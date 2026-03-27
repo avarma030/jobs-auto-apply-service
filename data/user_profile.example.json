@@ -1,0 +1,89 @@
+{
+  "first_name": "Jane",
+  "last_name": "Doe",
+  "email": "jane.doe@example.com",
+  "phone": "+1-555-123-4567",
+  "address": {
+    "city": "San Francisco",
+    "state": "CA",
+    "zip_code": "94105",
+    "country": "US"
+  },
+  "headline": "Senior Software Engineer",
+  "summary": "Experienced software engineer with 7+ years building scalable backend systems and leading cross-functional teams.",
+  "years_of_experience": 7,
+  "skills": [
+    "Python", "TypeScript", "Go",
+    "PostgreSQL", "Redis", "Kubernetes",
+    "AWS", "GCP", "Docker",
+    "REST APIs", "GraphQL", "gRPC"
+  ],
+  "languages": ["English", "Spanish"],
+  "work_experience": [
+    {
+      "company": "Acme Corp",
+      "title": "Senior Software Engineer",
+      "start_date": "2021-03",
+      "end_date": null,
+      "location": "San Francisco, CA (Remote)",
+      "description": "Led backend architecture for a high-throughput data pipeline processing 1M events/day."
+    },
+    {
+      "company": "Beta Inc",
+      "title": "Software Engineer",
+      "start_date": "2018-06",
+      "end_date": "2021-02",
+      "location": "New York, NY",
+      "description": "Built and maintained REST APIs serving 50k daily active users."
+    }
+  ],
+  "education": [
+    {
+      "institution": "State University",
+      "degree": "Bachelor of Science",
+      "field_of_study": "Computer Science",
+      "start_date": "2014-09",
+      "end_date": "2018-05",
+      "gpa": 3.8
+    }
+  ],
+  "social_links": {
+    "linkedin": "https://linkedin.com/in/janedoe",
+    "github": "https://github.com/janedoe",
+    "portfolio": "https://janedoe.dev"
+  },
+  "resume_path": "data/resume.pdf",
+  "cover_letter_template_path": null,
+  "job_board_accounts": {
+    "linkedin": {
+      "username": "jane.doe@example.com",
+      "password": "REPLACE_ME"
+    },
+    "indeed": {
+      "username": "jane.doe@example.com",
+      "password": "REPLACE_ME"
+    },
+    "glassdoor": {
+      "username": "jane.doe@example.com",
+      "password": "REPLACE_ME"
+    }
+  },
+  "preferences": {
+    "auto_apply": true,
+    "require_confirmation": false,
+    "max_applications_per_day": 50,
+    "easy_apply_only": false,
+    "skip_if_salary_not_listed": false,
+    "preferred_work_modes": ["remote", "hybrid"],
+    "blacklisted_companies": ["Company I Dont Like"],
+    "whitelisted_companies": []
+  },
+  "custom_answers": {
+    "Are you legally authorized to work in the US?": "Yes",
+    "Will you now or in the future require sponsorship?": "No",
+    "Years of experience with Python": "7",
+    "What is your desired salary?": "150000",
+    "Are you willing to relocate?": "No",
+    "How did you hear about this position?": "Job board"
+  }
+}
