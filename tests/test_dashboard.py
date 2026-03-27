@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from src.dashboard import DashboardQuery, format_posted_at, parse_dashboard_query, render_dashboard_page, split_keywords
+import pytest
+
+from src import dashboard as dashboard_module
+from src.dashboard import DashboardQuery, format_posted_at, parse_dashboard_query, render_dashboard_page, run_dashboard_search, split_keywords
 from src.models import Job
 
 
@@ -21,6 +24,7 @@ def test_split_keywords_handles_commas_and_newlines() -> None:
 def test_parse_dashboard_query_normalizes_form_values() -> None:
     query = parse_dashboard_query(
         {
+            "board": ["workday"],
             "keywords": ["project manager, delivery lead"],
             "location": ["Ireland"],
             "posted_within": ["7d"],
@@ -30,6 +34,7 @@ def test_parse_dashboard_query_normalizes_form_values() -> None:
     )
 
     assert query == DashboardQuery(
+        board="workday",
         keywords_raw="project manager, delivery lead",
         location="Ireland",
         posted_within="7d",
@@ -82,6 +87,39 @@ def test_render_dashboard_page_shows_polished_result_cards() -> None:
     assert "Found 1 LinkedIn result(s) in 1.2s." in html
 
 
+def test_render_dashboard_page_supports_workday_selection() -> None:
+    job = Job(
+        title="Senior Program Manager",
+        company="Acme",
+        location="Remote - Ireland",
+        description="Lead portfolio delivery across business systems.",
+        url="https://acme.wd5.myworkdayjobs.com/job/Ireland/Senior-Program-Manager_R-100",
+        source_board="workday",
+        external_id="Senior-Program-Manager_R-100",
+        job_type="full_time",
+        posted_at=datetime(2026, 3, 27),
+    )
+
+    html = render_dashboard_page(
+        query=DashboardQuery(
+            board="workday",
+            keywords_raw="program manager",
+            location="Ireland",
+            posted_within="24h",
+            remote_only=False,
+            limit=10,
+        ),
+        results=[job],
+        duration_seconds=1.4,
+    )
+
+    assert 'option value="workday" selected' in html
+    assert "Live Workday search console" in html
+    assert "Found 1 Workday result(s) in 1.4s." in html
+    assert "Board: Workday" in html
+    assert "Apply opens the Workday job page surfaced by the scraper." in html
+
+
 def test_render_dashboard_page_shows_empty_state() -> None:
     html = render_dashboard_page()
 
@@ -89,3 +127,49 @@ def test_render_dashboard_page_shows_empty_state() -> None:
     assert "Recent searches" in html
     assert "Shortcuts" in html
     assert "Ctrl + Enter" in html
+
+
+@pytest.mark.asyncio
+async def test_run_dashboard_search_dispatches_to_selected_board(monkeypatch: pytest.MonkeyPatch) -> None:
+    job = Job(
+        title="Senior Program Manager",
+        company="Acme",
+        location="Remote",
+        description="Lead delivery.",
+        url="https://example.com/job",
+        source_board="workday",
+        external_id="job-1",
+    )
+
+    class StubScraper:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def search(self, _search_filter):
+            yield job
+
+    monkeypatch.setitem(dashboard_module.SCRAPER_REGISTRY, "workday", StubScraper)
+    monkeypatch.setattr(
+        dashboard_module.settings,
+        "workday_tenant_urls",
+        "https://acme.wd5.myworkdayjobs.com/en-US/Careers",
+    )
+
+    results = await run_dashboard_search(
+        DashboardQuery(
+            board="workday",
+            keywords_raw="program manager",
+            location="Ireland",
+            posted_within="24h",
+            remote_only=False,
+            limit=10,
+        )
+    )
+
+    assert results == [job]

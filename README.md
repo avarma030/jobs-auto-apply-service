@@ -118,6 +118,7 @@ Key settings:
 | `MAX_APPLICATIONS_PER_RUN` | `50` | Cap on applications per run |
 | `HEADLESS_BROWSER` | `true` | Run browser in headless mode |
 | `REQUEST_DELAY_SECONDS` | `2.0` | Delay between requests (be polite) |
+| `WORKDAY_TENANT_URLS` | empty | Comma-separated public Workday board URLs to scrape |
 | `DATABASE_URL` | SQLite | Use PostgreSQL URL for production |
 
 ## User Profile

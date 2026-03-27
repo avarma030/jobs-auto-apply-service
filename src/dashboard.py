@@ -14,12 +14,22 @@ from urllib.parse import parse_qs
 
 from loguru import logger
 
+from src.config import settings
 from src.models import Job, JobSearchFilter
 from src.scrapers.linkedin import LinkedInScraper
+from src.scrapers.workday import WorkdayScraper
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 RECENT_SEARCHES_KEY = "jobs-auto-apply.recent-searches"
+BOARD_OPTIONS = [
+    ("linkedin", "LinkedIn"),
+    ("workday", "Workday"),
+]
+SCRAPER_REGISTRY = {
+    "linkedin": LinkedInScraper,
+    "workday": WorkdayScraper,
+}
 
 POSTED_WITHIN_TO_DAYS = {
     "24h": 1,
@@ -69,6 +79,7 @@ QUICK_SEARCH_PRESETS = [
 
 @dataclass(slots=True)
 class DashboardQuery:
+    board: str = "linkedin"
     keywords_raw: str = ""
     location: str = ""
     posted_within: str = "24h"
@@ -102,6 +113,10 @@ def split_keywords(raw: str) -> list[str]:
 
 
 def parse_dashboard_query(form_data: Mapping[str, list[str]]) -> DashboardQuery:
+    board = _first(form_data, "board", "linkedin")
+    if board not in dict(BOARD_OPTIONS):
+        board = "linkedin"
+
     posted_within = _first(form_data, "posted_within", "24h")
     if posted_within not in POSTED_WITHIN_TO_DAYS:
         posted_within = "24h"
@@ -112,6 +127,7 @@ def parse_dashboard_query(form_data: Mapping[str, list[str]]) -> DashboardQuery:
         limit = 10
 
     return DashboardQuery(
+        board=board,
         keywords_raw=_first(form_data, "keywords", ""),
         location=_first(form_data, "location", ""),
         posted_within=posted_within,
@@ -121,8 +137,15 @@ def parse_dashboard_query(form_data: Mapping[str, list[str]]) -> DashboardQuery:
 
 
 async def run_dashboard_search(query: DashboardQuery) -> list[Job]:
+    if query.board == "workday" and not settings.workday_tenant_url_list():
+        raise ValueError("Set WORKDAY_TENANT_URLS before running Workday searches.")
+
+    scraper_cls = SCRAPER_REGISTRY.get(query.board)
+    if scraper_cls is None:
+        raise ValueError(f"Unsupported board: {query.board}")
+
     results: list[Job] = []
-    async with LinkedInScraper() as scraper:
+    async with scraper_cls() as scraper:
         async for job in scraper.search(query.to_search_filter()):
             results.append(job)
             if len(results) >= query.limit:
@@ -234,6 +257,7 @@ def render_dashboard_page(
     query = query or DashboardQuery(location="Ireland")
     results = results or []
     has_results = bool(results)
+    board_label = board_display_name(query.board)
 
     if error:
         status_banner = f"""
@@ -246,7 +270,7 @@ def render_dashboard_page(
         status_banner = f"""
         <div class="status status--success">
           <div class="status__label">Live run complete</div>
-          <p>Found {len(results)} LinkedIn result(s){format_duration(duration_seconds)}.</p>
+          <p>Found {len(results)} {escape_html(board_label)} result(s){format_duration(duration_seconds)}.</p>
         </div>
         """
     else:
@@ -264,6 +288,10 @@ def render_dashboard_page(
     options_markup = "".join(
         f'<option value="{value}"{" selected" if query.posted_within == value else ""}>{label}</option>'
         for value, label in POSTED_WITHIN_OPTIONS
+    )
+    board_options_markup = "".join(
+        f'<option value="{value}"{" selected" if query.board == value else ""}>{label}</option>'
+        for value, label in BOARD_OPTIONS
     )
     presets_markup = "".join(render_preset_chip(preset, index=index) for index, preset in enumerate(QUICK_SEARCH_PRESETS))
     remote_checked = " checked" if query.remote_only else ""
@@ -1144,10 +1172,11 @@ def render_dashboard_page(
   <main class="shell">
     <section class="masthead">
       <section class="panel hero">
-        <div class="hero__eyebrow">Live LinkedIn search console</div>
+        <div class="hero__eyebrow">Live {escape_html(board_label)} search console</div>
         <h1>Search jobs like a product, not a shell script.</h1>
         <p>This dashboard runs the same real scraper underneath, but wraps it in a much faster experience: presets, recent searches, rich result cards, quick copy actions, and a cleaner scan path from query to apply link.</p>
         <div class="hero__meta">
+          <span class="hero__meta-chip">{escape_html(board_label)} selected</span>
           <span class="hero__meta-chip">Live detail enrichment</span>
           <span class="hero__meta-chip">Preset search chips</span>
           <span class="hero__meta-chip">Recent search memory</span>
@@ -1197,6 +1226,14 @@ def render_dashboard_page(
           <form method="post" action="/search" id="search-form">
             <div class="form-grid">
               <div class="field">
+                <label for="board">Source board</label>
+                <select id="board" name="board">
+                  {board_options_markup}
+                </select>
+                <div class="field-hint">Choose the live scraper to run without changing the rest of your search flow.</div>
+              </div>
+
+              <div class="field">
                 <label for="keywords">Keywords</label>
                 <input id="keywords" type="text" name="keywords" value="{escape_html(query.keywords_raw)}" placeholder="project manager">
                 <div class="field-hint">Use one phrase or separate multiple ideas with commas.</div>
@@ -1241,7 +1278,7 @@ def render_dashboard_page(
         <div class="results-head">
           <div>
             <h2>Results</h2>
-            <p>Each card is generated from the real LinkedIn scraper output, with detail-page enrichment where available.</p>
+            <p>Each card is generated from the real {escape_html(board_label)} scraper output, with detail-page enrichment where available.</p>
           </div>
           <div class="actions">
             <button type="button" class="button button--ghost" id="copy-search-button">Copy search summary</button>
@@ -1272,6 +1309,7 @@ def render_dashboard_page(
     const presetData = JSON.parse(document.getElementById("preset-data").textContent || "[]");
     const resultsSection = document.getElementById("results-section");
     const fields = {{
+      board: document.getElementById("board"),
       keywords: document.getElementById("keywords"),
       location: document.getElementById("location"),
       postedWithin: document.getElementById("posted_within"),
@@ -1295,6 +1333,7 @@ def render_dashboard_page(
 
     function currentSearchPayload() {{
       return {{
+        board: fields.board?.value || "linkedin",
         keywords: fields.keywords?.value?.trim() || "",
         location: fields.location?.value?.trim() || "",
         posted_within: fields.postedWithin?.value || "24h",
@@ -1304,6 +1343,9 @@ def render_dashboard_page(
     }}
 
     function applySearchPayload(payload) {{
+      if (payload.board && fields.board) {{
+        fields.board.value = payload.board;
+      }}
       fields.keywords.value = payload.keywords || "";
       fields.location.value = payload.location || "";
       fields.postedWithin.value = payload.posted_within || "24h";
@@ -1336,7 +1378,7 @@ def render_dashboard_page(
 
     function saveRecentSearch(payload) {{
       if (!payload.keywords) return;
-      const labelParts = [payload.keywords];
+      const labelParts = [payload.board || "linkedin", payload.keywords];
       if (payload.location) labelParts.push(payload.location);
       labelParts.push(payload.posted_within);
       const entry = {{
@@ -1372,6 +1414,7 @@ def render_dashboard_page(
     copySearchButton?.addEventListener("click", async () => {{
       const payload = currentSearchPayload();
       const summary = [
+        payload.board || "linkedin",
         payload.keywords || "No keywords",
         payload.location || "Any location",
         payload.posted_within,
@@ -1388,6 +1431,7 @@ def render_dashboard_page(
 
     clearButton?.addEventListener("click", () => {{
       applySearchPayload({{
+        board: fields.board?.value || "linkedin",
         keywords: "",
         location: "",
         posted_within: "24h",
@@ -1451,6 +1495,7 @@ def render_query_chips(query: DashboardQuery) -> str:
     keywords = ", ".join(query.keywords) if query.keywords else "No keywords yet"
     posted_label = dict(POSTED_WITHIN_OPTIONS).get(query.posted_within, "Last 24 hours")
     chips = [
+        f"Board: {board_display_name(query.board)}",
         f"Keywords: {shorten(keywords, limit=42)}",
         f"Location: {shorten(query.location or 'Any location', limit=30)}",
         f"Window: {posted_label}",
@@ -1602,7 +1647,7 @@ def render_result_card(job: Job, *, index: int) -> str:
         </div>
 
         <div class="result-card__footer">
-          <p class="result-card__note">Apply opens the LinkedIn job page surfaced by the scraper. Use Copy link if you want to save or share the exact result instantly.</p>
+          <p class="result-card__note">{escape_html(board_apply_note(job.source_board))}</p>
           <div class="result-card__actions">
             <button type="button" class="link-button link-button--secondary" data-copy-url="{apply_href}">Copy link</button>
             <a class="link-button link-button--primary" href="{apply_href}" target="_blank" rel="noopener">Open Apply Link</a>
@@ -1638,6 +1683,15 @@ def company_gradient(company: str) -> str:
     hue_a = seed % 360
     hue_b = (hue_a + 42) % 360
     return f"linear-gradient(135deg, hsl({hue_a} 58% 48%), hsl({hue_b} 72% 36%))"
+
+
+def board_display_name(board: str) -> str:
+    return dict(BOARD_OPTIONS).get(board, board.title())
+
+
+def board_apply_note(board: str) -> str:
+    board_label = board_display_name(board)
+    return f"Apply opens the {board_label} job page surfaced by the scraper. Use Copy link if you want to save or share the exact result instantly."
 
 
 def format_runtime(duration_seconds: float | None) -> str:

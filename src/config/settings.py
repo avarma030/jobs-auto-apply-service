@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     request_delay_seconds: float = Field(default=2.0, ge=0.5)
     use_proxies: bool = False
     proxy_list_path: Path | None = None
+    workday_tenant_urls: str = ""
 
     # ------------------------------------------------------------------
     # Applying
@@ -90,6 +91,9 @@ class Settings(BaseSettings):
                 "workday",
             ]
         return [b.strip().lower() for b in self.enabled_boards.split(",") if b.strip()]
+
+    def workday_tenant_url_list(self) -> list[str]:
+        return [url.strip() for url in self.workday_tenant_urls.split(",") if url.strip()]
 
 
 # Singleton instance — import this everywhere
