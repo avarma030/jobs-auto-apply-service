@@ -213,4 +213,9 @@ def _to_response(r: JobRecord) -> JobResponse:
         application_status=r.application_status,
         applied_at=r.applied_at,
         skills=skills,
+        match_score=getattr(r, "match_score", None),
+        ats_score=getattr(r, "ats_score", None),
+        ats_type=getattr(r, "ats_type", None),
+        tailored_resume_path=getattr(r, "tailored_resume_path", None),
+        cover_letter_path=getattr(r, "cover_letter_path", None),
     )

@@ -67,6 +67,13 @@ class Job(BaseModel):
     easy_apply: bool = False  # supports one-click / easy apply
     requires_cover_letter: bool = False
 
+    # AI pipeline fields
+    match_score: Optional[float] = None   # 0-100 resume-job compatibility
+    ats_score: Optional[float] = None     # 0-100 ATS score of tailored resume
+    tailored_resume_path: Optional[str] = None
+    cover_letter_path: Optional[str] = None
+    ats_type: Optional[str] = None        # greenhouse, workday, lever, generic …
+
     application_status: ApplicationStatus = ApplicationStatus.PENDING
     applied_at: Optional[datetime] = None
     notes: Optional[str] = None

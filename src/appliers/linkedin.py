@@ -121,7 +121,12 @@ class LinkedInApplier(BaseApplier):
     # Public apply entry point
     # ------------------------------------------------------------------
 
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(
+        self,
+        job: Job,
+        tailored_resume_path: str | None = None,
+        cover_letter: str | None = None,
+    ) -> ApplicationResult:
         if not self.can_apply(job):
             return self._skip(job, "Not a LinkedIn job")
         if not self._page:
@@ -130,7 +135,7 @@ class LinkedInApplier(BaseApplier):
         try:
             if not job.easy_apply:
                 return self._skip(job, "Job does not have Easy Apply — route to ATS applier")
-            return await self._easy_apply(job)
+            return await self._easy_apply(job, tailored_resume_path=tailored_resume_path, cover_letter=cover_letter)
         except Exception as exc:
             await self._bm.screenshot(self._page, f"error_{job.external_id}")
             return self._fail(job, str(exc))
@@ -179,8 +184,15 @@ class LinkedInApplier(BaseApplier):
     # Easy Apply
     # ------------------------------------------------------------------
 
-    async def _easy_apply(self, job: Job) -> ApplicationResult:
+    async def _easy_apply(
+        self,
+        job: Job,
+        tailored_resume_path: str | None = None,
+        cover_letter: str | None = None,
+    ) -> ApplicationResult:
         page = self._page
+        self._tailored_resume_path = tailored_resume_path
+        self._cover_letter_text = cover_letter
         logger.info(f"[LinkedIn] Easy Applying to: {job.title} @ {job.company}")
 
         await page.goto(job.url, wait_until="domcontentloaded")
@@ -312,9 +324,10 @@ class LinkedInApplier(BaseApplier):
             label = await self._get_field_label(page, area)
             label_lower = label.lower()
 
-            # Cover letter
+            # Cover letter — prefer AI-generated text injected via apply()
             if "cover letter" in label_lower or "cover_letter" in label_lower:
-                cl = self._build_cover_letter(job)
+                cl_text = getattr(self, "_cover_letter_text", None)
+                cl = cl_text if cl_text else self._build_cover_letter(job)
                 await area.fill(cl)
                 continue
 
@@ -400,27 +413,23 @@ class LinkedInApplier(BaseApplier):
                 await cb.uncheck()
 
     async def _handle_resume_upload(self, page: Page) -> None:
-        """Upload resume if needed; prefer a previously-uploaded resume on file."""
-        resume_path = Path(self.profile.resume_path) if self.profile.resume_path else None
+        """Upload resume — prefer tailored PDF, fall back to profile resume."""
+        # Tailored resume takes priority; otherwise fall back to profile resume
+        tailored = getattr(self, "_tailored_resume_path", None)
+        if tailored and Path(tailored).exists():
+            resume_path = Path(tailored)
+            logger.info(f"[LinkedIn] Using tailored resume: {resume_path.name}")
+        else:
+            resume_path = Path(self.profile.resume_path) if self.profile.resume_path else None
 
-        # If LinkedIn shows an already-uploaded resume card, select the first one
-        existing_card = page.locator(_RESUME_CARD).first
-        if await existing_card.count() > 0:
-            logger.debug("[LinkedIn] Resume already on file — using it")
-            try:
-                if not await existing_card.is_checked():
-                    await existing_card.click()
-            except Exception:
-                pass  # not a checkbox-style card; it's just displayed
-            return
-
-        # No resume on file — upload from disk
-        if not resume_path or not resume_path.exists():
-            logger.debug("[LinkedIn] No resume file found, skipping upload")
-            return
-
+        # If LinkedIn shows an already-uploaded resume card, click the upload button
+        # to replace it with our tailored version (only if we have one).
         file_input = page.locator(f"{_MODAL} {_FILE_INPUT}").first
         if await file_input.count() == 0:
+            return
+
+        if not resume_path or not resume_path.exists():
+            logger.debug("[LinkedIn] No resume file found, skipping upload")
             return
 
         await file_input.set_input_files(str(resume_path))

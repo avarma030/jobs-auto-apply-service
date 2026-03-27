@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from typing import Type
+from pathlib import Path
+from typing import Callable, Type
 
+import anthropic
 from loguru import logger
 
 from src.appliers.base import BaseApplier
@@ -25,6 +27,8 @@ from src.scrapers.linkedin import LinkedInScraper
 from src.scrapers.monster import MonsterScraper
 from src.scrapers.workday import WorkdayScraper
 from src.scrapers.ziprecruiter import ZipRecruiterScraper
+from src.services import ai_matcher, cover_letter as cover_letter_svc, pdf_builder, resume_parser, resume_tailor
+from src.services.job_classifier import detect_ats
 
 SCRAPER_REGISTRY: dict[str, Type[BaseScraper]] = {
     "linkedin": LinkedInScraper,
@@ -46,6 +50,9 @@ APPLIER_REGISTRY: list[Type[BaseApplier]] = [
     GenericApplier,  # fallback — must be last
 ]
 
+# Where tailored assets are stored: data/uploads/{user_id}/tailored/{job_id}/
+_UPLOAD_BASE = Path("data/uploads")
+
 
 class Orchestrator:
     """Coordinates scraping and applying across all enabled job boards."""
@@ -53,6 +60,7 @@ class Orchestrator:
     def __init__(self, profile: UserProfile, db: Database):
         self.profile = profile
         self.db = db
+        self._ai_client: anthropic.AsyncAnthropic | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -94,7 +102,11 @@ class Orchestrator:
 
             applier = self._pick_applier(job)
             async with applier as a:
-                result = await a.apply(job)
+                result = await a.apply(
+                    job,
+                    tailored_resume_path=record.tailored_resume_path,
+                    cover_letter=None,  # cover letter text not stored in DB — re-read file if needed
+                )
 
             status = result.status
             counts[status] = counts.get(status, 0) + 1
@@ -114,9 +126,184 @@ class Orchestrator:
         logger.info(f"Apply run complete: {counts}")
         return counts
 
+    async def run_full_pipeline(
+        self,
+        search_filter: JobSearchFilter,
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict:
+        """
+        End-to-end pipeline:
+          1. Scrape jobs from all enabled boards
+          2. Score each job against the user's resume (skip < min_match_score)
+          3. Detect ATS type
+          4. Tailor resume for each qualified job (loop until ATS score ≥ min_ats_score)
+          5. Generate tailored cover letter
+          6. Apply using the appropriate applier
+        Returns aggregate counts.
+        """
+        def _emit(msg: str) -> None:
+            logger.info(msg)
+            if progress_callback:
+                progress_callback(msg)
+
+        _emit("Pipeline starting — scraping jobs …")
+        jobs_found = await self.run_scrape(search_filter)
+        _emit(f"Scrape complete: {jobs_found} jobs found")
+
+        # Parse resume once
+        resume_text = ""
+        if settings.resume_path.exists():
+            try:
+                resume_text = resume_parser.parse_resume(settings.resume_path)
+                _emit(f"Resume parsed ({len(resume_text)} chars)")
+            except Exception as exc:
+                logger.error(f"Resume parse error: {exc}")
+
+        ai = self._get_ai_client()
+
+        # Load pending jobs
+        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run)
+        _emit(f"Scoring {len(pending)} jobs against resume …")
+
+        qualified: list[tuple] = []  # (record, job)
+        skipped_score = 0
+
+        for record in pending:
+            job = self._record_to_job(record)
+            if not resume_text or not job.description:
+                qualified.append((record, job))
+                continue
+
+            score = await ai_matcher.score_compatibility(
+                resume_text, job.title, job.description or "", ai, settings.anthropic_model
+            )
+            job.match_score = score
+
+            # Persist match score
+            await self.db.update_job_ai_fields(record.id, match_score=score)
+
+            if score < settings.min_match_score:
+                skipped_score += 1
+                _emit(f"  Skipped '{job.title}' @ {job.company} — {score:.0f}% match")
+                await self.db.update_job_status(
+                    record.id,
+                    ApplicationStatus.SKIPPED,
+                    notes=f"Match score {score:.0f}% < threshold {settings.min_match_score:.0f}%",
+                )
+            else:
+                _emit(f"  Qualified '{job.title}' @ {job.company} — {score:.0f}% match")
+                qualified.append((record, job))
+
+        _emit(f"Scoring done: {len(qualified)} qualified, {skipped_score} skipped")
+
+        # ------------------------------------------------------------------
+        # For each qualified job: ATS detect → tailor → cover letter → apply
+        # ------------------------------------------------------------------
+        counts: dict[str, int] = {"applied": 0, "failed": 0, "skipped": 0, "dry_run": 0}
+
+        for record, job in qualified:
+            uid = user_id or 0
+            job_dir = _UPLOAD_BASE / str(uid) / "tailored" / str(record.id)
+
+            tailored_resume_path: str | None = None
+            cl_text: str | None = None
+            ats_score: float | None = None
+
+            # Detect ATS type
+            ats_type = detect_ats(job)
+            job.ats_type = ats_type
+
+            if resume_text and job.description and ai:
+                # Tailor resume
+                _emit(f"Tailoring resume for '{job.title}' …")
+                try:
+                    tailored_text, ats_score = await resume_tailor.tailor_resume(
+                        resume_text,
+                        job.title,
+                        job.description,
+                        ai,
+                        settings.anthropic_model,
+                        target_ats_score=settings.min_ats_score,
+                        max_attempts=settings.max_tailor_attempts,
+                    )
+                    _emit(f"  ATS score: {ats_score:.0f}%")
+
+                    # Build tailored PDF
+                    pdf_path = job_dir / "resume.pdf"
+                    pdf_builder.build_resume_pdf(tailored_text, pdf_path)
+                    tailored_resume_path = str(pdf_path)
+                    job.tailored_resume_path = tailored_resume_path
+
+                    # Generate cover letter
+                    _emit(f"Generating cover letter for '{job.title}' …")
+                    cl_text = await cover_letter_svc.generate_cover_letter(
+                        self.profile, job, tailored_text, ai, settings.anthropic_model
+                    )
+                    cl_path = job_dir / "cover_letter.md"
+                    cl_path.parent.mkdir(parents=True, exist_ok=True)
+                    cl_path.write_text(cl_text)
+                    job.cover_letter_path = str(cl_path)
+
+                    await self.db.update_job_ai_fields(
+                        record.id,
+                        ats_score=ats_score,
+                        ats_type=ats_type,
+                        tailored_resume_path=tailored_resume_path,
+                        cover_letter_path=str(cl_path),
+                    )
+                except Exception as exc:
+                    logger.error(f"AI tailoring error for job {record.id}: {exc}")
+
+            if settings.dry_run:
+                _emit(f"[DRY RUN] Would apply to '{job.title}' @ {job.company} ({ats_type})")
+                counts["dry_run"] += 1
+                continue
+
+            _emit(f"Applying to '{job.title}' @ {job.company} via {ats_type} …")
+            applier = self._pick_applier(job)
+            try:
+                async with applier as a:
+                    result = await a.apply(
+                        job,
+                        tailored_resume_path=tailored_resume_path,
+                        cover_letter=cl_text,
+                    )
+            except Exception as exc:
+                logger.error(f"Applier error for job {record.id}: {exc}")
+                counts["failed"] += 1
+                await self.db.update_job_status(record.id, ApplicationStatus.FAILED, notes=str(exc))
+                continue
+
+            status = result.status
+            counts[status] = counts.get(status, 0) + 1
+            await self.db.update_job_status(
+                record.id,
+                status,
+                applied_at=datetime.utcnow() if status == ApplicationStatus.APPLIED else None,
+                notes=result.message,
+            )
+            await self.db.log_application(
+                record.id,
+                status,
+                confirmation_id=result.confirmation_id,
+                message=result.message,
+            )
+
+        _emit(f"Pipeline complete: {counts}")
+        return counts
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _get_ai_client(self) -> anthropic.AsyncAnthropic | None:
+        if not settings.anthropic_api_key:
+            logger.warning("ANTHROPIC_API_KEY not set — AI features disabled")
+            return None
+        if self._ai_client is None:
+            self._ai_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        return self._ai_client
 
     async def _scrape_board(self, board: str, search_filter: JobSearchFilter) -> int:
         scraper_cls = SCRAPER_REGISTRY[board]
@@ -173,4 +360,9 @@ class Orchestrator:
             application_status=record.application_status,
             applied_at=record.applied_at,
             notes=record.notes,
+            match_score=getattr(record, "match_score", None),
+            ats_score=getattr(record, "ats_score", None),
+            ats_type=getattr(record, "ats_type", None),
+            tailored_resume_path=getattr(record, "tailored_resume_path", None),
+            cover_letter_path=getattr(record, "cover_letter_path", None),
         )

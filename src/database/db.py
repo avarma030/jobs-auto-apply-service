@@ -97,6 +97,32 @@ class Database:
     # Application log
     # ------------------------------------------------------------------
 
+    async def update_job_ai_fields(
+        self,
+        job_id: int,
+        match_score: float | None = None,
+        ats_score: float | None = None,
+        ats_type: str | None = None,
+        tailored_resume_path: str | None = None,
+        cover_letter_path: str | None = None,
+    ) -> None:
+        """Persist AI-pipeline results to the job record."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(JobRecord).where(JobRecord.id == job_id))
+            record = result.scalar_one_or_none()
+            if record:
+                if match_score is not None:
+                    record.match_score = match_score
+                if ats_score is not None:
+                    record.ats_score = ats_score
+                if ats_type is not None:
+                    record.ats_type = ats_type
+                if tailored_resume_path is not None:
+                    record.tailored_resume_path = tailored_resume_path
+                if cover_letter_path is not None:
+                    record.cover_letter_path = cover_letter_path
+                await session.commit()
+
     async def log_application(
         self,
         job_id: int,

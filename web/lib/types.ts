@@ -27,6 +27,12 @@ export interface Job {
   application_status: string;
   applied_at?: string;
   skills: string[];
+  // AI pipeline
+  match_score?: number | null;
+  ats_score?: number | null;
+  ats_type?: string | null;
+  tailored_resume_path?: string | null;
+  cover_letter_path?: string | null;
 }
 
 export interface JobsPage {

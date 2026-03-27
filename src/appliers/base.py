@@ -64,8 +64,18 @@ class BaseApplier(abc.ABC):
     # ------------------------------------------------------------------
 
     @abc.abstractmethod
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(
+        self,
+        job: Job,
+        tailored_resume_path: str | None = None,
+        cover_letter: str | None = None,
+    ) -> ApplicationResult:
         """Attempt to apply to *job* using *self.profile*.
+
+        Args:
+            job: The job to apply to.
+            tailored_resume_path: Absolute path to the tailored resume PDF, if generated.
+            cover_letter: Cover letter text, if generated.
 
         Returns an ``ApplicationResult`` regardless of success/failure.
         Implementations must never raise — catch all errors and return

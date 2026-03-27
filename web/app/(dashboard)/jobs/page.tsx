@@ -14,6 +14,39 @@ import { formatDistanceToNow } from "date-fns";
 
 const STATUS_OPTIONS = ["", "pending", "approved", "applied", "skipped", "failed"];
 
+function MatchScoreBadge({ score }: { score?: number | null }) {
+  if (score == null) return <span className="text-gray-400 text-xs">–</span>;
+  const pct = Math.round(score);
+  const color =
+    pct >= 90 ? "bg-green-100 text-green-800 border-green-300"
+    : pct >= 75 ? "bg-yellow-100 text-yellow-800 border-yellow-300"
+    : "bg-red-100 text-red-700 border-red-300";
+  return (
+    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold border ${color}`}>
+      {pct}% match
+    </span>
+  );
+}
+
+function AtsBadge({ score, atsType }: { score?: number | null; atsType?: string | null }) {
+  if (score == null && !atsType) return <span className="text-gray-400 text-xs">–</span>;
+  const pct = score != null ? Math.round(score) : null;
+  const color =
+    pct == null ? "bg-gray-100 text-gray-600 border-gray-300"
+    : pct >= 90 ? "bg-green-100 text-green-800 border-green-300"
+    : "bg-orange-100 text-orange-800 border-orange-300";
+  return (
+    <div className="flex flex-col gap-0.5">
+      {pct != null && (
+        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold border ${color}`}>
+          ATS {pct}%
+        </span>
+      )}
+      {atsType && <span className="text-xs text-gray-500 capitalize">{atsType}</span>}
+    </div>
+  );
+}
+
 export default function JobsPage() {
   const [data, setData] = useState<JobsPage>({ items: [], total: 0, page: 1, page_size: 25 });
   const [status, setStatus] = useState("");
@@ -81,6 +114,8 @@ export default function JobsPage() {
             <thead className="bg-gray-50 border-b">
               <tr>
                 <th className="px-4 py-3 text-left font-medium text-gray-700">Job</th>
+                <th className="px-4 py-3 text-left font-medium text-gray-700 hidden lg:table-cell">Match</th>
+                <th className="px-4 py-3 text-left font-medium text-gray-700 hidden lg:table-cell">ATS</th>
                 <th className="px-4 py-3 text-left font-medium text-gray-700 hidden md:table-cell">Board</th>
                 <th className="px-4 py-3 text-left font-medium text-gray-700 hidden lg:table-cell">Posted</th>
                 <th className="px-4 py-3 text-left font-medium text-gray-700">Status</th>
@@ -89,9 +124,9 @@ export default function JobsPage() {
             </thead>
             <tbody className="divide-y">
               {loading ? (
-                <tr><td colSpan={5} className="px-4 py-8 text-center text-muted-foreground">Loading…</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">Loading…</td></tr>
               ) : data.items.length === 0 ? (
-                <tr><td colSpan={5} className="px-4 py-8 text-center text-muted-foreground">No jobs found. Start a scrape from the Dashboard.</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">No jobs found. Start a scrape from the Dashboard.</td></tr>
               ) : (
                 data.items.map((job) => (
                   <tr key={job.id} className="hover:bg-gray-50">
@@ -103,9 +138,16 @@ export default function JobsPage() {
                           <div className="flex gap-1.5 mt-1">
                             {job.easy_apply && <Badge variant="info" className="text-xs py-0">Easy Apply</Badge>}
                             {job.work_mode && <Badge variant="outline" className="text-xs py-0 capitalize">{job.work_mode}</Badge>}
+                            {job.tailored_resume_path && <Badge variant="outline" className="text-xs py-0 text-purple-700 border-purple-300">Tailored</Badge>}
                           </div>
                         </div>
                       </div>
+                    </td>
+                    <td className="px-4 py-3 hidden lg:table-cell">
+                      <MatchScoreBadge score={job.match_score} />
+                    </td>
+                    <td className="px-4 py-3 hidden lg:table-cell">
+                      <AtsBadge score={job.ats_score} atsType={job.ats_type} />
                     </td>
                     <td className="px-4 py-3 hidden md:table-cell">
                       <span className="capitalize text-gray-600">{job.source_board}</span>

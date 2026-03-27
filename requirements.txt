@@ -36,6 +36,12 @@ python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
 asyncpg>=0.29.0
 
+# AI / Claude
+anthropic>=0.28.0
+
+# PDF generation for tailored resumes
+reportlab>=4.0.0
+
 # Utilities
 python-dotenv>=1.0.1
 tenacity>=8.3.0

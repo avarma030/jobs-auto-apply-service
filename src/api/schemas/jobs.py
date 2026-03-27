@@ -25,6 +25,12 @@ class JobResponse(BaseModel):
     application_status: str
     applied_at: Optional[datetime] = None
     skills: list[str] = []
+    # AI pipeline fields
+    match_score: Optional[float] = None
+    ats_score: Optional[float] = None
+    ats_type: Optional[str] = None
+    tailored_resume_path: Optional[str] = None
+    cover_letter_path: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
