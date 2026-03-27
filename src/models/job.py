@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class JobType(str, Enum):
@@ -71,8 +71,7 @@ class Job(BaseModel):
     applied_at: Optional[datetime] = None
     notes: Optional[str] = None
 
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 class JobSearchFilter(BaseModel):
