@@ -29,28 +29,43 @@ from playwright.async_api import Page, TimeoutError as PWTimeoutError
 
 from src.appliers.base import ApplicationResult, BaseApplier
 from src.models import Job, UserProfile
-from src.utils.browser import BrowserManager
+from src.utils.browser import BrowserManager, BrowserManager as _BM
 
 # ── Selectors ─────────────────────────────────────────────────────────────────
 
 _LOGIN_URL = "https://www.linkedin.com/login"
 _FEED_URL = "https://www.linkedin.com/feed/"
 
-# Job page
+# Job page — multiple selector variants to survive LinkedIn UI changes
 _EASY_APPLY_BTN = (
     "button.jobs-apply-button[aria-label*='Easy Apply'], "
-    "button.jobs-apply-button--top-card[aria-label*='Easy Apply']"
+    "button.jobs-apply-button--top-card[aria-label*='Easy Apply'], "
+    "button[data-control-name='jobdetails_topcard_inapply']"
 )
-_APPLY_BTN = "button.jobs-apply-button"  # generic apply (may be external)
+_APPLY_BTN = "button.jobs-apply-button"
+
+# "Follow" prompt that sometimes blocks the Easy Apply button
+_FOLLOW_PROMPT_DISMISS = (
+    "button[aria-label='Dismiss'], "
+    "button[aria-label='Got it'], "
+    "button.artdeco-modal__dismiss"
+)
 
 # Modal container
 _MODAL = "div.jobs-easy-apply-modal"
+
+# Progress indicator — "Step X of Y"
+_STEP_INDICATOR = (
+    "span.jobs-easy-apply-form-section__grouping-title, "
+    "div.ph5 span.t-14"
+)
 
 # Within the modal
 _NEXT_BTN = (
     "button[aria-label='Continue to next step'], "
     "button[aria-label='Review your application'], "
-    "footer button[aria-label*='Next']"
+    "footer button[aria-label*='Next'], "
+    "button.artdeco-button--primary[type='button']"
 )
 _SUBMIT_BTN = "button[aria-label='Submit application']"
 _DISMISS_BTN = "button[aria-label='Dismiss']"
@@ -65,7 +80,11 @@ _CHECKBOXES = "input[type='checkbox']"
 
 # Resume upload
 _FILE_INPUT = "input[type='file']"
-_RESUME_CARD = "div.jobs-document-upload__card, label.jobs-document-upload-redesign-card"
+_RESUME_CARD = (
+    "div.jobs-document-upload__card, "
+    "label.jobs-document-upload-redesign-card, "
+    "li.jobs-resume-picker__resume"
+)
 
 
 class LinkedInApplier(BaseApplier):
@@ -165,12 +184,14 @@ class LinkedInApplier(BaseApplier):
         logger.info(f"[LinkedIn] Easy Applying to: {job.title} @ {job.company}")
 
         await page.goto(job.url, wait_until="domcontentloaded")
-        await asyncio.sleep(1.5)  # let dynamic content settle
+        await asyncio.sleep(1.5)
+
+        # Dismiss any follow/notification prompts that block the apply button
+        await self._dismiss_prompts(page)
 
         # Click Easy Apply button
         btn = page.locator(_EASY_APPLY_BTN).first
         if await btn.count() == 0:
-            # Maybe the page only has an external apply button
             generic_btn = page.locator(_APPLY_BTN).first
             if await generic_btn.count() > 0:
                 label = await generic_btn.get_attribute("aria-label") or ""
@@ -179,44 +200,73 @@ class LinkedInApplier(BaseApplier):
             return self._fail(job, "No apply button found on page")
 
         await btn.click()
-        await page.wait_for_selector(_MODAL, timeout=10_000)
+        try:
+            await page.wait_for_selector(_MODAL, timeout=10_000)
+        except PWTimeoutError:
+            await self._bm.screenshot(page, f"modal_timeout_{job.external_id}")
+            return self._fail(job, "Easy Apply modal did not open (timeout)")
         logger.debug("[LinkedIn] Easy Apply modal opened")
 
-        # Step through modal pages
         max_steps = 15
         for step in range(max_steps):
             await asyncio.sleep(0.8)
 
-            # Check for submit button (final step)
+            # Log step progress if LinkedIn shows it
+            step_label = await self._get_step_label(page)
+            logger.info(f"[LinkedIn] Modal step {step + 1}{': ' + step_label if step_label else ''}")
+
+            # Final step: submit button visible
             submit = page.locator(_SUBMIT_BTN).first
             if await submit.count() > 0 and await submit.is_visible():
+                await self._bm.screenshot(page, f"pre_submit_{job.external_id}")
                 await submit.click()
                 await asyncio.sleep(2)
-                logger.info(f"[LinkedIn] Application submitted: {job.title} @ {job.company}")
+                await self._bm.screenshot(page, f"post_submit_{job.external_id}")
+                logger.info(f"[LinkedIn] ✓ Application submitted: {job.title} @ {job.company}")
                 return self._ok(job)
 
-            # Fill the current modal page
+            # Fill visible fields on this page
             await self._fill_modal_page(page, job)
 
-            # Check for errors before proceeding
+            # Check for validation errors before clicking Next
             error_el = page.locator(_ERROR_MSG).first
             if await error_el.count() > 0:
                 error_text = await error_el.inner_text()
-                logger.warning(f"[LinkedIn] Form error on step {step + 1}: {error_text}")
+                logger.warning(f"[LinkedIn] Validation error at step {step + 1}: {error_text}")
                 await self._bm.screenshot(page, f"form_error_{job.external_id}_{step}")
                 return self._fail(job, f"Form validation error: {error_text}")
 
-            # Click Next / Continue / Review
+            # Advance to next step
             next_btn = page.locator(_NEXT_BTN).first
             if await next_btn.count() > 0 and await next_btn.is_enabled():
                 await next_btn.click()
             else:
-                # No next or submit button — stuck
-                logger.warning(f"[LinkedIn] Stuck at step {step + 1}, no next/submit button")
+                logger.warning(f"[LinkedIn] No Next/Submit at step {step + 1} — stuck")
                 await self._bm.screenshot(page, f"stuck_{job.external_id}_{step}")
                 return self._fail(job, f"Stuck at modal step {step + 1}")
 
         return self._fail(job, "Exceeded max modal steps without submitting")
+
+    async def _dismiss_prompts(self, page: Page) -> None:
+        """Dismiss any overlay prompts (Follow, notifications) that cover the apply button."""
+        for selector in _FOLLOW_PROMPT_DISMISS.split(", "):
+            try:
+                el = page.locator(selector.strip()).first
+                if await el.count() > 0 and await el.is_visible():
+                    await el.click()
+                    await asyncio.sleep(0.3)
+            except Exception:
+                pass
+
+    async def _get_step_label(self, page: Page) -> str:
+        """Return the current step indicator text, e.g. 'Step 2 of 4', or empty string."""
+        try:
+            el = page.locator(_STEP_INDICATOR).first
+            if await el.count() > 0:
+                return (await el.inner_text()).strip()
+        except Exception:
+            pass
+        return ""
 
     # ------------------------------------------------------------------
     # Form filling
@@ -246,7 +296,8 @@ class LinkedInApplier(BaseApplier):
                 value = self._infer_value_from_label(label)
 
             if value is not None:
-                await inp.fill(str(value))
+                await inp.fill("")  # clear first
+                await _BM.human_type(inp, str(value))
                 logger.debug(f"[LinkedIn] Filled '{label}' = '{value}'")
 
     async def _fill_textareas(self, page: Page, job: Job) -> None:
@@ -349,24 +400,40 @@ class LinkedInApplier(BaseApplier):
                 await cb.uncheck()
 
     async def _handle_resume_upload(self, page: Page) -> None:
-        """Upload resume if a file input is present and no resume is already selected."""
-        if not self.profile.resume_path or not Path(self.profile.resume_path).exists():
+        """Upload resume if needed; prefer a previously-uploaded resume on file."""
+        resume_path = Path(self.profile.resume_path) if self.profile.resume_path else None
+
+        # If LinkedIn shows an already-uploaded resume card, select the first one
+        existing_card = page.locator(_RESUME_CARD).first
+        if await existing_card.count() > 0:
+            logger.debug("[LinkedIn] Resume already on file — using it")
+            try:
+                if not await existing_card.is_checked():
+                    await existing_card.click()
+            except Exception:
+                pass  # not a checkbox-style card; it's just displayed
+            return
+
+        # No resume on file — upload from disk
+        if not resume_path or not resume_path.exists():
+            logger.debug("[LinkedIn] No resume file found, skipping upload")
             return
 
         file_input = page.locator(f"{_MODAL} {_FILE_INPUT}").first
         if await file_input.count() == 0:
             return
 
-        # Check if a resume card is already selected (LinkedIn may show previously uploaded)
-        existing = page.locator(_RESUME_CARD).first
-        if await existing.count() > 0:
-            # A resume is already present — use it
-            logger.debug("[LinkedIn] Resume already on file, skipping upload")
-            return
-
-        await file_input.set_input_files(str(self.profile.resume_path))
-        logger.info(f"[LinkedIn] Uploaded resume: {self.profile.resume_path}")
-        await asyncio.sleep(1.5)  # wait for upload to process
+        await file_input.set_input_files(str(resume_path))
+        logger.info(f"[LinkedIn] Uploaded resume: {resume_path.name}")
+        # Wait for LinkedIn to process the upload (shows a progress indicator)
+        try:
+            await page.wait_for_selector(
+                f"{_MODAL} {_RESUME_CARD}",
+                timeout=8_000,
+            )
+        except PWTimeoutError:
+            logger.debug("[LinkedIn] Resume upload progress indicator not detected (may be fine)")
+        await asyncio.sleep(0.5)
 
     # ------------------------------------------------------------------
     # Label / answer helpers

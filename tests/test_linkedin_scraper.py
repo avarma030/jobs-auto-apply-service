@@ -66,9 +66,13 @@ SAMPLE_DETAIL_HTML = """
 # ── Scraper setup helpers ──────────────────────────────────────────────────────
 
 def make_scraper() -> LinkedInScraper:
+    from fake_useragent import UserAgent
     scraper = LinkedInScraper.__new__(LinkedInScraper)
     scraper.credentials = {}
     scraper._session_active = False
+    scraper._ua = UserAgent()
+    scraper._proxies = []
+    scraper._proxy_index = 0
     return scraper
 
 

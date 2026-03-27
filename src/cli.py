@@ -157,6 +157,149 @@ def stats() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# login
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command()
+@click.argument("board", type=click.Choice(["linkedin"], case_sensitive=False))
+def login(board: str) -> None:
+    """Open a visible browser window to log in and save the session cookie.
+
+    Run this once before using the applier so it doesn't need to log in
+    on every run.  The session is saved to data/.linkedin_session/.
+
+    Example:
+        python main.py login linkedin
+    """
+    async def _run() -> None:
+        from pathlib import Path
+        from src.utils.browser import BrowserManager
+
+        console.print(f"\n[bold cyan]Opening browser for {board} login…[/bold cyan]")
+        console.print("[dim]Log in manually, then close the browser window (or press Ctrl-C).[/dim]\n")
+
+        bm = BrowserManager(
+            headless=False,
+            user_data_dir=Path(f"data/.{board}_session"),
+        )
+        await bm.start()
+        page = await bm.new_page()
+
+        if board == "linkedin":
+            await page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
+
+        # Keep browser open until user closes it or Ctrl-C
+        try:
+            await page.wait_for_event("close", timeout=0)  # wait forever
+        except Exception:
+            pass
+        finally:
+            await bm.stop()
+
+        console.print(f"[green]✓ Session saved to data/.{board}_session/[/green]")
+        console.print("[dim]Future runs will reuse this session automatically.[/dim]")
+
+    asyncio.run(_run())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# verify-linkedin
+# ──────────────────────────────────────────────────────────────────────────────
+
+@main.command("verify-linkedin")
+@click.option("--keywords", "-k", default="software engineer", help="Test search keywords")
+@click.option("--max-jobs", default=5, type=int, help="Jobs to fetch for the health check")
+def verify_linkedin(keywords: str, max_jobs: int) -> None:
+    """Run a quick health check on the LinkedIn integration.
+
+    Checks:
+    • Can reach the LinkedIn guest search API
+    • Parses at least one job card
+    • Session cookie exists (login status)
+
+    Does NOT apply to any jobs.
+    """
+    async def _run() -> None:
+        import sys
+        from src.models import JobSearchFilter
+        from src.scrapers.linkedin import LinkedInScraper
+        from rich.panel import Panel
+
+        console.rule("[bold cyan]LinkedIn Health Check[/bold cyan]")
+        results: dict[str, str] = {}
+
+        # 1. Scraper connectivity
+        console.print("\n[bold]1. Scraping test…[/bold]")
+        jobs = []
+        error_msg = ""
+        try:
+            async with LinkedInScraper() as scraper:
+                search_filter = JobSearchFilter(
+                    keywords=keywords.split(), max_age_days=0
+                )
+                async for job in scraper.search(search_filter):
+                    jobs.append(job)
+                    console.print(f"   ✓ {job.title} @ {job.company}")
+                    if len(jobs) >= max_jobs:
+                        break
+        except Exception as exc:
+            error_msg = str(exc)
+
+        if jobs:
+            results["Scraping"] = f"[green]✓ {len(jobs)} jobs fetched[/green]"
+        else:
+            results["Scraping"] = f"[red]✗ No jobs (error: {error_msg or 'empty response'})[/red]"
+
+        # 2. Session cookie
+        console.print("\n[bold]2. Session cookie…[/bold]")
+        session_dir = Path("data/.linkedin_session")
+        if session_dir.exists() and any(session_dir.iterdir()):
+            results["Session cookie"] = "[green]✓ Found[/green]"
+            console.print("   ✓ Session directory exists")
+        else:
+            results["Session cookie"] = "[yellow]⚠ Not found — run: python main.py login linkedin[/yellow]"
+            console.print("   ⚠ No session — run 'python main.py login linkedin' to log in")
+
+        # 3. Resume file
+        console.print("\n[bold]3. Resume file…[/bold]")
+        resume = Path(settings.resume_path)
+        if resume.exists():
+            results["Resume"] = f"[green]✓ {resume}[/green]"
+            console.print(f"   ✓ {resume}")
+        else:
+            results["Resume"] = f"[yellow]⚠ Not found at {resume}[/yellow]"
+            console.print(f"   ⚠ Missing — add your resume at {resume}")
+
+        # 4. User profile
+        console.print("\n[bold]4. User profile…[/bold]")
+        profile_path = Path(settings.user_profile_path)
+        if profile_path.exists():
+            try:
+                profile = load_profile(profile_path)
+                results["User profile"] = f"[green]✓ {profile.first_name} {profile.last_name}[/green]"
+                console.print(f"   ✓ Loaded profile for {profile.first_name} {profile.last_name}")
+            except Exception as exc:
+                results["User profile"] = f"[red]✗ Parse error: {exc}[/red]"
+        else:
+            results["User profile"] = f"[yellow]⚠ Not found — copy data/user_profile.example.json[/yellow]"
+
+        # Summary
+        console.print()
+        console.rule("[bold]Summary[/bold]")
+        for check, status in results.items():
+            console.print(f"  {check:20s} {status}")
+
+        all_green = all("✓" in v for v in results.values())
+        console.print()
+        if all_green:
+            console.print(Panel("[bold green]All checks passed — LinkedIn is ready.[/bold green]", expand=False))
+        else:
+            console.print(Panel("[bold yellow]Some checks need attention (see above).[/bold yellow]", expand=False))
+
+    asyncio.run(_run())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 

@@ -23,15 +23,17 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import AsyncIterator
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode
 
 import httpx
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from src.config import settings
 from src.models import ExperienceLevel, Job, JobSearchFilter, JobType, WorkMode
 from src.scrapers.base import BaseScraper
 
@@ -65,7 +67,18 @@ _EXP_LEVEL_MAP = {
 
 _PAGE_SIZE = 25
 _MAX_PAGES = 40  # 1 000 jobs per search
-_REQUEST_DELAY = 2.0  # seconds between requests
+
+# Signals LinkedIn returned a login/CAPTCHA wall instead of job cards
+_CAPTCHA_SIGNALS = (
+    "authwall",
+    "checkpoint/challenge",
+    "linkedin.com/uas/login",
+    "Sign in",
+)
+
+
+class _RateLimitError(Exception):
+    """Raised on 429 so tenacity can retry with backoff."""
 
 
 class LinkedInScraper(BaseScraper):
@@ -81,17 +94,43 @@ class LinkedInScraper(BaseScraper):
 
     async def setup(self) -> None:
         await super().setup()
-        ua = UserAgent()
-        self._client = httpx.AsyncClient(
+        self._ua = UserAgent()
+        self._proxies: list[str] = self._load_proxies()
+        self._proxy_index = 0
+        self._client = self._make_client()
+
+    def _make_client(self, proxy: str | None = None) -> httpx.AsyncClient:
+        """Build a fresh httpx client, optionally via *proxy*."""
+        return httpx.AsyncClient(
             headers={
-                "User-Agent": ua.random,
+                "User-Agent": self._ua.random,
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": "https://www.linkedin.com/jobs/search/",
+                "DNT": "1",
             },
             timeout=30,
             follow_redirects=True,
+            proxy=proxy,
         )
+
+    def _load_proxies(self) -> list[str]:
+        if not settings.use_proxies or not settings.proxy_list_path:
+            return []
+        path = Path(settings.proxy_list_path)
+        if not path.exists():
+            logger.warning(f"[LinkedIn] Proxy list not found: {path}")
+            return []
+        proxies = [line.strip() for line in path.read_text().splitlines() if line.strip()]
+        logger.info(f"[LinkedIn] Loaded {len(proxies)} proxies")
+        return proxies
+
+    def _next_proxy(self) -> str | None:
+        if not self._proxies:
+            return None
+        proxy = self._proxies[self._proxy_index % len(self._proxies)]
+        self._proxy_index += 1
+        return proxy
 
     async def teardown(self) -> None:
         await self._client.aclose()
@@ -156,7 +195,7 @@ class LinkedInScraper(BaseScraper):
             if new_this_page == 0:
                 break
 
-            await asyncio.sleep(_REQUEST_DELAY)
+            await asyncio.sleep(settings.request_delay_seconds)
 
     async def get_job_details(self, job: Job) -> Job:
         """Fetch the full job detail page and enrich *job* in-place."""
@@ -230,22 +269,65 @@ class LinkedInScraper(BaseScraper):
     # HTTP helpers
     # ------------------------------------------------------------------
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(
+        retry=retry_if_exception_type(_RateLimitError),
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=2, min=10, max=60),
+        reraise=True,
+    )
     async def _fetch_search_page(self, params: dict) -> str:
         url = f"{_GUEST_SEARCH_URL}?{urlencode(params)}"
-        resp = await self._client.get(url)
-        if resp.status_code == 429:
-            logger.warning("[LinkedIn] Rate limited (429) — backing off")
-            await asyncio.sleep(30)
-            resp.raise_for_status()
-        resp.raise_for_status()
-        return resp.text
+        return await self._get(url)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(
+        retry=retry_if_exception_type(_RateLimitError),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=5, max=30),
+        reraise=True,
+    )
     async def _fetch_page(self, url: str) -> str:
-        resp = await self._client.get(url)
+        return await self._get(url)
+
+    async def _get(self, url: str) -> str:
+        """GET *url*, rotating proxy and user-agent on each call."""
+        # Rotate user-agent per request
+        self._client.headers["User-Agent"] = self._ua.random
+
+        try:
+            resp = await self._client.get(url)
+        except httpx.ProxyError:
+            # Rotate to next proxy and retry
+            proxy = self._next_proxy()
+            if proxy:
+                logger.warning(f"[LinkedIn] Proxy error, rotating to next proxy")
+                await self._client.aclose()
+                self._client = self._make_client(proxy)
+            raise _RateLimitError("Proxy error")
+
+        if resp.status_code == 429:
+            logger.warning("[LinkedIn] Rate limited (429) — will back off and retry")
+            raise _RateLimitError("429 Too Many Requests")
+
+        if resp.status_code in (403, 999):
+            # LinkedIn uses 999 for bot detection
+            logger.warning(f"[LinkedIn] Blocked ({resp.status_code}) — rotating proxy/UA")
+            proxy = self._next_proxy()
+            await self._client.aclose()
+            self._client = self._make_client(proxy)
+            raise _RateLimitError(f"Blocked with {resp.status_code}")
+
         resp.raise_for_status()
-        return resp.text
+        html = resp.text
+
+        # Detect auth-wall / CAPTCHA redirect in body
+        if any(signal in html for signal in _CAPTCHA_SIGNALS):
+            logger.warning(
+                "[LinkedIn] Response looks like a login wall or CAPTCHA. "
+                "Consider using proxies (USE_PROXIES=true) or adding a delay."
+            )
+            return ""  # treat as empty page — no crash, just no results
+
+        return html
 
     # ------------------------------------------------------------------
     # HTML parsing
