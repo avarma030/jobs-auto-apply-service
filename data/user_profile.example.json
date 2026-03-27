@@ -73,6 +73,8 @@
     "require_confirmation": false,
     "max_applications_per_day": 50,
     "easy_apply_only": false,
+    "min_match_score": 75,
+    "min_ats_score": 90,
     "skip_if_salary_not_listed": false,
     "preferred_work_modes": ["remote", "hybrid"],
     "blacklisted_companies": ["Company I Dont Like"],

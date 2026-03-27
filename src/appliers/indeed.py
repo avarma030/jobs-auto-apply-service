@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.appliers.base import ApplicationResult, BaseApplier
-from src.models import Job
+from src.models import ApplicationPackage, Job
 
 
 class IndeedApplier(BaseApplier):
@@ -10,7 +10,7 @@ class IndeedApplier(BaseApplier):
     board_name = "Indeed"
     board_slug = "indeed"
 
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(self, job: Job, package: ApplicationPackage | None = None) -> ApplicationResult:
         if not self.can_apply(job):
             return self._skip(job, "Not an Indeed job")
         try:

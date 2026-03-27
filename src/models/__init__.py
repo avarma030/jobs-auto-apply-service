@@ -1,3 +1,4 @@
+from .autopilot import ApplicationPackage, ApplicationRoute, AutomationState, AutopilotRun, JobAutomationResult
 from .job import ApplicationStatus, ExperienceLevel, Job, JobSearchFilter, JobType, WorkMode
 from .user_profile import (
     Address,
@@ -17,6 +18,11 @@ __all__ = [
     "WorkMode",
     "ExperienceLevel",
     "ApplicationStatus",
+    "ApplicationPackage",
+    "ApplicationRoute",
+    "AutomationState",
+    "AutopilotRun",
+    "JobAutomationResult",
     "UserProfile",
     "Address",
     "WorkExperience",

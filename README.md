@@ -51,12 +51,15 @@ playwright install chromium
 ### 2. Set up your profile
 
 ```bash
-cp data/user_profile.example.json data/user_profile.json
-# Edit data/user_profile.json with your info
-# Add your resume as data/resume.pdf
 cp .env.example .env
+# Add your resume as data/resume.pdf
+python main.py profile bootstrap --resume data/resume.pdf
+# Review the generated data/user_profile.json and fill any gaps
 # Edit .env as needed
 ```
+
+If you prefer the manual route, you can still copy `data/user_profile.example.json` to
+`data/user_profile.json` and edit it by hand.
 
 ### 3. Scrape jobs
 

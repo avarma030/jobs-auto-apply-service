@@ -4,7 +4,7 @@ import abc
 
 from loguru import logger
 
-from src.models import ApplicationStatus, Job, UserProfile
+from src.models import ApplicationPackage, ApplicationStatus, Job, UserProfile
 
 
 class ApplicationResult:
@@ -64,7 +64,7 @@ class BaseApplier(abc.ABC):
     # ------------------------------------------------------------------
 
     @abc.abstractmethod
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(self, job: Job, package: ApplicationPackage | None = None) -> ApplicationResult:
         """Attempt to apply to *job* using *self.profile*.
 
         Returns an ``ApplicationResult`` regardless of success/failure.

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.appliers.base import ApplicationResult, BaseApplier
-from src.models import Job
+from src.models import ApplicationPackage, Job
 
 
 class GenericApplier(BaseApplier):
@@ -17,7 +17,7 @@ class GenericApplier(BaseApplier):
     def can_apply(self, job: Job) -> bool:
         return True  # fallback — handles anything
 
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(self, job: Job, package: ApplicationPackage | None = None) -> ApplicationResult:
         try:
             # TODO:
             # 1. Navigate to job.url

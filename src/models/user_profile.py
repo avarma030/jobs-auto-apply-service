@@ -63,6 +63,8 @@ class ApplicationPreferences(BaseModel):
     require_confirmation: bool = False  # pause and ask before each apply
     max_applications_per_day: int = 50
     easy_apply_only: bool = False
+    min_match_score: int = Field(default=75, ge=0, le=100)
+    min_ats_score: int = Field(default=90, ge=0, le=100)
     skip_if_salary_not_listed: bool = False
     preferred_work_modes: list[str] = Field(default_factory=lambda: ["remote", "hybrid"])
     blacklisted_companies: list[str] = Field(default_factory=list)

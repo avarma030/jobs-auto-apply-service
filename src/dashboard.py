@@ -14,10 +14,18 @@ from urllib.parse import parse_qs
 
 from loguru import logger
 
+from src.autopilot import AutopilotEngine
 from src.config import settings
-from src.models import Job, JobSearchFilter
+from src.models import (
+    ApplicationRoute,
+    AutopilotRun,
+    AutomationState,
+    JobAutomationResult,
+    JobSearchFilter,
+)
 from src.scrapers.linkedin import LinkedInScraper
 from src.scrapers.workday import WorkdayScraper
+from src.utils import load_profile
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
@@ -136,7 +144,7 @@ def parse_dashboard_query(form_data: Mapping[str, list[str]]) -> DashboardQuery:
     )
 
 
-async def run_dashboard_search(query: DashboardQuery) -> list[Job]:
+async def run_dashboard_search(query: DashboardQuery) -> AutopilotRun:
     if query.board == "workday" and not settings.workday_tenant_url_list():
         raise ValueError("Set WORKDAY_TENANT_URLS before running Workday searches.")
 
@@ -144,13 +152,19 @@ async def run_dashboard_search(query: DashboardQuery) -> list[Job]:
     if scraper_cls is None:
         raise ValueError(f"Unsupported board: {query.board}")
 
-    results: list[Job] = []
-    async with scraper_cls() as scraper:
-        async for job in scraper.search(query.to_search_filter()):
-            results.append(job)
-            if len(results) >= query.limit:
-                break
-    return results
+    profile = load_profile(settings.user_profile_path)
+    live_apply_routes = (
+        {ApplicationRoute.LINKEDIN_EASY_APPLY}
+        if query.board == "linkedin"
+        else set()
+    )
+    engine = AutopilotEngine(profile=profile, live_apply_routes=live_apply_routes)
+    return await engine.run_search(
+        board=query.board,
+        scraper_cls=scraper_cls,
+        search_filter=query.to_search_filter(),
+        limit=query.limit,
+    )
 
 
 def serve_dashboard(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, *, open_browser: bool = True) -> None:
@@ -205,7 +219,7 @@ def _make_handler() -> type[BaseHTTPRequestHandler]:
 
             started = perf_counter()
             try:
-                jobs = asyncio.run(run_dashboard_search(query))
+                run = asyncio.run(run_dashboard_search(query))
             except Exception as exc:
                 logger.exception("Dashboard search failed")
                 self._write_html(
@@ -220,7 +234,7 @@ def _make_handler() -> type[BaseHTTPRequestHandler]:
             self._write_html(
                 render_dashboard_page(
                     query=query,
-                    results=jobs,
+                    run=run,
                     duration_seconds=perf_counter() - started,
                 )
             )
@@ -250,13 +264,15 @@ def _make_handler() -> type[BaseHTTPRequestHandler]:
 def render_dashboard_page(
     *,
     query: DashboardQuery | None = None,
-    results: list[Job] | None = None,
+    run: AutopilotRun | None = None,
     error: str | None = None,
     duration_seconds: float | None = None,
 ) -> str:
     query = query or DashboardQuery(location="Ireland")
-    results = results or []
+    run = run or AutopilotRun(board=query.board)
+    results = run.results
     has_results = bool(results)
+    has_run = run.total_scraped > 0 or has_results
     board_label = board_display_name(query.board)
 
     if error:
@@ -266,22 +282,23 @@ def render_dashboard_page(
           <p>{escape_html(error)}</p>
         </div>
         """
-    elif has_results:
+    elif has_run:
+        visible_label = "visible Easy Apply match(es)" if query.board == "linkedin" else "visible shortlisted match(es)"
         status_banner = f"""
         <div class="status status--success">
-          <div class="status__label">Live run complete</div>
-          <p>Found {len(results)} {escape_html(board_label)} result(s){format_duration(duration_seconds)}.</p>
+          <div class="status__label">Autopilot run complete</div>
+          <p>Scraped {run.total_scraped} {escape_html(board_label)} job(s), filtered out {run.filtered_out_count}, kept {run.shortlisted_count} {visible_label}, submitted {run.auto_applied_count}, and held back {run.ats_blocked_count}{format_duration(duration_seconds)}.</p>
         </div>
         """
     else:
         status_banner = """
         <div class="status status--neutral">
           <div class="status__label">Ready to search</div>
-          <p>Use a preset or type your own search. Results render from the live scraper below.</p>
+          <p>Use a preset or type your own search. One run will scrape, score, tailor, and route the jobs below.</p>
         </div>
         """
 
-    result_markup = "".join(render_result_card(job, index=index) for index, job in enumerate(results, start=1))
+    result_markup = "".join(render_result_card(result, index=index) for index, result in enumerate(results, start=1))
     if not result_markup:
         result_markup = render_empty_state()
 
@@ -1172,27 +1189,27 @@ def render_dashboard_page(
   <main class="shell">
     <section class="masthead">
       <section class="panel hero">
-        <div class="hero__eyebrow">Live {escape_html(board_label)} search console</div>
-        <h1>Search jobs like a product, not a shell script.</h1>
-        <p>This dashboard runs the same real scraper underneath, but wraps it in a much faster experience: presets, recent searches, rich result cards, quick copy actions, and a cleaner scan path from query to apply link.</p>
+        <div class="hero__eyebrow">Live {escape_html(board_label)} autopilot console</div>
+        <h1>Search once. Let the application system take it from there.</h1>
+        <p>This dashboard runs the live scraper, scores the jobs against the profile, tailors the application package, and routes each match into the right apply path without making the user babysit the process.</p>
         <div class="hero__meta">
           <span class="hero__meta-chip">{escape_html(board_label)} selected</span>
-          <span class="hero__meta-chip">Live detail enrichment</span>
-          <span class="hero__meta-chip">Preset search chips</span>
-          <span class="hero__meta-chip">Recent search memory</span>
+          <span class="hero__meta-chip">Compatibility scoring</span>
+          <span class="hero__meta-chip">ATS tailoring</span>
+          <span class="hero__meta-chip">Handler routing</span>
         </div>
       </section>
       <aside class="panel insight-stack">
         <section class="insight-card">
-          <h2>Built for convenience first</h2>
-          <p>Fill one form, run one search, and get polished cards with the fields people actually care about. It is still local and fast, but it no longer feels like tooling.</p>
+          <h2>Built for one input</h2>
+          <p>Search criteria are the only user action. The run behind it handles scraping, filtering, tailoring, and handler selection before a job ever shows up in the list.</p>
         </section>
         <section class="insight-card">
-          <h2>Good search habits</h2>
+          <h2>Autopilot priorities</h2>
           <div class="insight-list">
-            <div class="insight-row"><span>Keep result limits small while testing</span><strong>1-12</strong></div>
-            <div class="insight-row"><span>Use presets to avoid repetitive typing</span><strong>1 click</strong></div>
-            <div class="insight-row"><span>Copy job links directly from cards</span><strong>Instant</strong></div>
+            <div class="insight-row"><span>Only show jobs above the match threshold</span><strong>75%+</strong></div>
+            <div class="insight-row"><span>Tailor the application package before apply</span><strong>90% ATS</strong></div>
+            <div class="insight-row"><span>Route each job into the right handler</span><strong>Automatic</strong></div>
           </div>
         </section>
       </aside>
@@ -1204,7 +1221,7 @@ def render_dashboard_page(
           <div class="section-title">
             <div>
               <h2>Search setup</h2>
-              <p>Start with a preset or build a custom query.</p>
+              <p>Start with a preset or define the exact jobs the autopilot should chase.</p>
             </div>
           </div>
           <div class="preset-grid">{presets_markup}</div>
@@ -1230,7 +1247,7 @@ def render_dashboard_page(
                 <select id="board" name="board">
                   {board_options_markup}
                 </select>
-                <div class="field-hint">Choose the live scraper to run without changing the rest of your search flow.</div>
+                <div class="field-hint">Choose the board to scrape. The scoring, tailoring, and routing flow stays the same.</div>
               </div>
 
               <div class="field">
@@ -1266,7 +1283,7 @@ def render_dashboard_page(
               </label>
 
               <div class="actions">
-                <button type="submit" class="button button--primary" id="search-button">Run live scraper</button>
+                <button type="submit" class="button button--primary" id="search-button">Run autopilot</button>
                 <button type="button" class="button button--ghost" id="clear-button">Clear</button>
               </div>
             </div>
@@ -1278,7 +1295,7 @@ def render_dashboard_page(
         <div class="results-head">
           <div>
             <h2>Results</h2>
-            <p>Each card is generated from the real {escape_html(board_label)} scraper output, with detail-page enrichment where available.</p>
+            <p>Each card comes from the real {escape_html(board_label)} scraper output, then gets scored, tailored, and routed into the right application path.</p>
           </div>
           <div class="actions">
             <button type="button" class="button button--ghost" id="copy-search-button">Copy search summary</button>
@@ -1286,7 +1303,7 @@ def render_dashboard_page(
         </div>
 
         {status_banner}
-        {render_stat_cards(results, duration_seconds)}
+        {render_stat_cards(run, duration_seconds)}
         <div class="query-strip">{render_query_chips(query)}</div>
         <div class="results-grid">
           {result_markup}
@@ -1459,10 +1476,10 @@ def render_dashboard_page(
       const payload = currentSearchPayload();
       saveRecentSearch(payload);
       button.disabled = true;
-      button.textContent = "Running live scraper...";
+      button.textContent = "Running autopilot...";
     }});
 
-    if ({str(has_results).lower()} || {str(bool(error)).lower()}) {{
+    if ({str(has_run).lower()} || {str(bool(error)).lower()}) {{
       setTimeout(() => resultsSection?.scrollIntoView({{ behavior: "smooth", block: "start" }}), 120);
     }}
 
@@ -1472,11 +1489,13 @@ def render_dashboard_page(
 </html>"""
 
 
-def render_stat_cards(results: list[Job], duration_seconds: float | None) -> str:
+def render_stat_cards(run: AutopilotRun, duration_seconds: float | None) -> str:
     cards = [
-        ("Results", str(len(results))),
-        ("Companies", str(count_unique_companies(results))),
-        ("Easy Apply", str(sum(1 for job in results if job.easy_apply))),
+        ("Scraped", str(run.total_scraped)),
+        ("Filtered out", str(run.filtered_out_count)),
+        ("Visible", str(run.shortlisted_count)),
+        ("Applied", str(run.auto_applied_count)),
+        ("Needs review", str(run.ats_blocked_count)),
         ("Runtime", format_runtime(duration_seconds)),
     ]
     markup = "".join(
@@ -1524,27 +1543,27 @@ def render_preset_chip(preset: dict[str, object], *, index: int) -> str:
 def render_empty_state() -> str:
     return """
     <article class="empty-state">
-      <h3>Your live results will land here.</h3>
-      <p>Pick a preset or enter your own search criteria to run the scraper. When jobs arrive, this panel turns into a clean application workspace with copy-ready links and a faster scan path from query to apply link.</p>
+      <h3>Your autopilot shortlist will land here.</h3>
+      <p>Pick a preset or enter your own search criteria to launch the scrape, scoring, and tailoring flow. When jobs arrive, this panel turns into a ranked application workspace with route and handler decisions already made.</p>
       <div class="empty-grid">
         <div class="empty-card">
           <strong>Start narrow</strong>
-          <span>Use one job title and one location first. It is the fastest way to validate relevance.</span>
+          <span>Use one title and one location first so the compatibility filter stays honest.</span>
         </div>
         <div class="empty-card">
-          <strong>Lean on presets</strong>
-          <span>Quick search chips save repetitive typing and make demo flows feel instant.</span>
+          <strong>Lean on thresholds</strong>
+          <span>Only jobs above the match threshold stay in the list, so empty states are useful signal too.</span>
         </div>
         <div class="empty-card">
-          <strong>Copy what matters</strong>
-          <span>Each result card gives you direct actions instead of forcing you to manage tabs or raw JSON.</span>
+          <strong>Inspect the handoff</strong>
+          <span>Each result shows the handler, ATS score, and apply status instead of just dumping raw scrape output.</span>
         </div>
       </div>
     </article>
     """
 
 
-def render_action_panel(results: list[Job]) -> str:
+def render_action_panel(results: list[JobAutomationResult]) -> str:
     if not results:
         return """
         <section class="search-section">
@@ -1569,7 +1588,8 @@ def render_action_panel(results: list[Job]) -> str:
         </section>
         """
 
-    top_job = results[0]
+    top_result = results[0]
+    top_job = top_result.job
     summary = " | ".join(
         part for part in [top_job.company, top_job.location or "Location not listed", format_posted_at(top_job.posted_at)] if part
     )
@@ -1592,10 +1612,14 @@ def render_action_panel(results: list[Job]) -> str:
         <h3>{escape_html(top_job.title)}</h3>
         <p class="launch-meta">{escape_html(summary)}</p>
         <div class="result-card__tags">
-          {render_pill("Easy Apply", kind="signal") if top_job.easy_apply else render_pill("Review details")}
+          {render_pill(f"Match {top_result.compatibility_score}%", kind="signal")}
+          {render_pill(f"ATS {top_result.ats_score}%", kind="warm")}
+          {render_pill(route_display_name(top_result.route))}
+          {render_pill(automation_state_label(top_result.automation_state), kind=automation_state_kind(top_result.automation_state))}
           {render_pill(str(top_job.job_type).replace("_", " ").title()) if top_job.job_type else ""}
           {render_pill(str(top_job.experience_level).replace("_", " ").title(), kind="warm") if top_job.experience_level else ""}
         </div>
+        <p class="launch-meta">{escape_html(automation_note(top_result))}</p>
         <div class="actions">
           {actions}
         </div>
@@ -1604,10 +1628,13 @@ def render_action_panel(results: list[Job]) -> str:
     """
 
 
-def render_result_card(job: Job, *, index: int) -> str:
+def render_result_card(result: JobAutomationResult, *, index: int) -> str:
+    job = result.job
     meta_items = [
         render_pill(job.location or "Location not listed"),
         render_pill(format_posted_at(job.posted_at), kind="warm"),
+        render_pill(f"Match {result.compatibility_score}%", kind="signal"),
+        render_pill(f"ATS {result.ats_score}%", kind="warm"),
     ]
     if job.job_type:
         meta_items.append(render_pill(str(job.job_type).replace("_", " ").title()))
@@ -1617,8 +1644,16 @@ def render_result_card(job: Job, *, index: int) -> str:
         meta_items.append(render_pill(str(job.work_mode).replace("_", " ").title()))
     if job.easy_apply:
         meta_items.append(render_pill("Easy Apply", kind="signal"))
+    meta_items.append(render_pill(route_display_name(result.route)))
+    meta_items.append(
+        render_pill(
+            automation_state_label(result.automation_state),
+            kind=automation_state_kind(result.automation_state),
+        )
+    )
 
-    tags_markup = "".join(render_pill(tag, kind="signal") for tag in job.tags[:5]) or render_pill("Detail page enriched")
+    signal_terms = [*result.matched_keywords[:3], *[f"Tailored: {term}" for term in result.added_keywords[:2]]]
+    tags_markup = "".join(render_pill(tag, kind="signal") for tag in signal_terms) or render_pill("Profile alignment ready")
     description = escape_html(shorten(job.description or "No description available yet.", limit=320))
     apply_href = escape_html(job.url)
     featured_flag = '<div class="result-card__flag">Top result</div>' if index == 1 else ""
@@ -1647,7 +1682,7 @@ def render_result_card(job: Job, *, index: int) -> str:
         </div>
 
         <div class="result-card__footer">
-          <p class="result-card__note">{escape_html(board_apply_note(job.source_board))}</p>
+          <p class="result-card__note">{escape_html(automation_note(result))}</p>
           <div class="result-card__actions">
             <button type="button" class="link-button link-button--secondary" data-copy-url="{apply_href}">Copy link</button>
             <a class="link-button link-button--primary" href="{apply_href}" target="_blank" rel="noopener">Open Apply Link</a>
@@ -1667,8 +1702,8 @@ def render_pill(label: str, *, kind: str | None = None) -> str:
     return f'<span class="{class_name}">{escape_html(label)}</span>'
 
 
-def count_unique_companies(results: list[Job]) -> int:
-    return len({job.company.strip().lower() for job in results if job.company.strip()})
+def count_unique_companies(results: list[JobAutomationResult]) -> int:
+    return len({result.job.company.strip().lower() for result in results if result.job.company.strip()})
 
 
 def company_monogram(company: str) -> str:
@@ -1689,9 +1724,44 @@ def board_display_name(board: str) -> str:
     return dict(BOARD_OPTIONS).get(board, board.title())
 
 
-def board_apply_note(board: str) -> str:
-    board_label = board_display_name(board)
-    return f"Apply opens the {board_label} job page surfaced by the scraper. Use Copy link if you want to save or share the exact result instantly."
+def route_display_name(route: object) -> str:
+    route_value = getattr(route, "value", route)
+    labels = {
+        "linkedin_easy_apply": "LinkedIn Easy Apply",
+        "linkedin_external": "External site",
+        "greenhouse": "Greenhouse",
+        "workday": "Workday",
+        "lever": "Lever",
+        "generic": "Generic handler",
+    }
+    return labels.get(str(route_value), str(route_value).replace("_", " ").title())
+
+
+def automation_state_label(state: AutomationState) -> str:
+    labels = {
+        AutomationState.READY: "Ready",
+        AutomationState.APPLIED: "Applied",
+        AutomationState.QUEUED: "Queued",
+        AutomationState.NEEDS_REVIEW: "Needs review",
+        AutomationState.FAILED: "Failed",
+    }
+    return labels[state]
+
+
+def automation_state_kind(state: AutomationState) -> str | None:
+    if state == AutomationState.APPLIED:
+        return "signal"
+    if state in {AutomationState.QUEUED, AutomationState.NEEDS_REVIEW}:
+        return "warm"
+    return "signal" if state == AutomationState.READY else None
+
+
+def automation_note(result: JobAutomationResult) -> str:
+    note_parts = [
+        f"{automation_state_label(result.automation_state)} via {result.handler_name}.",
+        result.auto_apply_message or f"{route_display_name(result.route)} route detected.",
+    ]
+    return " ".join(part.strip() for part in note_parts if part.strip())
 
 
 def format_runtime(duration_seconds: float | None) -> str:

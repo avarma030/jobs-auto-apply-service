@@ -6,7 +6,54 @@ import pytest
 
 from src import dashboard as dashboard_module
 from src.dashboard import DashboardQuery, format_posted_at, parse_dashboard_query, render_dashboard_page, run_dashboard_search, split_keywords
-from src.models import Job
+from src.models import (
+    ApplicationPackage,
+    ApplicationRoute,
+    AutopilotRun,
+    AutomationState,
+    Job,
+    JobAutomationResult,
+)
+
+
+def build_result(
+    *,
+    board: str = "linkedin",
+    route: ApplicationRoute = ApplicationRoute.LINKEDIN_EASY_APPLY,
+    state: AutomationState = AutomationState.QUEUED,
+    handler_name: str = "LinkedInApplier",
+) -> JobAutomationResult:
+    job = Job(
+        title="Senior Project Manager",
+        company="Acme Delivery",
+        location="Dublin, Ireland",
+        description="Lead cross-functional delivery across a complex transformation programme.",
+        url="https://example.com/jobs/123",
+        source_board=board,
+        external_id="123",
+        job_type="contract",
+        experience_level="senior",
+        posted_at=datetime(2026, 3, 27),
+        easy_apply=route == ApplicationRoute.LINKEDIN_EASY_APPLY,
+    )
+    return JobAutomationResult(
+        job=job,
+        compatibility_score=92,
+        compatibility_reasons=["25% search alignment", "37% keyword overlap"],
+        route=route,
+        handler_name=handler_name,
+        package=ApplicationPackage(
+            resume_path=None,
+            cover_letter_path=None,
+            resume_preview="Tailored resume preview",
+            cover_letter_text="Tailored cover letter",
+            ats_score=95,
+            matched_keywords=["project", "manager", "delivery"],
+            added_keywords=["stakeholder"],
+        ),
+        automation_state=state,
+        auto_apply_message=f"Tailored application package is ready and routed to {handler_name}.",
+    )
 
 
 def test_split_keywords_preserves_single_phrase() -> None:
@@ -49,20 +96,13 @@ def test_format_posted_at_handles_date_only() -> None:
     assert format_posted_at(datetime(2026, 3, 27)) == "2026-03-27"
 
 
-def test_render_dashboard_page_shows_polished_result_cards() -> None:
-    job = Job(
-        title="Senior Project Manager",
-        company="Acme Delivery",
-        location="Dublin, Ireland",
-        description="Lead cross-functional delivery across a complex transformation programme.",
-        url="https://example.com/jobs/123",
-        source_board="linkedin",
-        external_id="123",
-        job_type="contract",
-        experience_level="senior",
-        posted_at=datetime(2026, 3, 27),
-        easy_apply=True,
-        tags=["Transformation", "Stakeholder Management"],
+def test_render_dashboard_page_shows_autopilot_result_cards() -> None:
+    run = AutopilotRun(
+        board="linkedin",
+        results=[build_result(state=AutomationState.APPLIED)],
+        total_scraped=4,
+        filtered_out_count=2,
+        auto_applied_count=1,
     )
 
     html = render_dashboard_page(
@@ -73,31 +113,32 @@ def test_render_dashboard_page_shows_polished_result_cards() -> None:
             remote_only=False,
             limit=10,
         ),
-        results=[job],
+        run=run,
         duration_seconds=1.23,
     )
 
-    assert "Project manager in Ireland" in html
+    assert "Search once. Let the application system take it from there." in html
+    assert "Autopilot run complete" in html
+    assert "Scraped 4 LinkedIn job(s), filtered out 2, kept 1 visible Easy Apply match(es), submitted 1, and held back 0" in html
+    assert "Match 92%" in html
+    assert "ATS 95%" in html
+    assert "Applied via LinkedInApplier." in html
+    assert "Run autopilot" in html
     assert "Copy search summary" in html
-    assert "Copy link" in html
-    assert "Open Apply Link" in html
-    assert "Next best move" in html
-    assert "Open top match" in html
-    assert "Top result" in html
-    assert "Found 1 LinkedIn result(s) in 1.2s." in html
 
 
 def test_render_dashboard_page_supports_workday_selection() -> None:
-    job = Job(
-        title="Senior Program Manager",
-        company="Acme",
-        location="Remote - Ireland",
-        description="Lead portfolio delivery across business systems.",
-        url="https://acme.wd5.myworkdayjobs.com/job/Ireland/Senior-Program-Manager_R-100",
-        source_board="workday",
-        external_id="Senior-Program-Manager_R-100",
-        job_type="full_time",
-        posted_at=datetime(2026, 3, 27),
+    run = AutopilotRun(
+        board="workday",
+        results=[
+            build_result(
+                board="workday",
+                route=ApplicationRoute.WORKDAY,
+                handler_name="WorkdayApplier",
+            )
+        ],
+        total_scraped=3,
+        queued_count=1,
     )
 
     html = render_dashboard_page(
@@ -109,59 +150,54 @@ def test_render_dashboard_page_supports_workday_selection() -> None:
             remote_only=False,
             limit=10,
         ),
-        results=[job],
+        run=run,
         duration_seconds=1.4,
     )
 
     assert 'option value="workday" selected' in html
-    assert "Live Workday search console" in html
-    assert "Found 1 Workday result(s) in 1.4s." in html
+    assert "Live Workday autopilot console" in html
+    assert "Scraped 3 Workday job(s), filtered out 0, kept 1 visible shortlisted match(es), submitted 0, and held back 0" in html
     assert "Board: Workday" in html
-    assert "Apply opens the Workday job page surfaced by the scraper." in html
+    assert "Queued via WorkdayApplier." in html
 
 
 def test_render_dashboard_page_shows_empty_state() -> None:
     html = render_dashboard_page()
 
-    assert "Your live results will land here." in html
+    assert "Your autopilot shortlist will land here." in html
     assert "Recent searches" in html
     assert "Shortcuts" in html
     assert "Ctrl + Enter" in html
 
 
 @pytest.mark.asyncio
-async def test_run_dashboard_search_dispatches_to_selected_board(monkeypatch: pytest.MonkeyPatch) -> None:
-    job = Job(
-        title="Senior Program Manager",
-        company="Acme",
-        location="Remote",
-        description="Lead delivery.",
-        url="https://example.com/job",
-        source_board="workday",
-        external_id="job-1",
-    )
+async def test_run_dashboard_search_dispatches_to_autopilot(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = AutopilotRun(board="workday", total_scraped=2)
 
-    class StubScraper:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
+    class StubEngine:
+        def __init__(self, profile, live_apply_routes) -> None:
+            self.profile = profile
+            self.live_apply_routes = live_apply_routes
 
-        async def __aenter__(self):
-            return self
+        async def run_search(self, *, board, scraper_cls, search_filter, limit):
+            assert board == "workday"
+            assert scraper_cls is object
+            assert search_filter.keywords == ["program manager"]
+            assert search_filter.location == "Ireland"
+            assert limit == 10
+            assert self.live_apply_routes == set()
+            return expected
 
-        async def __aexit__(self, *_args) -> None:
-            return None
-
-        async def search(self, _search_filter):
-            yield job
-
-    monkeypatch.setitem(dashboard_module.SCRAPER_REGISTRY, "workday", StubScraper)
+    monkeypatch.setattr(dashboard_module, "AutopilotEngine", StubEngine)
+    monkeypatch.setattr(dashboard_module, "load_profile", lambda _path: object())
+    monkeypatch.setitem(dashboard_module.SCRAPER_REGISTRY, "workday", object)
     monkeypatch.setattr(
         dashboard_module.settings,
         "workday_tenant_urls",
         "https://acme.wd5.myworkdayjobs.com/en-US/Careers",
     )
 
-    results = await run_dashboard_search(
+    run = await run_dashboard_search(
         DashboardQuery(
             board="workday",
             keywords_raw="program manager",
@@ -172,4 +208,4 @@ async def test_run_dashboard_search_dispatches_to_selected_board(monkeypatch: py
         )
     )
 
-    assert results == [job]
+    assert run == expected

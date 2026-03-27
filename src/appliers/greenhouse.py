@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.appliers.base import ApplicationResult, BaseApplier
-from src.models import Job
+from src.models import ApplicationPackage, Job
 
 
 class GreenhouseApplier(BaseApplier):
@@ -21,7 +21,7 @@ class GreenhouseApplier(BaseApplier):
     def can_apply(self, job: Job) -> bool:
         return "greenhouse.io" in (job.url or "") or job.source_board == self.board_slug
 
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(self, job: Job, package: ApplicationPackage | None = None) -> ApplicationResult:
         try:
             # TODO:
             # 1. Navigate to job.url (boards.greenhouse.io/...)

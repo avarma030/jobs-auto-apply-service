@@ -18,7 +18,8 @@ def load_profile(path: Path | str) -> UserProfile:
     if not path.exists():
         raise FileNotFoundError(
             f"User profile not found at {path}. "
-            "Copy data/user_profile.example.json to data/user_profile.json and fill in your details."
+            "Run `python main.py profile bootstrap --resume data/resume.pdf` to generate a draft, "
+            "or copy data/user_profile.example.json to data/user_profile.json and fill in your details."
         )
     with path.open() as f:
         data = json.load(f)
