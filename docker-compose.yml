@@ -1,0 +1,57 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: run --keywords "software engineer" --remote
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      USE_TASK_QUEUE: "true"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["celery", "-A", "src.tasks.celery_app", "worker", "--loglevel=info"]
+    profiles: ["queue"]
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+      POSTGRES_DB: jobs_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    profiles: ["postgres"]
+
+volumes:
+  postgres_data:
