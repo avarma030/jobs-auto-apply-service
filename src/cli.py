@@ -105,13 +105,31 @@ def apply(dry_run: bool) -> None:
 @click.option("--location", "-l", default=None)
 @click.option("--remote/--no-remote", default=False)
 @click.option("--dry-run/--no-dry-run", default=False)
+@click.option(
+    "--no-ai",
+    is_flag=True,
+    default=False,
+    help="Skip AI scoring/tailoring — fall back to scrape-then-apply",
+)
 def run(
     keywords: tuple[str, ...],
     location: str | None,
     remote: bool,
     dry_run: bool,
+    no_ai: bool,
 ) -> None:
-    """Scrape then apply in a single command."""
+    """Scrape then apply in a single command (AI pipeline by default).
+
+    The AI pipeline:
+      1. Scrapes jobs from all enabled boards
+      2. Scores each job vs your resume — skips < 75% matches
+      3. Tailors your resume for each qualifying job (ATS score ≥ 90%)
+      4. Generates a tailored cover letter
+      5. Applies via LinkedIn Easy Apply or the appropriate ATS handler
+
+    Set ANTHROPIC_API_KEY in .env to enable AI features.
+    Use --no-ai to skip scoring/tailoring and apply directly.
+    """
     search_filter = JobSearchFilter(
         keywords=list(keywords),
         location=location,
@@ -119,15 +137,35 @@ def run(
     )
 
     async def _run() -> None:
+        import os
+
+        if dry_run:
+            os.environ["DRY_RUN"] = "true"
+
         db = Database(settings.database_url)
         await db.init()
         profile = load_profile(settings.user_profile_path)
         orch = Orchestrator(profile=profile, db=db)
-        scraped = await orch.run_scrape(search_filter)
-        console.print(f"[cyan]Scraped {scraped} new jobs.[/cyan]")
-        if not dry_run:
-            counts = await orch.run_apply()
+
+        if no_ai or not settings.anthropic_api_key:
+            if not no_ai and not settings.anthropic_api_key:
+                console.print(
+                    "[yellow]⚠ ANTHROPIC_API_KEY not set — falling back to basic scrape+apply.[/yellow]\n"
+                    "[dim]Set ANTHROPIC_API_KEY in .env to enable AI scoring and resume tailoring.[/dim]"
+                )
+            scraped = await orch.run_scrape(search_filter)
+            console.print(f"[cyan]Scraped {scraped} new jobs.[/cyan]")
+            if not dry_run:
+                counts = await orch.run_apply()
+                _print_counts(counts)
+        else:
+            console.rule("[bold cyan]AI-Powered Job Pipeline[/bold cyan]")
+            counts = await orch.run_full_pipeline(
+                search_filter,
+                progress_callback=lambda msg: console.print(f"  [dim]{msg}[/dim]"),
+            )
             _print_counts(counts)
+
         await db.close()
 
     asyncio.run(_run())
@@ -282,6 +320,31 @@ def verify_linkedin(keywords: str, max_jobs: int) -> None:
                 results["User profile"] = f"[red]✗ Parse error: {exc}[/red]"
         else:
             results["User profile"] = f"[yellow]⚠ Not found — copy data/user_profile.example.json[/yellow]"
+            console.print("   ⚠ Missing — copy data/user_profile.example.json to data/user_profile.json")
+
+        # 5. Anthropic API key (AI features)
+        console.print("\n[bold]5. Anthropic API key (AI pipeline)…[/bold]")
+        if settings.anthropic_api_key:
+            import anthropic as _anthropic
+            try:
+                client = _anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+                # Lightweight ping: list models endpoint requires a valid key
+                msg = await client.messages.create(
+                    model=settings.anthropic_model,
+                    max_tokens=5,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+                results["Anthropic API"] = "[green]✓ Key valid — AI pipeline enabled[/green]"
+                console.print("   ✓ API key valid")
+            except Exception as exc:
+                results["Anthropic API"] = f"[red]✗ API error: {exc}[/red]"
+                console.print(f"   ✗ API error: {exc}")
+        else:
+            results["Anthropic API"] = (
+                "[yellow]⚠ Not set — AI scoring/tailoring disabled[/yellow]\n"
+                "             Set ANTHROPIC_API_KEY in .env to enable"
+            )
+            console.print("   ⚠ ANTHROPIC_API_KEY not set — AI features disabled (jobs will apply without scoring/tailoring)")
 
         # Summary
         console.print()

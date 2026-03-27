@@ -92,14 +92,21 @@ async def trigger_scrape(
 
 
 # ---------------------------------------------------------------------------
-# Background scrape task
+# Background pipeline task
 # ---------------------------------------------------------------------------
 
 async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
+    """Run the full AI pipeline (scrape → score → tailor → apply) as a background task.
+
+    Falls back to scrape-only if ANTHROPIC_API_KEY is not set.
+    Progress messages are pushed to the SSE stream via append_run_progress().
+    """
+    from src.api.routers.runs import append_run_progress
     from src.config import settings
     from src.database.db import Database
     from src.models import JobSearchFilter
-    from src.orchestrator import SCRAPER_REGISTRY
+    from src.orchestrator import Orchestrator
+    from src.utils import load_profile
 
     db = Database(settings.database_url)
     await db.init()
@@ -109,6 +116,9 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
         run.status = "running"
         await session.commit()
 
+    def _progress(msg: str) -> None:
+        append_run_progress(run_id, msg)
+
     try:
         filt = JobSearchFilter(
             keywords=req.keywords,
@@ -116,51 +126,33 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             remote_only=req.remote_only,
             max_age_days=req.max_age_days,
         )
-        total = 0
-        for board in req.boards:
-            if board not in SCRAPER_REGISTRY:
-                continue
-            scraper_cls = SCRAPER_REGISTRY[board]
-            try:
-                async with scraper_cls(credentials={}) as scraper:
-                    async for job in scraper.search(filt):
-                        async with db.session_factory() as session:
-                            record = JobRecord(
-                                user_id=user_id,
-                                scrape_run_id=run_id,
-                                external_id=job.external_id,
-                                source_board=job.source_board,
-                                url=job.url,
-                                title=job.title,
-                                company=job.company,
-                                location=job.location,
-                                description=job.description,
-                                job_type=job.job_type,
-                                work_mode=job.work_mode,
-                                experience_level=job.experience_level,
-                                salary_min=job.salary_min,
-                                salary_max=job.salary_max,
-                                salary_currency=job.salary_currency,
-                                skills=json.dumps(job.skills),
-                                easy_apply=job.easy_apply,
-                                posted_at=job.posted_at,
-                                scraped_at=job.scraped_at,
-                                application_status="pending",
-                            )
-                            session.add(record)
-                            await session.commit()
-                        total += 1
-            except NotImplementedError:
-                pass
-            except Exception:
-                pass
+
+        profile = load_profile(settings.user_profile_path)
+        orch = Orchestrator(profile=profile, db=db)
+
+        if settings.anthropic_api_key:
+            # Full AI pipeline: scrape → score → tailor → apply
+            counts = await orch.run_full_pipeline(
+                filt,
+                user_id=user_id,
+                progress_callback=_progress,
+            )
+            total_found = counts.get("applied", 0) + counts.get("skipped", 0) + counts.get("failed", 0) + counts.get("dry_run", 0)
+            total_applied = counts.get("applied", 0)
+        else:
+            # Scrape-only fallback (no AI key)
+            _progress("ANTHROPIC_API_KEY not set — running scrape only (no AI scoring or applying)")
+            total_found = await orch.run_scrape(filt)
+            total_applied = 0
 
         async with db.session_factory() as session:
             run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()
             run.status = "done"
-            run.jobs_found = total
+            run.jobs_found = total_found
+            run.jobs_applied = total_applied
             run.finished_at = datetime.utcnow()
             await session.commit()
+
     except Exception as exc:
         async with db.session_factory() as session:
             run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()
