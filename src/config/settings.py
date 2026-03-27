@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # Application
     # ------------------------------------------------------------------
     app_name: str = "jobs-auto-apply-service"
+    secret_key: str = "changeme-replace-with-a-long-random-secret-in-production"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     dry_run: bool = Field(
         default=False,
