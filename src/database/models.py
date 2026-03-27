@@ -1,13 +1,80 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class User(Base):
+    """Application user account."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(256), unique=True, nullable=False, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class UserProfile(Base):
+    """Serialised UserProfile JSON blob per user."""
+
+    __tablename__ = "user_profiles"
+
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    profile_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class UserSettings(Base):
+    """Per-user settings overrides stored as JSON."""
+
+    __tablename__ = "user_settings"
+
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    settings_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class ScrapeRun(Base):
+    """A single scrape+apply run triggered by a user."""
+
+    __tablename__ = "scrape_runs"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending", index=True
+    )  # pending | running | done | failed | stopped
+    boards: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    keywords: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    jobs_found: Mapped[int] = mapped_column(Integer, default=0)
+    jobs_applied: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class JobRecord(Base):
@@ -16,9 +83,15 @@ class JobRecord(Base):
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    scrape_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("scrape_runs.id", ondelete="SET NULL"), nullable=True
+    )
     external_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
     source_board: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
-    url: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
 
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     company: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -50,6 +123,9 @@ class ApplicationRecord(Base):
     __tablename__ = "applications"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     attempted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String(64), nullable=False)

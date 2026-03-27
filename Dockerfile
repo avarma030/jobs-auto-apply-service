@@ -27,5 +27,6 @@ RUN mkdir -p data/screenshots logs
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-ENTRYPOINT ["python", "main.py"]
-CMD ["--help"]
+# Default: start the API server. Override with `command:` in docker-compose.
+ENTRYPOINT []
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
