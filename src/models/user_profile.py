@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class Address(BaseModel):
@@ -70,6 +70,8 @@ class ApplicationPreferences(BaseModel):
 
 
 class UserProfile(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     # Personal info
     first_name: str
     last_name: str
@@ -107,5 +109,3 @@ class UserProfile(BaseModel):
         description="Map of question text/key → answer, used for form auto-fill",
     )
 
-    class Config:
-        arbitrary_types_allowed = True

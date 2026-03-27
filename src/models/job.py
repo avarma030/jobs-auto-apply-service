@@ -4,7 +4,9 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+
+from src.utils.time import utcnow_naive
 
 
 class JobType(str, Enum):
@@ -41,6 +43,8 @@ class ApplicationStatus(str, Enum):
 
 
 class Job(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+
     id: Optional[str] = None
     title: str
     company: str
@@ -62,7 +66,7 @@ class Job(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
     posted_at: Optional[datetime] = None
-    scraped_at: datetime = Field(default_factory=datetime.utcnow)
+    scraped_at: datetime = Field(default_factory=utcnow_naive)
 
     easy_apply: bool = False  # supports one-click / easy apply
     requires_cover_letter: bool = False
@@ -70,9 +74,6 @@ class Job(BaseModel):
     application_status: ApplicationStatus = ApplicationStatus.PENDING
     applied_at: Optional[datetime] = None
     notes: Optional[str] = None
-
-    class Config:
-        use_enum_values = True
 
 
 class JobSearchFilter(BaseModel):

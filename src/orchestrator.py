@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 from typing import Type
 
 from loguru import logger
@@ -25,6 +24,7 @@ from src.scrapers.linkedin import LinkedInScraper
 from src.scrapers.monster import MonsterScraper
 from src.scrapers.workday import WorkdayScraper
 from src.scrapers.ziprecruiter import ZipRecruiterScraper
+from src.utils.time import utcnow_naive
 
 SCRAPER_REGISTRY: dict[str, Type[BaseScraper]] = {
     "linkedin": LinkedInScraper,
@@ -101,7 +101,7 @@ class Orchestrator:
             await self.db.update_job_status(
                 record.id,
                 status,
-                applied_at=datetime.utcnow() if status == ApplicationStatus.APPLIED else None,
+                applied_at=utcnow_naive() if status == ApplicationStatus.APPLIED else None,
                 notes=result.message,
             )
             await self.db.log_application(

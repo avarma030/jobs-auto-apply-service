@@ -5,6 +5,8 @@ from datetime import datetime
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from src.utils.time import utcnow_naive
+
 
 class Base(DeclarativeBase):
     pass
@@ -37,7 +39,7 @@ class JobRecord(Base):
     easy_apply: Mapped[bool] = mapped_column(Boolean, default=False)
 
     posted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    scraped_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive)
 
     application_status: Mapped[str] = mapped_column(String(64), default="pending", index=True)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -51,7 +53,7 @@ class ApplicationRecord(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
-    attempted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    attempted_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow_naive)
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     confirmation_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)

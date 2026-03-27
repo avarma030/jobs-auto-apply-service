@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from src.models import UserProfile
+if TYPE_CHECKING:
+    from src.models import UserProfile
 
 
 def load_profile(path: Path | str) -> UserProfile:
     """Load a UserProfile from a JSON file."""
+    from src.models import UserProfile
+
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(
