@@ -27,8 +27,9 @@ from src.scrapers.linkedin import LinkedInScraper
 from src.scrapers.monster import MonsterScraper
 from src.scrapers.workday import WorkdayScraper
 from src.scrapers.ziprecruiter import ZipRecruiterScraper
-from src.services import ai_matcher, cover_letter as cover_letter_svc, pdf_builder, resume_parser, resume_tailor
+from src.services import ai_matcher, cover_letter as cover_letter_svc, pdf_builder, profile_extractor, resume_parser, resume_tailor
 from src.services.job_classifier import detect_ats
+from src.utils.profile_loader import save_profile
 
 SCRAPER_REGISTRY: dict[str, Type[BaseScraper]] = {
     "linkedin": LinkedInScraper,
@@ -122,6 +123,8 @@ class Orchestrator:
                 confirmation_id=result.confirmation_id,
                 message=result.message,
             )
+            if result.new_questions:
+                await self._handle_new_questions(result.new_questions)
 
         logger.info(f"Apply run complete: {counts}")
         return counts
@@ -289,6 +292,9 @@ class Orchestrator:
                 confirmation_id=result.confirmation_id,
                 message=result.message,
             )
+            if result.new_questions:
+                _emit(f"  Learning {len(result.new_questions)} new Q&A pairs from this application …")
+                await self._handle_new_questions(result.new_questions, user_id)
 
         _emit(f"Pipeline complete: {counts}")
         return counts
@@ -304,6 +310,47 @@ class Orchestrator:
         if self._ai_client is None:
             self._ai_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         return self._ai_client
+
+    async def _handle_new_questions(
+        self,
+        questions: list[str],
+        user_id: int | None = None,
+    ) -> None:
+        """Use Claude to generate answers for unknown screening questions,
+        then persist Q&A pairs to profile (file + DB) for future runs."""
+        ai = self._get_ai_client()
+        if not ai:
+            logger.warning(f"New questions found but no AI client — skipping: {questions}")
+            return
+
+        try:
+            new_answers = await profile_extractor.suggest_answers(
+                questions, self.profile, ai, settings.anthropic_model
+            )
+        except Exception as exc:
+            logger.error(f"suggest_answers error: {exc}")
+            return
+
+        if not new_answers:
+            return
+
+        self.profile.custom_answers.update(new_answers)
+        logger.info(
+            f"Learned {len(new_answers)} new Q&A pairs: {list(new_answers.keys())}"
+        )
+
+        # Persist to filesystem (always — keeps CLI and API in sync)
+        try:
+            save_profile(self.profile, settings.user_profile_path)
+        except Exception as exc:
+            logger.warning(f"Could not save profile to file: {exc}")
+
+        # Persist to DB (API / multi-user mode)
+        if user_id is not None:
+            try:
+                await self.db.update_profile_custom_answers(user_id, self.profile.custom_answers)
+            except Exception as exc:
+                logger.warning(f"Could not save custom_answers to DB: {exc}")
 
     async def _scrape_board(self, board: str, search_filter: JobSearchFilter) -> int:
         scraper_cls = SCRAPER_REGISTRY[board]

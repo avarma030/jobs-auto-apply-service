@@ -17,3 +17,5 @@ class ProfileUpdate(BaseModel):
 class ResumeUploadResponse(BaseModel):
     resume_path: str
     filename: str
+    extracted_profile: dict[str, Any] | None = None  # populated when AI extraction runs
+    profile_updated: bool = False                     # True if DB profile was updated

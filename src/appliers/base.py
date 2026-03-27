@@ -14,11 +14,16 @@ class ApplicationResult:
         status: ApplicationStatus,
         message: str = "",
         confirmation_id: str | None = None,
+        new_questions: list[str] | None = None,
     ):
         self.job = job
         self.status = status
         self.message = message
         self.confirmation_id = confirmation_id
+        # Questions encountered during the application with no pre-set answer.
+        # The orchestrator will use Claude to generate answers and save them back
+        # to the profile so future applications answer them automatically.
+        self.new_questions: list[str] = new_questions or []
 
     def __repr__(self) -> str:
         return (

@@ -141,6 +141,27 @@ class Database:
             await session.commit()
             return record
 
+    async def update_profile_custom_answers(
+        self, user_id: int, custom_answers: dict[str, str]
+    ) -> None:
+        """Merge new custom_answers into the user's stored profile JSON blob."""
+        from src.database.models import UserProfile as UserProfileRecord
+
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(UserProfileRecord).where(UserProfileRecord.user_id == user_id)
+                )
+            ).scalar_one_or_none()
+            if row:
+                profile_data = json.loads(row.profile_json) if row.profile_json else {}
+                existing = profile_data.get("custom_answers", {})
+                existing.update(custom_answers)
+                profile_data["custom_answers"] = existing
+                row.profile_json = json.dumps(profile_data)
+                await session.commit()
+                logger.debug(f"Persisted {len(custom_answers)} custom_answers for user {user_id}")
+
     async def get_application_stats(self) -> dict:
         async with self.session_factory() as session:
             from sqlalchemy import func

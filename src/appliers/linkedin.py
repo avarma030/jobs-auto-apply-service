@@ -98,6 +98,9 @@ class LinkedInApplier(BaseApplier):
         self._bm: BrowserManager | None = None
         self._page: Page | None = None
         self._logged_in = False
+        # Collects question labels encountered with no pre-set answer.
+        # Cleared per apply() call; surfaced via ApplicationResult.new_questions.
+        self._unknown_questions: list[str] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -132,13 +135,19 @@ class LinkedInApplier(BaseApplier):
         if not self._page:
             return self._fail(job, "Browser not initialised")
 
+        self._unknown_questions = []  # reset for this application
         try:
             if not job.easy_apply:
                 return self._skip(job, "Job does not have Easy Apply — route to ATS applier")
-            return await self._easy_apply(job, tailored_resume_path=tailored_resume_path, cover_letter=cover_letter)
+            result = await self._easy_apply(job, tailored_resume_path=tailored_resume_path, cover_letter=cover_letter)
         except Exception as exc:
             await self._bm.screenshot(self._page, f"error_{job.external_id}")
-            return self._fail(job, str(exc))
+            result = self._fail(job, str(exc))
+
+        # Attach any questions we couldn't answer so the orchestrator can learn them
+        result.new_questions = list(dict.fromkeys(self._unknown_questions))  # dedup, preserve order
+        self._unknown_questions = []
+        return result
 
     # ------------------------------------------------------------------
     # Login
@@ -311,6 +320,9 @@ class LinkedInApplier(BaseApplier):
                 await inp.fill("")  # clear first
                 await _BM.human_type(inp, str(value))
                 logger.debug(f"[LinkedIn] Filled '{label}' = '{value}'")
+            elif label:
+                self._unknown_questions.append(label)
+                logger.debug(f"[LinkedIn] No answer for text input: '{label}'")
 
     async def _fill_textareas(self, page: Page, job: Job) -> None:
         areas = await page.locator(f"{_MODAL} {_TEXTAREAS}").all()
@@ -340,6 +352,9 @@ class LinkedInApplier(BaseApplier):
             value = self._answer_for_label(label)
             if value:
                 await area.fill(str(value))
+            elif label:
+                self._unknown_questions.append(label)
+                logger.debug(f"[LinkedIn] No answer for textarea: '{label}'")
 
     async def _fill_selects(self, page: Page) -> None:
         selects = await page.locator(f"{_MODAL} {_SELECTS}").all()
@@ -364,6 +379,9 @@ class LinkedInApplier(BaseApplier):
                         await sel.select_option(label=str(value))
                     except Exception:
                         logger.debug(f"[LinkedIn] Could not select '{value}' for '{label}'")
+            elif label:
+                self._unknown_questions.append(label)
+                logger.debug(f"[LinkedIn] No answer for select: '{label}'")
 
     async def _fill_radio_buttons(self, page: Page) -> None:
         fieldsets = await page.locator(f"{_MODAL} {_RADIO_GROUPS}").all()
@@ -379,6 +397,9 @@ class LinkedInApplier(BaseApplier):
             if answer is None:
                 answer = self._infer_value_from_label(legend)
             if answer is None:
+                if legend:
+                    self._unknown_questions.append(legend)
+                    logger.debug(f"[LinkedIn] No answer for radio: '{legend}'")
                 continue
 
             # Find radio buttons
@@ -404,6 +425,9 @@ class LinkedInApplier(BaseApplier):
 
             answer = self._answer_for_label(label)
             if answer is None:
+                if label:
+                    self._unknown_questions.append(label)
+                    logger.debug(f"[LinkedIn] No answer for checkbox: '{label}'")
                 continue
 
             should_check = str(answer).lower() in ("yes", "true", "1", "checked")

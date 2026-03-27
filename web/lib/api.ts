@@ -83,7 +83,12 @@ export const profile = {
   get: () => request<{ profile: Profile }>("/profile"),
   update: (data: Profile) =>
     request<{ profile: Profile }>("/profile", { method: "PUT", body: JSON.stringify({ profile: data }) }),
-  uploadResume: (file: File) => {
+  uploadResume: (file: File): Promise<{
+    resume_path: string;
+    filename: string;
+    extracted_profile?: Record<string, unknown> | null;
+    profile_updated?: boolean;
+  }> => {
     const form = new FormData();
     form.append("file", file);
     const token = getToken();
