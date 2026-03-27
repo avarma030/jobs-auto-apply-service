@@ -87,6 +87,14 @@ python main.py run --keywords "senior python developer" --remote
 python main.py stats
 ```
 
+### 7. Run the local dashboard
+
+```bash
+python main.py dashboard
+```
+
+Then open `http://127.0.0.1:8765` in your browser. The dashboard runs the live LinkedIn scraper and renders results from a search form instead of the CLI.
+
 ## Docker
 
 ```bash

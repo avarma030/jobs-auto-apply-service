@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from pathlib import Path
 
 import click
 from loguru import logger
@@ -11,10 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from src.config import settings
-from src.database import Database
-from src.models import ExperienceLevel, JobSearchFilter, JobType, WorkMode
-from src.orchestrator import Orchestrator
-from src.utils import load_profile
+from src.dashboard import DEFAULT_HOST, DEFAULT_PORT, serve_dashboard
 
 console = Console()
 
@@ -51,6 +46,8 @@ def scrape(
     salary_min: float | None,
 ) -> None:
     """Scrape job boards and store results in the database."""
+    from src.models import JobSearchFilter
+
     search_filter = JobSearchFilter(
         keywords=list(keywords),
         location=location,
@@ -60,6 +57,10 @@ def scrape(
     )
 
     async def _run() -> None:
+        from src.database import Database
+        from src.orchestrator import Orchestrator
+        from src.utils import load_profile
+
         db = Database(settings.database_url)
         await db.init()
         profile = load_profile(settings.user_profile_path)
@@ -85,6 +86,10 @@ def apply(dry_run: bool) -> None:
         settings.__init__()  # reload
 
     async def _run() -> None:
+        from src.database import Database
+        from src.orchestrator import Orchestrator
+        from src.utils import load_profile
+
         db = Database(settings.database_url)
         await db.init()
         profile = load_profile(settings.user_profile_path)
@@ -112,6 +117,8 @@ def run(
     dry_run: bool,
 ) -> None:
     """Scrape then apply in a single command."""
+    from src.models import JobSearchFilter
+
     search_filter = JobSearchFilter(
         keywords=list(keywords),
         location=location,
@@ -119,6 +126,10 @@ def run(
     )
 
     async def _run() -> None:
+        from src.database import Database
+        from src.orchestrator import Orchestrator
+        from src.utils import load_profile
+
         db = Database(settings.database_url)
         await db.init()
         profile = load_profile(settings.user_profile_path)
@@ -142,6 +153,8 @@ def stats() -> None:
     """Show application statistics."""
 
     async def _run() -> None:
+        from src.database import Database
+
         db = Database(settings.database_url)
         await db.init()
         data = await db.get_application_stats()
@@ -154,6 +167,20 @@ def stats() -> None:
         await db.close()
 
     asyncio.run(_run())
+
+
+@main.command()
+@click.option("--host", default=DEFAULT_HOST, show_default=True, help="Host to bind the dashboard server")
+@click.option("--port", default=DEFAULT_PORT, show_default=True, type=int, help="Port to bind the dashboard server")
+@click.option("--open-browser/--no-open-browser", default=True, show_default=True, help="Open the dashboard in your browser automatically")
+def dashboard(host: str, port: int, open_browser: bool) -> None:
+    """Launch a local browser dashboard for live LinkedIn searches."""
+    console.print(f"[cyan]Starting dashboard at http://{host}:{port}[/cyan]")
+    console.print("[dim]Press Ctrl+C to stop the local server.[/dim]")
+    try:
+        serve_dashboard(host=host, port=port, open_browser=open_browser)
+    except OSError as exc:
+        raise click.ClickException(str(exc)) from exc
 
 
 # ──────────────────────────────────────────────────────────────────────────────
