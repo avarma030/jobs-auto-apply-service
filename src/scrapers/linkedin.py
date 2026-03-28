@@ -245,9 +245,10 @@ class LinkedInScraper(BaseScraper):
                         timeout=30_000,
                     )
                     await bm.human_pause(1, 2)
-                    await page.fill("#username", creds["username"])
+                    # LinkedIn uses name= attributes; id= selectors are unreliable
+                    await page.fill("input[name='session_key']", creds["username"])
                     await bm.human_pause(0.3, 0.8)
-                    await page.fill("#password", creds["password"])
+                    await page.fill("input[name='session_password']", creds["password"])
                     await bm.human_pause(0.5, 1.0)
                     await page.click("button[type=submit]")
                     await bm.human_pause(3, 5)
