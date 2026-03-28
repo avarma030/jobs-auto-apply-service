@@ -236,23 +236,44 @@ class LinkedInScraper(BaseScraper):
             async with BrowserManager(headless=True, user_data_dir=_SESSION_DIR) as bm:
                 page = await bm.new_page()
 
-                # If credentials are configured, log in for a trusted li_at cookie
+                # If credentials are configured, attempt login for a trusted li_at cookie.
+                # Wrapped in its own try/except so a login-page change or CAPTCHA challenge
+                # doesn't abort the whole warm — unauthenticated cookies are still useful.
                 if creds.get("username") and creds.get("password"):
-                    logger.info("[LinkedIn] Logging in to get authenticated session cookies …")
-                    await page.goto(
-                        "https://www.linkedin.com/login",
-                        wait_until="domcontentloaded",
-                        timeout=30_000,
-                    )
-                    await bm.human_pause(1, 2)
-                    # LinkedIn uses name= attributes; id= selectors are unreliable
-                    await page.fill("input[name='session_key']", creds["username"])
-                    await bm.human_pause(0.3, 0.8)
-                    await page.fill("input[name='session_password']", creds["password"])
-                    await bm.human_pause(0.5, 1.0)
-                    await page.click("button[type=submit]")
-                    await bm.human_pause(3, 5)
-                    logger.info("[LinkedIn] Login submitted — waiting for redirect …")
+                    try:
+                        logger.info("[LinkedIn] Logging in to get authenticated session cookies …")
+                        await page.goto(
+                            "https://www.linkedin.com/login",
+                            wait_until="domcontentloaded",
+                            timeout=30_000,
+                        )
+                        await bm.human_pause(1, 2)
+                        # Try the current name= selector first, fall back to id= selectors
+                        email_sel = (
+                            "input[name='session_key'], "
+                            "#username, "
+                            "input[type='email']"
+                        )
+                        pass_sel = (
+                            "input[name='session_password'], "
+                            "#password, "
+                            "input[type='password']"
+                        )
+                        await page.locator(email_sel).first.fill(
+                            creds["username"], timeout=10_000
+                        )
+                        await bm.human_pause(0.3, 0.8)
+                        await page.locator(pass_sel).first.fill(
+                            creds["password"], timeout=10_000
+                        )
+                        await bm.human_pause(0.5, 1.0)
+                        await page.click("button[type=submit]")
+                        await bm.human_pause(3, 5)
+                        logger.info("[LinkedIn] Login submitted — waiting for redirect …")
+                    except Exception as login_exc:
+                        logger.warning(
+                            f"[LinkedIn] Login step failed (will continue with guest cookies): {login_exc}"
+                        )
 
                 # Navigate to jobs search to generate/refresh session cookies
                 await page.goto(
