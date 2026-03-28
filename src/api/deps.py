@@ -33,15 +33,18 @@ async def get_session(db: Database = Depends(get_database)) -> AsyncGenerator[As
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     session: AsyncSession = Depends(get_session),
+    token: str | None = None,   # query-param fallback (used by SSE + file-download endpoints)
 ) -> User:
-    if credentials is None:
+    # Prefer Authorization header; fall back to ?token= query param
+    raw_token: str | None = credentials.credentials if credentials else token
+    if raw_token is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
     try:
-        payload = decode_token(credentials.credentials)
+        payload = decode_token(raw_token)
         user_id = int(payload["sub"])
     except (JWTError, KeyError, ValueError):
         raise HTTPException(

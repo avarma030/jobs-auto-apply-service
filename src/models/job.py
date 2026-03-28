@@ -85,8 +85,10 @@ class JobSearchFilter(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     location: Optional[str] = None
     remote_only: bool = False
+    work_modes: list[str] = Field(default_factory=list)   # ["remote","hybrid","onsite"]
     job_types: list[JobType] = Field(default_factory=list)
     experience_levels: list[ExperienceLevel] = Field(default_factory=list)
+    easy_apply_only: bool = False
     salary_min: Optional[float] = None
     exclude_keywords: list[str] = Field(default_factory=list)
     max_age_days: int = 7  # only scrape jobs posted within N days

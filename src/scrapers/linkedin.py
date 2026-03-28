@@ -907,31 +907,39 @@ class LinkedInScraper(BaseScraper):
         if f.location:
             params["location"] = f.location
 
-        if f.remote_only:
-            params["f_WT"] = "2"
-        elif f.job_types:
-            work_codes = [
-                _WORK_TYPE_MAP[wt]
-                for wt in [WorkMode.REMOTE, WorkMode.HYBRID, WorkMode.ONSITE]
-                if wt in (f.job_types or [])
-            ]
-            if work_codes:
-                params["f_WT"] = ",".join(work_codes)
+        # ── Work mode (f_WT) ──────────────────────────────────────────────────
+        # Prefer the explicit work_modes list; fall back to remote_only flag.
+        work_modes: list[str] = list(getattr(f, "work_modes", []))
+        if f.remote_only and "remote" not in work_modes:
+            work_modes.append("remote")
 
+        if work_modes:
+            wt_map = {"remote": "2", "hybrid": "3", "onsite": "1"}
+            wt_codes = [wt_map[wm] for wm in work_modes if wm in wt_map]
+            if wt_codes:
+                params["f_WT"] = ",".join(dict.fromkeys(wt_codes))  # dedup, preserve order
+
+        # ── Job type (f_JT) ───────────────────────────────────────────────────
         if f.job_types:
             jt_codes = [_JOB_TYPE_MAP[jt] for jt in f.job_types if jt in _JOB_TYPE_MAP]
             if jt_codes:
                 params["f_JT"] = ",".join(jt_codes)
 
+        # ── Experience level (f_E) ────────────────────────────────────────────
         if f.experience_levels:
             el_codes = [
                 _EXP_LEVEL_MAP[el] for el in f.experience_levels if el in _EXP_LEVEL_MAP
             ]
             if el_codes:
-                params["f_E"] = ",".join(set(el_codes))
+                params["f_E"] = ",".join(dict.fromkeys(el_codes))
 
+        # ── Date posted (f_TPR) ───────────────────────────────────────────────
         if f.max_age_days:
             params["f_TPR"] = f"r{f.max_age_days * 86400}"
+
+        # ── Easy Apply only (f_LF) ────────────────────────────────────────────
+        if getattr(f, "easy_apply_only", False):
+            params["f_LF"] = "f_AL"
 
         return params
 

@@ -45,6 +45,9 @@ anthropic>=0.28.0
 # PDF generation for tailored resumes
 reportlab>=4.0.0
 
+# Excel export
+openpyxl>=3.1.0
+
 # Utilities
 python-dotenv>=1.0.1
 tenacity>=8.3.0

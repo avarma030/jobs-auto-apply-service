@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import uuid
 from datetime import datetime
 from typing import Optional
 
+import openpyxl
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +19,10 @@ from src.database.models import JobRecord, ScrapeRun, User
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
+
+# ---------------------------------------------------------------------------
+# List / read
+# ---------------------------------------------------------------------------
 
 @router.get("", response_model=JobsPage)
 async def list_jobs(
@@ -28,8 +35,15 @@ async def list_jobs(
     current_user: User = Depends(get_current_user),
 ):
     q = select(JobRecord).where(JobRecord.user_id == current_user.id)
+
     if status:
+        # Explicit status filter — show exactly what was requested (including skipped)
         q = q.where(JobRecord.application_status == status)
+    else:
+        # Default "Active" view — hide skipped (score < 75%) jobs so only
+        # qualified jobs are visible unless user explicitly selects "Skipped".
+        q = q.where(JobRecord.application_status != "skipped")
+
     if board:
         q = q.where(JobRecord.source_board == board)
     if keywords:
@@ -43,6 +57,90 @@ async def list_jobs(
 
     items = [_to_response(r) for r in records]
     return JobsPage(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get("/export")
+async def export_jobs(
+    status: Optional[str] = None,
+    board: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    """Export jobs as an Excel (.xlsx) file with all available fields."""
+    q = select(JobRecord).where(JobRecord.user_id == current_user.id)
+    if status:
+        q = q.where(JobRecord.application_status == status)
+    else:
+        q = q.where(JobRecord.application_status != "skipped")
+    if board:
+        q = q.where(JobRecord.source_board == board)
+    q = q.order_by(JobRecord.scraped_at.desc()).limit(10_000)
+    records = list((await session.execute(q)).scalars().all())
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Jobs"
+
+    headers = [
+        "Title", "Company", "Location", "Board", "Status",
+        "Match %", "ATS %", "ATS Type",
+        "Job Type", "Work Mode", "Experience Level",
+        "Salary Min", "Salary Max", "Currency",
+        "Easy Apply", "Skills",
+        "Posted Date", "Scraped Date",
+        "URL",
+    ]
+    ws.append(headers)
+
+    # Bold the header row
+    from openpyxl.styles import Font
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+
+    for r in records:
+        skills_str = ""
+        if r.skills:
+            try:
+                skills_str = ", ".join(json.loads(r.skills))
+            except Exception:
+                skills_str = r.skills
+
+        ws.append([
+            r.title,
+            r.company,
+            r.location or "",
+            r.source_board,
+            r.application_status,
+            round(r.match_score, 1) if r.match_score is not None else "",
+            round(r.ats_score, 1) if r.ats_score is not None else "",
+            r.ats_type or "",
+            r.job_type or "",
+            r.work_mode or "",
+            r.experience_level or "",
+            r.salary_min if r.salary_min is not None else "",
+            r.salary_max if r.salary_max is not None else "",
+            r.salary_currency or "",
+            "Yes" if r.easy_apply else "No",
+            skills_str,
+            r.posted_at.strftime("%Y-%m-%d") if r.posted_at else "",
+            r.scraped_at.strftime("%Y-%m-%d %H:%M") if r.scraped_at else "",
+            r.url,
+        ])
+
+    # Auto-size columns (approximate)
+    for col in ws.columns:
+        max_len = max((len(str(cell.value or "")) for cell in col), default=0)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 60)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"jobs_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 @router.get("/{job_id}", response_model=JobResponse)
@@ -107,7 +205,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
     from src.config import settings
     from src.database.db import Database
     from src.database.models import UserProfile as UserProfileRecord
-    from src.models import JobSearchFilter, UserProfile
+    from src.models import ExperienceLevel, JobSearchFilter, JobType, UserProfile
     from src.orchestrator import Orchestrator
 
     db = Database(settings.database_url)
@@ -122,10 +220,34 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
         append_run_progress(run_id, msg)
 
     try:
+        # Resolve work modes: prefer work_modes list; fall back to remote_only flag
+        work_modes = list(req.work_modes)
+        if req.remote_only and "remote" not in work_modes:
+            work_modes.append("remote")
+
+        # Convert string values to enums, silently ignoring unknown values
+        job_type_enums = []
+        for jt in req.job_types:
+            try:
+                job_type_enums.append(JobType(jt))
+            except ValueError:
+                pass
+
+        exp_level_enums = []
+        for el in req.experience_levels:
+            try:
+                exp_level_enums.append(ExperienceLevel(el))
+            except ValueError:
+                pass
+
         filt = JobSearchFilter(
             keywords=req.keywords,
             location=req.location,
-            remote_only=req.remote_only,
+            remote_only="remote" in work_modes and len(work_modes) == 1,
+            work_modes=work_modes,
+            job_types=job_type_enums,
+            experience_levels=exp_level_enums,
+            easy_apply_only=req.easy_apply_only,
             max_age_days=req.max_age_days,
         )
 

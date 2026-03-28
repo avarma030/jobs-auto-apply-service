@@ -38,6 +38,15 @@ class JobResponse(BaseModel):
 class ScrapeRequest(BaseModel):
     keywords: list[str] = ["software engineer"]
     location: Optional[str] = None
+    # Work mode filters — one or more of: "remote", "hybrid", "onsite"
+    work_modes: list[str] = []
+    # Job type filters — one or more of: "full_time", "part_time", "contract", "internship", "temporary"
+    job_types: list[str] = []
+    # Experience level filters — one or more of: "entry", "mid", "senior", "lead", "executive"
+    experience_levels: list[str] = []
+    # Easy Apply only (LinkedIn one-click apply)
+    easy_apply_only: bool = False
+    # Legacy shortcut — if True, forces work_modes = ["remote"]
     remote_only: bool = False
     boards: list[str] = ["linkedin"]
     max_age_days: int = 7

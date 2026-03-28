@@ -58,8 +58,27 @@ export const jobs = {
   get: (id: number) => request<Job>(`/jobs/${id}`),
   updateStatus: (id: number, status: string) =>
     request<Job>(`/jobs/${id}/status`, { method: "PUT", body: JSON.stringify({ status }) }),
-  scrape: (body: { keywords: string[]; location?: string; remote_only?: boolean; boards: string[]; max_age_days?: number }) =>
+  scrape: (body: {
+    keywords: string[];
+    location?: string;
+    work_modes?: string[];
+    job_types?: string[];
+    experience_levels?: string[];
+    easy_apply_only?: boolean;
+    remote_only?: boolean;
+    boards: string[];
+    max_age_days?: number;
+  }) =>
     request<{ run_id: string }>("/jobs/scrape", { method: "POST", body: JSON.stringify(body) }),
+  /** Returns a download URL for Excel export. Open or assign to window.location.href. */
+  exportUrl: (params?: { status?: string; board?: string }): string => {
+    const q = new URLSearchParams();
+    if (params?.status) q.set("status", params.status);
+    if (params?.board) q.set("board", params.board);
+    const token = getToken();
+    if (token) q.set("token", token);
+    return `${BASE}/jobs/export?${q}`;
+  },
 };
 
 // Applications
