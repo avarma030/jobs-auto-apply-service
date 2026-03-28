@@ -54,6 +54,10 @@ _GUEST_SEARCH_URL = (
     "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 )
 _JOB_VIEW_URL = "https://www.linkedin.com/jobs/view/{job_id}/"
+# Guest API for individual job postings — returns a static server-rendered HTML
+# fragment (same pattern as the search endpoint).  The /jobs/view/{id}/ URL now
+# returns a client-side-rendered React SPA shell with no content.
+_JOB_POSTING_API_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
 
 # Cookie / session persistence
 _COOKIE_PATH = Path("data/.linkedin_cookies.json")
@@ -350,7 +354,9 @@ class LinkedInScraper(BaseScraper):
         if not job.external_id:
             return job
 
-        url = _JOB_VIEW_URL.format(job_id=job.external_id)
+        # Use the guest posting API (server-rendered fragment) instead of the
+        # /jobs/view/ URL which now returns a client-side-rendered React SPA shell.
+        url = _JOB_POSTING_API_URL.format(job_id=job.external_id)
         try:
             html = await self._fetch_page(url)
         except Exception as exc:
