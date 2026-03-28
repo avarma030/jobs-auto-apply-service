@@ -2,36 +2,34 @@
 
 Scraping strategy
 -----------------
-Hybrid Apify-style approach:
+Hybrid Apify-style approach with Chrome TLS fingerprint impersonation:
 
-1. Session warming — Playwright visits linkedin.com/jobs/search with a stealth
-   browser profile (persistent user-data-dir) and extracts real session cookies
-   (li_sugr, JSESSIONID, bcookie …).  The profile is stored in
-   ``data/.linkedin_scraper_session/`` so LinkedIn sees a "returning browser".
+1. Session warming — Playwright visits linkedin.com/jobs/search (or logs in if
+   credentials are configured) using a stealth browser profile stored in
+   ``data/.linkedin_scraper_session/``.  Extracts real session cookies.
 
-2. Cookie-authenticated httpx — cookies from step 1 are injected into a
-   lightweight httpx.AsyncClient together with the full Sec-Fetch-* header suite.
-   API calls go to the guest search endpoint:
+2. Cookie-authenticated curl-cffi — cookies are injected into a curl-cffi
+   AsyncSession configured with ``impersonate="chrome124"``, which reproduces
+   Chrome's exact JA3 TLS fingerprint and HTTP/2 SETTINGS frame.  This prevents
+   Akamai/PerimeterX from flagging us at the TLS layer.
+   API endpoint: GET /jobs-guest/jobs/api/seeMoreJobPostings/search
 
-     GET https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search
-         ?keywords=<q>&location=<loc>&start=<offset>&count=25&…
+3. Cookie persistence — saved to ``data/.linkedin_cookies.json``, reused up to
+   4 hours before re-warming.
 
-3. Cookie persistence — cookies are saved to ``data/.linkedin_cookies.json``
-   and reused for up to 4 hours before triggering a re-warm.
-
-4. Re-warm on block — on HTTP 403/999/CAPTCHA the scraper re-runs step 1 and
-   retries the request once.
+4. Re-warm on block — on HTTP 403/999/CAPTCHA the scraper re-warms and retries once.
 
 5. Playwright fallback — if the guest API returns empty even after re-warm,
-   the first page is scraped directly via a Playwright-rendered page.
+   the first page is scraped directly via Playwright.
 
-No login is required for scraping.  Credentials in ``self.credentials`` are
-used only by the applier (LinkedInApplier in src/appliers/linkedin.py).
+Credentials in ``self.credentials`` are used both to log in during warming
+(obtaining a trusted ``li_at`` cookie) and by the applier.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -39,8 +37,8 @@ from pathlib import Path
 from typing import AsyncIterator
 from urllib.parse import urlencode
 
-import httpx
 from bs4 import BeautifulSoup
+from curl_cffi.requests import AsyncSession
 from fake_useragent import UserAgent
 from loguru import logger
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -147,21 +145,27 @@ class LinkedInScraper(BaseScraper):
 
         self._client = self._make_client()
 
-    def _make_client(self, proxy: str | None = None) -> httpx.AsyncClient:
-        """Build a fresh httpx client with real-browser headers and warmed cookies."""
-        return httpx.AsyncClient(
+    def _make_client(self, proxy: str | None = None) -> AsyncSession:
+        """Build a curl-cffi session that impersonates Chrome's TLS fingerprint.
+
+        Using curl-cffi instead of httpx is critical: LinkedIn's Akamai/PerimeterX
+        bot detection checks the JA3 TLS fingerprint.  httpx's cipher suite order
+        differs from Chrome and gets flagged immediately.  curl-cffi reproduces
+        Chrome 124's exact JA3 hash and HTTP/2 SETTINGS frame.
+        """
+        return AsyncSession(
+            impersonate="chrome124",
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
+                    "Chrome/124.0.0.0 Safari/537.36"
                 ),
                 **_BROWSER_HEADERS,
             },
             cookies=self._cookies,
             timeout=30,
-            follow_redirects=True,
-            proxy=proxy,
+            proxies={"https": proxy, "http": proxy} if proxy else None,
         )
 
     def _load_proxies(self) -> list[str]:
@@ -183,7 +187,8 @@ class LinkedInScraper(BaseScraper):
         return proxy
 
     async def teardown(self) -> None:
-        await self._client.aclose()
+        if hasattr(self, "_client"):
+            await self._client.close()
         await super().teardown()
 
     # ------------------------------------------------------------------
@@ -222,10 +227,29 @@ class LinkedInScraper(BaseScraper):
         """
         logger.info("[LinkedIn] Warming session via Playwright (this takes ~15 s) …")
         cookies: dict = {}
+        creds = self.credentials  # set by BaseScraper from profile.job_board_accounts.linkedin
         try:
             async with BrowserManager(headless=True, user_data_dir=_SESSION_DIR) as bm:
                 page = await bm.new_page()
-                # Visit public jobs search — no login required
+
+                # If credentials are configured, log in for a trusted li_at cookie
+                if creds.get("username") and creds.get("password"):
+                    logger.info("[LinkedIn] Logging in to get authenticated session cookies …")
+                    await page.goto(
+                        "https://www.linkedin.com/login",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    await bm.human_pause(1, 2)
+                    await page.fill("#username", creds["username"])
+                    await bm.human_pause(0.3, 0.8)
+                    await page.fill("#password", creds["password"])
+                    await bm.human_pause(0.5, 1.0)
+                    await page.click("button[type=submit]")
+                    await bm.human_pause(3, 5)
+                    logger.info("[LinkedIn] Login submitted — waiting for redirect …")
+
+                # Navigate to jobs search to generate/refresh session cookies
                 await page.goto(
                     "https://www.linkedin.com/jobs/search/?keywords=software+engineer",
                     wait_until="domcontentloaded",
@@ -240,7 +264,11 @@ class LinkedInScraper(BaseScraper):
                 # Extract cookies for linkedin.com
                 raw = await page.context.cookies("https://www.linkedin.com")
                 cookies = {c["name"]: c["value"] for c in raw}
-                logger.info(f"[LinkedIn] Session warm complete — got {len(cookies)} cookies")
+                has_auth = "li_at" in cookies
+                logger.info(
+                    f"[LinkedIn] Session warm complete — {len(cookies)} cookies "
+                    f"(authenticated={has_auth})"
+                )
         except Exception as exc:
             logger.warning(f"[LinkedIn] Session warming failed: {exc}")
         return cookies
@@ -314,7 +342,8 @@ class LinkedInScraper(BaseScraper):
             if new_this_page == 0:
                 break
 
-            await asyncio.sleep(settings.request_delay_seconds)
+            # Randomized delay — breaks fixed-interval bot detection pattern
+            await asyncio.sleep(max(1.0, settings.request_delay_seconds + random.uniform(-0.5, 2.0)))
 
     async def get_job_details(self, job: Job) -> Job:
         """Fetch the full job detail page and enrich *job* in-place."""
@@ -411,16 +440,22 @@ class LinkedInScraper(BaseScraper):
         return await self._get(url)
 
     async def _get(self, url: str, _rewarm_attempted: bool = False) -> str:
-        """GET *url*.  On block/CAPTCHA, re-warm the session and retry once."""
+        """GET *url*.  Rotates UA per request, re-warms on block/CAPTCHA."""
+        # Rotate User-Agent on every request to avoid per-UA tracking
+        self._client.headers.update({"User-Agent": self._ua.random})
+
         try:
             resp = await self._client.get(url)
-        except httpx.ProxyError:
-            proxy = self._next_proxy()
-            if proxy:
-                logger.warning("[LinkedIn] Proxy error — rotating to next proxy")
-                await self._client.aclose()
-                self._client = self._make_client(proxy)
-            raise _RateLimitError("Proxy error")
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "proxy" in err_str or "connect" in err_str:
+                proxy = self._next_proxy()
+                if proxy:
+                    logger.warning("[LinkedIn] Proxy/connection error — rotating to next proxy")
+                    await self._client.close()
+                    self._client = self._make_client(proxy)
+                raise _RateLimitError("Proxy/connection error")
+            raise
 
         if resp.status_code == 429:
             logger.warning("[LinkedIn] Rate limited (429) — will back off and retry")
@@ -435,12 +470,12 @@ class LinkedInScraper(BaseScraper):
                 self._cookies = await self._warm_session()
                 if self._cookies:
                     self._save_cookies(self._cookies)
-                    await self._client.aclose()
+                    await self._client.close()
                     self._client = self._make_client()
                     return await self._get(url, _rewarm_attempted=True)
             logger.warning("[LinkedIn] Still blocked after re-warm — rotating proxy/UA")
             proxy = self._next_proxy()
-            await self._client.aclose()
+            await self._client.close()
             self._client = self._make_client(proxy)
             raise _RateLimitError(f"Blocked with {resp.status_code}")
 
@@ -454,12 +489,12 @@ class LinkedInScraper(BaseScraper):
                 self._cookies = await self._warm_session()
                 if self._cookies:
                     self._save_cookies(self._cookies)
-                    await self._client.aclose()
+                    await self._client.close()
                     self._client = self._make_client()
                     return await self._get(url, _rewarm_attempted=True)
             logger.warning(
                 "[LinkedIn] Still getting auth-wall after re-warm. "
-                "Consider using proxies (USE_PROXIES=true)."
+                "Consider adding LinkedIn credentials or proxies (USE_PROXIES=true)."
             )
             return ""
 
