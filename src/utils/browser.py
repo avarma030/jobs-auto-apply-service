@@ -51,6 +51,13 @@ _STEALTH_JS = """
 }
 """
 
+# Realistic Chrome user-agent — shared by both persistent and ephemeral contexts
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
 # Realistic viewport sizes to randomise across
 _VIEWPORTS = [
     {"width": 1366, "height": 768},
@@ -67,6 +74,7 @@ class BrowserManager:
     Includes stealth measures to reduce bot-detection fingerprint:
     - Randomised viewport
     - navigator.webdriver patch + other property spoofs
+    - Consistent Chrome user-agent (no HeadlessChrome leak)
     - Human-like typing and click delays (via ``human_type`` / ``human_click``)
 
     Usage::
@@ -124,7 +132,15 @@ class BrowserManager:
                 viewport=viewport,
                 locale="en-US",
                 timezone_id="America/New_York",
+                # Explicit UA prevents the "HeadlessChrome" string from leaking
+                # in the very first request before the page-level stealth JS runs.
+                user_agent=_UA,
+                ignore_https_errors=True,
+                accept_downloads=True,
             )
+            # Apply stealth at context level so it covers every document,
+            # including iframes and popups (belt-and-suspenders with new_page() below).
+            await self._context.add_init_script(_STEALTH_JS)
         else:
             self._browser = await self._playwright.chromium.launch(
                 headless=self.headless,
@@ -134,11 +150,9 @@ class BrowserManager:
                 viewport=viewport,
                 locale="en-US",
                 timezone_id="America/New_York",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
+                user_agent=_UA,
+                ignore_https_errors=True,
+                accept_downloads=True,
             )
 
         self._context.set_default_timeout(self.timeout_ms)
@@ -161,6 +175,7 @@ class BrowserManager:
         if not self._context:
             raise RuntimeError("BrowserManager not started — use async with")
         page = await self._context.new_page()
+        # Page-level stealth as belt-and-suspenders (context-level set in start())
         await page.add_init_script(_STEALTH_JS)
         return page
 
