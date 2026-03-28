@@ -88,6 +88,8 @@ export const profile = {
     filename: string;
     extracted_profile?: Record<string, unknown> | null;
     profile_updated?: boolean;
+    ai_extraction_enabled?: boolean;
+    extraction_error?: string | null;
   }> => {
     const form = new FormData();
     form.append("file", file);
