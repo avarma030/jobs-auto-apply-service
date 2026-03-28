@@ -67,14 +67,14 @@ class Orchestrator:
     # Public API
     # ------------------------------------------------------------------
 
-    async def run_scrape(self, search_filter: JobSearchFilter) -> int:
+    async def run_scrape(self, search_filter: JobSearchFilter, user_id: int | None = None) -> int:
         """Scrape all enabled boards and persist discovered jobs. Returns count."""
         boards = settings.enabled_board_list()
         logger.info(f"Scraping {len(boards)} board(s): {boards}")
 
         total = 0
         tasks = [
-            self._scrape_board(board, search_filter)
+            self._scrape_board(board, search_filter, user_id=user_id)
             for board in boards
             if board in SCRAPER_REGISTRY
         ]
@@ -151,7 +151,7 @@ class Orchestrator:
                 progress_callback(msg)
 
         _emit("Pipeline starting — scraping jobs …")
-        jobs_found = await self.run_scrape(search_filter)
+        jobs_found = await self.run_scrape(search_filter, user_id=user_id)
         _emit(f"Scrape complete: {jobs_found} jobs found")
 
         # Parse resume once
@@ -352,14 +352,14 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning(f"Could not save custom_answers to DB: {exc}")
 
-    async def _scrape_board(self, board: str, search_filter: JobSearchFilter) -> int:
+    async def _scrape_board(self, board: str, search_filter: JobSearchFilter, user_id: int | None = None) -> int:
         scraper_cls = SCRAPER_REGISTRY[board]
         creds = self._get_creds(board)
         count = 0
         try:
             async with scraper_cls(credentials=creds) as scraper:
                 async for job in scraper.search(search_filter):
-                    await self.db.upsert_job(job)
+                    await self.db.upsert_job(job, user_id=user_id)
                     count += 1
         except NotImplementedError:
             logger.warning(f"[{board}] Scraper not yet implemented — skipping")

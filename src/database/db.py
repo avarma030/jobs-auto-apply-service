@@ -32,7 +32,7 @@ class Database:
     # Jobs
     # ------------------------------------------------------------------
 
-    async def upsert_job(self, job: Job) -> JobRecord:
+    async def upsert_job(self, job: Job, user_id: int | None = None) -> JobRecord:
         """Insert or update a job record. Returns the persisted record."""
         async with self.session_factory() as session:
             # Check for existing record by URL
@@ -43,6 +43,8 @@ class Database:
                 record = JobRecord(url=job.url)
                 session.add(record)
 
+            if user_id is not None:
+                record.user_id = user_id
             record.external_id = job.external_id
             record.source_board = job.source_board
             record.title = job.title
