@@ -399,8 +399,15 @@ class Orchestrator:
         try:
             async with scraper_cls(credentials=creds) as scraper:
                 async for job in scraper.search(search_filter):
+                    # Fetch full details (description, salary, skills) while
+                    # the scraper session is still warm and has active cookies
+                    try:
+                        job = await scraper.get_job_details(job)
+                    except Exception as exc:
+                        logger.warning(f"[{board}] Detail fetch failed for {job.title}: {exc}")
                     await self.db.upsert_job(job, user_id=user_id)
                     count += 1
+                    await asyncio.sleep(settings.request_delay_seconds)
         except NotImplementedError:
             logger.warning(f"[{board}] Scraper not yet implemented — skipping")
         except Exception as exc:

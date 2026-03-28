@@ -328,6 +328,10 @@ class LinkedInScraper(BaseScraper):
             logger.warning(f"[LinkedIn] Could not fetch details for {job.external_id}: {exc}")
             return job
 
+        if not html or len(html) < 200:
+            logger.warning(f"[LinkedIn] Detail page for {job.external_id} returned empty/short HTML ({len(html)} chars)")
+            return job
+
         soup = BeautifulSoup(html, "lxml")
 
         # Description
@@ -336,6 +340,9 @@ class LinkedInScraper(BaseScraper):
         )
         if desc_el:
             job.description = desc_el.get_text(separator="\n", strip=True)
+            logger.debug(f"[LinkedIn] Got description for {job.external_id} ({len(job.description)} chars)")
+        else:
+            logger.warning(f"[LinkedIn] No description element found for {job.external_id}")
 
         # Easy Apply detection
         apply_btn = soup.select_one("button.jobs-apply-button")
