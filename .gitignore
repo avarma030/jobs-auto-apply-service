@@ -10,6 +10,8 @@ data/screenshots/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/.linkedin_cookies.json
+data/.linkedin_scraper_session/
 
 # Logs
 logs/
