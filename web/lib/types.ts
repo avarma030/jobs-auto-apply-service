@@ -138,4 +138,5 @@ export interface Profile {
   };
   custom_answers?: Record<string, string>;
   resume_path?: string;
+  job_board_accounts?: Record<string, { username?: string; password?: string }>;
 }
