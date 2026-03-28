@@ -52,3 +52,10 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Node / Next.js
+node_modules/
+web/node_modules/
+web/package-lock.json
+web/.next/
+web/tsconfig.tsbuildinfo
