@@ -167,6 +167,38 @@ class Orchestrator:
 
         # Load pending jobs
         pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run)
+
+        # ------------------------------------------------------------------
+        # Enrich jobs with full descriptions before scoring
+        # ------------------------------------------------------------------
+        need_details = [r for r in pending if not r.description]
+        if need_details:
+            _emit(f"Fetching details for {len(need_details)} jobs …")
+            boards = settings.enabled_board_list()
+            for board in boards:
+                scraper_cls = SCRAPER_REGISTRY.get(board)
+                if not scraper_cls:
+                    continue
+                board_records = [r for r in need_details if r.source_board == board]
+                if not board_records:
+                    continue
+                try:
+                    async with scraper_cls(credentials=self._get_creds(board)) as scraper:
+                        for record in board_records:
+                            job = self._record_to_job(record)
+                            try:
+                                enriched = await scraper.get_job_details(job)
+                                if enriched.description:
+                                    record.description = enriched.description
+                                    record.easy_apply = enriched.easy_apply
+                                    await self.db.update_job_details(record.id, enriched)
+                                    _emit(f"  Fetched details for '{job.title}' @ {job.company}")
+                            except Exception as exc:
+                                logger.warning(f"Could not fetch details for {job.title}: {exc}")
+                            await asyncio.sleep(settings.request_delay_seconds)
+                except Exception as exc:
+                    logger.error(f"[{board}] Detail fetch error: {exc}")
+
         _emit(f"Scoring {len(pending)} jobs against resume …")
 
         qualified: list[tuple] = []  # (record, job)
@@ -174,8 +206,16 @@ class Orchestrator:
 
         for record in pending:
             job = self._record_to_job(record)
-            if not resume_text or not job.description:
+            if not resume_text:
                 qualified.append((record, job))
+                continue
+            if not job.description:
+                _emit(f"  Skipping '{job.title}' — no description available for scoring")
+                skipped_score += 1
+                await self.db.update_job_status(
+                    record.id, ApplicationStatus.SKIPPED,
+                    notes="No job description available for AI scoring",
+                )
                 continue
 
             score = await ai_matcher.score_compatibility(

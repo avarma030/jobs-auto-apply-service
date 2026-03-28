@@ -104,6 +104,28 @@ class Database:
                     record.notes = notes
                 await session.commit()
 
+    async def update_job_details(self, job_id: int, job: Job) -> None:
+        """Persist enriched job details (description, salary, skills, etc.)."""
+        async with self.session_factory() as session:
+            result = await session.execute(select(JobRecord).where(JobRecord.id == job_id))
+            record = result.scalar_one_or_none()
+            if record:
+                record.description = job.description
+                record.easy_apply = job.easy_apply
+                if job.salary_min is not None:
+                    record.salary_min = job.salary_min
+                if job.salary_max is not None:
+                    record.salary_max = job.salary_max
+                if job.salary_currency:
+                    record.salary_currency = job.salary_currency
+                if job.skills:
+                    record.skills = json.dumps(job.skills)
+                if job.job_type:
+                    record.job_type = job.job_type
+                if job.experience_level:
+                    record.experience_level = job.experience_level
+                await session.commit()
+
     # ------------------------------------------------------------------
     # Application log
     # ------------------------------------------------------------------
