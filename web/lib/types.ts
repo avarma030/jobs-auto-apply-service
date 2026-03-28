@@ -137,4 +137,5 @@ export interface Profile {
     twitter?: string;
   };
   custom_answers?: Record<string, string>;
+  resume_path?: string;
 }
