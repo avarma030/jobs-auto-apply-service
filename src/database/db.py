@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
@@ -10,6 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.database.models import ApplicationRecord, Base, JobRecord
 from src.models import ApplicationStatus, Job
+
+
+def _strip_tz(dt: datetime | None) -> datetime | None:
+    """Convert timezone-aware datetime to naive UTC for TIMESTAMP columns."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class Database:
@@ -59,10 +68,10 @@ class Database:
             record.salary_currency = job.salary_currency
             record.skills = json.dumps(job.skills)
             record.easy_apply = job.easy_apply
-            record.posted_at = job.posted_at
-            record.scraped_at = job.scraped_at
+            record.posted_at = _strip_tz(job.posted_at)
+            record.scraped_at = _strip_tz(job.scraped_at)
             record.application_status = job.application_status
-            record.applied_at = job.applied_at
+            record.applied_at = _strip_tz(job.applied_at)
             record.notes = job.notes
 
             await session.commit()
