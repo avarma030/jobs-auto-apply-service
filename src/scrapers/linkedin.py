@@ -363,15 +363,49 @@ class LinkedInScraper(BaseScraper):
 
         soup = BeautifulSoup(html, "lxml")
 
-        # Description
-        desc_el = soup.select_one(
-            "div.show-more-less-html__markup, div.description__text"
-        )
-        if desc_el:
-            job.description = desc_el.get_text(separator="\n", strip=True)
-            logger.debug(f"[LinkedIn] Got description for {job.external_id} ({len(job.description)} chars)")
+        # Description — try JSON-LD structured data first (stable schema.org SEO data),
+        # fall back to CSS selectors which LinkedIn rotates periodically.
+        desc: str | None = None
+        _ld_employment_type: str | None = None
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                if isinstance(data, dict) and data.get("description"):
+                    raw = data["description"]
+                    # description field may contain HTML markup — strip it
+                    if "<" in raw:
+                        raw = BeautifulSoup(raw, "lxml").get_text(separator="\n", strip=True)
+                    desc = raw.strip()
+                    _ld_employment_type = data.get("employmentType")
+                    logger.debug(
+                        f"[LinkedIn] JSON-LD description for {job.external_id} ({len(desc)} chars)"
+                    )
+                    break
+            except Exception:
+                pass
+
+        if desc:
+            job.description = desc
+            # Enrich job_type from JSON-LD when CSS criteria aren't available
+            if not job.job_type and _ld_employment_type:
+                job.job_type = self._parse_job_type(_ld_employment_type)
         else:
-            logger.warning(f"[LinkedIn] No description element found for {job.external_id}")
+            # CSS fallback — covers older cached/Playwright-rendered pages
+            desc_el = soup.select_one(
+                "div.show-more-less-html__markup, "
+                "div.description__text, "
+                "div[class*='description__text'], "
+                "section.show-more-less-html, "
+                "div.jobs-description__content"
+            )
+            if desc_el:
+                job.description = desc_el.get_text(separator="\n", strip=True)
+                logger.debug(
+                    f"[LinkedIn] CSS description for {job.external_id} ({len(job.description)} chars)"
+                )
+            else:
+                logger.warning(f"[LinkedIn] No description found for {job.external_id}")
+                logger.debug(f"[LinkedIn] HTML snippet for {job.external_id}: {html[:800]!r}")
 
         # Easy Apply detection
         apply_btn = soup.select_one("button.jobs-apply-button")

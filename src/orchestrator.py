@@ -171,7 +171,7 @@ class Orchestrator:
         # ------------------------------------------------------------------
         # Enrich jobs with full descriptions before scoring
         # ------------------------------------------------------------------
-        need_details = [r for r in pending if not r.description]
+        need_details = [r for r in pending if not (r.description or "").strip()]
         if need_details:
             _emit(f"Fetching details for {len(need_details)} jobs …")
             boards = settings.enabled_board_list()
