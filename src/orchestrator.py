@@ -67,14 +67,19 @@ class Orchestrator:
     # Public API
     # ------------------------------------------------------------------
 
-    async def run_scrape(self, search_filter: JobSearchFilter, user_id: int | None = None) -> int:
+    async def run_scrape(
+        self,
+        search_filter: JobSearchFilter,
+        user_id: int | None = None,
+        run_id: str | None = None,
+    ) -> int:
         """Scrape all enabled boards and persist discovered jobs. Returns count."""
         boards = settings.enabled_board_list()
         logger.info(f"Scraping {len(boards)} board(s): {boards}")
 
         total = 0
         tasks = [
-            self._scrape_board(board, search_filter, user_id=user_id)
+            self._scrape_board(board, search_filter, user_id=user_id, run_id=run_id)
             for board in boards
             if board in SCRAPER_REGISTRY
         ]
@@ -133,6 +138,7 @@ class Orchestrator:
         self,
         search_filter: JobSearchFilter,
         user_id: int | None = None,
+        run_id: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> dict:
         """
@@ -155,7 +161,7 @@ class Orchestrator:
                 progress_callback(f"{_ts()} {msg}")
 
         _emit("🚀 Pipeline starting — scraping jobs …")
-        jobs_found = await self.run_scrape(search_filter, user_id=user_id)
+        jobs_found = await self.run_scrape(search_filter, user_id=user_id, run_id=run_id)
         _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
 
         # Parse resume once — try per-user path first, then global fallback
@@ -174,8 +180,13 @@ class Orchestrator:
 
         ai = self._get_ai_client()
 
-        # Load pending jobs — scoped to this user to avoid processing other users' jobs
-        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run, user_id=user_id)
+        # Load ONLY jobs from this run — never re-process leftover pending jobs from
+        # previous runs, which would give wrong counts and re-score already-seen jobs.
+        pending = await self.db.get_pending_jobs(
+            limit=settings.max_applications_per_run,
+            user_id=user_id,
+            scrape_run_id=run_id,
+        )
 
         # ------------------------------------------------------------------
         # Enrich jobs with full descriptions before scoring
@@ -423,7 +434,13 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning(f"Could not save custom_answers to DB: {exc}")
 
-    async def _scrape_board(self, board: str, search_filter: JobSearchFilter, user_id: int | None = None) -> int:
+    async def _scrape_board(
+        self,
+        board: str,
+        search_filter: JobSearchFilter,
+        user_id: int | None = None,
+        run_id: str | None = None,
+    ) -> int:
         scraper_cls = SCRAPER_REGISTRY[board]
         creds = self._get_creds(board)
         count = 0
@@ -436,7 +453,7 @@ class Orchestrator:
                         job = await scraper.get_job_details(job)
                     except Exception as exc:
                         logger.warning(f"[{board}] Detail fetch failed for {job.title}: {exc}")
-                    await self.db.upsert_job(job, user_id=user_id)
+                    await self.db.upsert_job(job, user_id=user_id, scrape_run_id=run_id)
                     count += 1
                     await asyncio.sleep(settings.request_delay_seconds)
         except NotImplementedError:

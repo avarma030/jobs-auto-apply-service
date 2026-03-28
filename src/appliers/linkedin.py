@@ -405,9 +405,11 @@ class LinkedInApplier(BaseApplier):
         self._cover_letter_text = cover_letter
         logger.info(f"[LinkedIn] Easy Apply → {job.title} @ {job.company}")
 
-        # Navigate to job page
+        # Navigate to job page — normalize locale subdomains first (safety net for
+        # URLs stored in DB before the scraper fix, e.g. de.linkedin.com → www.linkedin.com)
+        job_url = re.sub(r"https://[a-z]{2}\.linkedin\.com/", "https://www.linkedin.com/", job.url)
         try:
-            await page.goto(job.url, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
             return self._fail(job, f"Could not navigate to job page: {exc}")
         await asyncio.sleep(random.uniform(1.5, 2.5))

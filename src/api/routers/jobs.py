@@ -283,6 +283,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
         counts = await orch.run_full_pipeline(
             filt,
             user_id=user_id,
+            run_id=run_id,
             progress_callback=_progress,
         )
         total_found = counts.get("scraped", (

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
@@ -41,19 +41,25 @@ class Database:
     # Jobs
     # ------------------------------------------------------------------
 
-    async def upsert_job(self, job: Job, user_id: int | None = None) -> JobRecord:
+    async def upsert_job(
+        self, job: Job, user_id: int | None = None, scrape_run_id: str | None = None
+    ) -> JobRecord:
         """Insert or update a job record. Returns the persisted record."""
         async with self.session_factory() as session:
             # Check for existing record by URL
             result = await session.execute(select(JobRecord).where(JobRecord.url == job.url))
             record = result.scalar_one_or_none()
 
-            if record is None:
+            is_new = record is None
+            if is_new:
                 record = JobRecord(url=job.url)
                 session.add(record)
 
             if user_id is not None:
                 record.user_id = user_id
+            # Only stamp scrape_run_id on new records — don't overwrite on re-scrape
+            if is_new and scrape_run_id:
+                record.scrape_run_id = scrape_run_id
             record.external_id = job.external_id
             record.source_board = job.source_board
             record.title = job.title
@@ -78,7 +84,10 @@ class Database:
             return record
 
     async def get_pending_jobs(
-        self, limit: int = 100, user_id: int | None = None
+        self,
+        limit: int = 100,
+        user_id: int | None = None,
+        scrape_run_id: str | None = None,
     ) -> list[JobRecord]:
         async with self.session_factory() as session:
             q = select(JobRecord).where(
@@ -86,6 +95,14 @@ class Database:
             )
             if user_id is not None:
                 q = q.where(JobRecord.user_id == user_id)
+            if scrape_run_id is not None:
+                # Scope to the current run — never process other runs' jobs
+                q = q.where(JobRecord.scrape_run_id == scrape_run_id)
+            else:
+                # Legacy / standalone path: limit to jobs scraped in the last 24 h
+                # so very old pending jobs don't accumulate indefinitely
+                cutoff = datetime.utcnow() - timedelta(hours=24)
+                q = q.where(JobRecord.scraped_at >= cutoff)
             result = await session.execute(q.limit(limit))
             return list(result.scalars().all())
 

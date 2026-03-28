@@ -883,11 +883,14 @@ class LinkedInScraper(BaseScraper):
             )
             location = loc_el.get_text(strip=True) if loc_el else None
 
-            # URL
+            # URL — normalize locale subdomains (de.linkedin.com → www.linkedin.com)
+            # to avoid ERR_TOO_MANY_REDIRECTS when Playwright navigates with .com cookies
             link_el = card_el.select_one("a.base-card__full-link")
-            url = link_el["href"].split("?")[0] if link_el and link_el.get("href") else (
-                _JOB_VIEW_URL.format(job_id=job_id)
-            )
+            if link_el and link_el.get("href"):
+                raw_url = link_el["href"].split("?")[0]
+                url = re.sub(r"https://[a-z]{2}\.linkedin\.com/", "https://www.linkedin.com/", raw_url)
+            else:
+                url = _JOB_VIEW_URL.format(job_id=job_id)
 
             # Posted at
             time_el = card_el.select_one("time")
