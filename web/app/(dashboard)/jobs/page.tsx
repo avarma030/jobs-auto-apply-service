@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
-import { ExternalLink, Check, X, ChevronLeft, ChevronRight, Download } from "lucide-react";
+import { ExternalLink, Check, X, ChevronLeft, ChevronRight, Download, ChevronDown, ChevronUp } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
 // "" = Active view (hides skipped/rejected). All other values are explicit status filters.
@@ -61,6 +61,7 @@ export default function JobsPage() {
   const [keywords, setKeywords] = useState("");
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
+  const [expandedId, setExpandedId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -150,63 +151,84 @@ export default function JobsPage() {
                   {status === "" ? "No active jobs. Start a scrape from the Dashboard." : "No jobs found for this filter."}
                 </td></tr>
               ) : (
-                data.items.map((job) => (
-                  <tr key={job.id} className="hover:bg-gray-50">
-                    <td className="px-4 py-3">
-                      <div>
-                        <p className="font-medium text-gray-900">{job.title}</p>
-                        <p className="text-gray-500 text-xs">{job.company} · {job.location ?? "Remote"}</p>
-                        <div className="flex gap-1.5 mt-1">
-                          {job.easy_apply && <Badge variant="info" className="text-xs py-0">Easy Apply</Badge>}
-                          {job.work_mode && <Badge variant="outline" className="text-xs py-0 capitalize">{job.work_mode}</Badge>}
-                          {job.experience_level && <Badge variant="outline" className="text-xs py-0 capitalize">{job.experience_level}</Badge>}
-                          {job.salary_min && (
-                            <Badge variant="outline" className="text-xs py-0 text-green-700 border-green-300">
-                              {job.salary_currency ?? "$"}{(job.salary_min / 1000).toFixed(0)}k{job.salary_max ? `–${(job.salary_max / 1000).toFixed(0)}k` : "+"}
-                            </Badge>
-                          )}
-                          {job.tailored_resume_path && <Badge variant="outline" className="text-xs py-0 text-purple-700 border-purple-300">Tailored</Badge>}
+                data.items.flatMap((job) => {
+                  const isExpanded = expandedId === job.id;
+                  return [
+                    <tr key={job.id} className="hover:bg-gray-50 cursor-pointer"
+                      onClick={() => setExpandedId(isExpanded ? null : job.id)}>
+                      <td className="px-4 py-3">
+                        <div>
+                          <div className="flex items-center gap-1.5">
+                            <p className="font-medium text-gray-900">{job.title}</p>
+                            {job.description && (
+                              isExpanded
+                                ? <ChevronUp className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
+                                : <ChevronDown className="h-3.5 w-3.5 text-gray-400 flex-shrink-0" />
+                            )}
+                          </div>
+                          <p className="text-gray-500 text-xs">{job.company} · {job.location ?? "Remote"}</p>
+                          <div className="flex gap-1.5 mt-1">
+                            {job.easy_apply && <Badge variant="info" className="text-xs py-0">Easy Apply</Badge>}
+                            {job.work_mode && <Badge variant="outline" className="text-xs py-0 capitalize">{job.work_mode}</Badge>}
+                            {job.experience_level && <Badge variant="outline" className="text-xs py-0 capitalize">{job.experience_level}</Badge>}
+                            {job.salary_min && (
+                              <Badge variant="outline" className="text-xs py-0 text-green-700 border-green-300">
+                                {job.salary_currency ?? "$"}{(job.salary_min / 1000).toFixed(0)}k{job.salary_max ? `–${(job.salary_max / 1000).toFixed(0)}k` : "+"}
+                              </Badge>
+                            )}
+                            {job.tailored_resume_path && <Badge variant="outline" className="text-xs py-0 text-purple-700 border-purple-300">Tailored</Badge>}
+                          </div>
                         </div>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 hidden lg:table-cell">
-                      <MatchScoreBadge score={job.match_score} />
-                    </td>
-                    <td className="px-4 py-3 hidden lg:table-cell">
-                      <AtsBadge score={job.ats_score} atsType={job.ats_type} />
-                    </td>
-                    <td className="px-4 py-3 hidden md:table-cell">
-                      <span className="capitalize text-gray-600">{job.source_board}</span>
-                    </td>
-                    <td className="px-4 py-3 hidden lg:table-cell text-gray-500 text-xs">
-                      {job.posted_at ? formatDistanceToNow(new Date(job.posted_at), { addSuffix: true }) : "–"}
-                    </td>
-                    <td className="px-4 py-3">
-                      <StatusBadge status={job.application_status} />
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex gap-1">
-                        {job.application_status === "pending" && (
-                          <>
-                            <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600 hover:bg-green-50"
-                              onClick={() => updateStatus(job.id, "approved")} title="Approve">
-                              <Check className="h-4 w-4" />
+                      </td>
+                      <td className="px-4 py-3 hidden lg:table-cell">
+                        <MatchScoreBadge score={job.match_score} />
+                      </td>
+                      <td className="px-4 py-3 hidden lg:table-cell">
+                        <AtsBadge score={job.ats_score} atsType={job.ats_type} />
+                      </td>
+                      <td className="px-4 py-3 hidden md:table-cell">
+                        <span className="capitalize text-gray-600">{job.source_board}</span>
+                      </td>
+                      <td className="px-4 py-3 hidden lg:table-cell text-gray-500 text-xs">
+                        {job.posted_at ? formatDistanceToNow(new Date(job.posted_at), { addSuffix: true }) : "–"}
+                      </td>
+                      <td className="px-4 py-3">
+                        <StatusBadge status={job.application_status} />
+                      </td>
+                      <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex gap-1">
+                          {job.application_status === "pending" && (
+                            <>
+                              <Button size="icon" variant="ghost" className="h-7 w-7 text-green-600 hover:bg-green-50"
+                                onClick={() => updateStatus(job.id, "approved")} title="Approve">
+                                <Check className="h-4 w-4" />
+                              </Button>
+                              <Button size="icon" variant="ghost" className="h-7 w-7 text-gray-400 hover:bg-gray-100"
+                                onClick={() => updateStatus(job.id, "skipped")} title="Skip">
+                                <X className="h-4 w-4" />
+                              </Button>
+                            </>
+                          )}
+                          <a href={job.url} target="_blank" rel="noopener noreferrer">
+                            <Button size="icon" variant="ghost" className="h-7 w-7 text-blue-500 hover:bg-blue-50" title="Open job">
+                              <ExternalLink className="h-4 w-4" />
                             </Button>
-                            <Button size="icon" variant="ghost" className="h-7 w-7 text-gray-400 hover:bg-gray-100"
-                              onClick={() => updateStatus(job.id, "skipped")} title="Skip">
-                              <X className="h-4 w-4" />
-                            </Button>
-                          </>
-                        )}
-                        <a href={job.url} target="_blank" rel="noopener noreferrer">
-                          <Button size="icon" variant="ghost" className="h-7 w-7 text-blue-500 hover:bg-blue-50" title="Open job">
-                            <ExternalLink className="h-4 w-4" />
-                          </Button>
-                        </a>
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                          </a>
+                        </div>
+                      </td>
+                    </tr>,
+                    isExpanded && job.description ? (
+                      <tr key={`${job.id}-desc`} className="bg-blue-50/40">
+                        <td colSpan={7} className="px-6 py-4">
+                          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Job Description</p>
+                          <p className="text-sm text-gray-700 whitespace-pre-line leading-relaxed max-h-64 overflow-y-auto">
+                            {job.description}
+                          </p>
+                        </td>
+                      </tr>
+                    ) : null,
+                  ].filter(Boolean);
+                })
               )}
             </tbody>
           </table>

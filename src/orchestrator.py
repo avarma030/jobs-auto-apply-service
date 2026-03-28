@@ -145,14 +145,18 @@ class Orchestrator:
           6. Apply using the appropriate applier
         Returns aggregate counts.
         """
+        def _ts() -> str:
+            """Current time as [HH:MM:SS] prefix."""
+            return datetime.utcnow().strftime("[%H:%M:%S]")
+
         def _emit(msg: str) -> None:
             logger.info(msg)
             if progress_callback:
-                progress_callback(msg)
+                progress_callback(f"{_ts()} {msg}")
 
-        _emit("Pipeline starting — scraping jobs …")
+        _emit("🚀 Pipeline starting — scraping jobs …")
         jobs_found = await self.run_scrape(search_filter, user_id=user_id)
-        _emit(f"Scrape complete: {jobs_found} jobs found")
+        _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
 
         # Parse resume once — try per-user path first, then global fallback
         resume_text = ""
@@ -164,7 +168,7 @@ class Orchestrator:
         if resume_path.exists():
             try:
                 resume_text = resume_parser.parse_resume(resume_path)
-                _emit(f"Resume parsed ({len(resume_text)} chars)")
+                _emit(f"📄 Resume parsed ({len(resume_text):,} chars)")
             except Exception as exc:
                 logger.error(f"Resume parse error: {exc}")
 
@@ -178,7 +182,7 @@ class Orchestrator:
         # ------------------------------------------------------------------
         need_details = [r for r in pending if not (r.description or "").strip()]
         if need_details:
-            _emit(f"Fetching details for {len(need_details)} jobs …")
+            _emit(f"🔎 Fetching full descriptions for {len(need_details)} jobs …")
             boards = settings.enabled_board_list()
             for board in boards:
                 scraper_cls = SCRAPER_REGISTRY.get(board)
@@ -197,7 +201,6 @@ class Orchestrator:
                                     record.description = enriched.description
                                     record.easy_apply = enriched.easy_apply
                                     await self.db.update_job_details(record.id, enriched)
-                                    _emit(f"  Fetched details for '{job.title}' @ {job.company}")
                             except Exception as exc:
                                 logger.warning(f"Could not fetch details for {job.title}: {exc}")
                             await asyncio.sleep(settings.request_delay_seconds)
@@ -206,28 +209,24 @@ class Orchestrator:
 
         if not resume_text:
             _emit(
-                "WARNING: No resume found at configured path — "
-                "scoring and tailoring disabled. "
-                "Upload a resume to data/resume.pdf to enable AI features."
+                "⚠️  No resume found — scoring and tailoring disabled. "
+                "Upload a resume via the Profile page to enable AI features."
             )
         if not ai:
-            _emit(
-                "WARNING: ANTHROPIC_API_KEY not set — "
-                "scoring and tailoring disabled."
-            )
+            _emit("⚠️  ANTHROPIC_API_KEY not set — scoring and tailoring disabled.")
 
-        _emit(f"Scoring {len(pending)} jobs against resume …")
+        _emit(f"🧠 Scoring {len(pending)} jobs against your resume …")
 
         qualified: list[tuple] = []  # (record, job)
         skipped_score = 0
 
-        for record in pending:
+        for i, record in enumerate(pending, 1):
             job = self._record_to_job(record)
             if not resume_text or not ai:
                 # Cannot score — leave as pending for manual review, do not auto-qualify
                 continue
             if not job.description:
-                _emit(f"  Skipping '{job.title}' — no description available for scoring")
+                _emit(f"  ⏭️  [{i}/{len(pending)}] '{job.title}' @ {job.company} — no description, skipped")
                 skipped_score += 1
                 await self.db.update_job_status(
                     record.id, ApplicationStatus.SKIPPED,
@@ -245,17 +244,17 @@ class Orchestrator:
 
             if score < settings.min_match_score:
                 skipped_score += 1
-                _emit(f"  Skipped '{job.title}' @ {job.company} — {score:.0f}% match")
+                _emit(f"  ❌ [{i}/{len(pending)}] '{job.title}' @ {job.company} — {score:.0f}% (below {settings.min_match_score:.0f}% threshold)")
                 await self.db.update_job_status(
                     record.id,
                     ApplicationStatus.SKIPPED,
                     notes=f"Match score {score:.0f}% < threshold {settings.min_match_score:.0f}%",
                 )
             else:
-                _emit(f"  Qualified '{job.title}' @ {job.company} — {score:.0f}% match")
+                _emit(f"  ✅ [{i}/{len(pending)}] '{job.title}' @ {job.company} — {score:.0f}% match ✓")
                 qualified.append((record, job))
 
-        _emit(f"Scoring done: {len(qualified)} qualified, {skipped_score} skipped")
+        _emit(f"📊 Scoring done — {len(qualified)} qualified, {skipped_score} skipped")
 
         # ------------------------------------------------------------------
         # For each qualified job: ATS detect → tailor → cover letter → apply
@@ -268,7 +267,7 @@ class Orchestrator:
             "scraped": jobs_found,     # total scraped — for run record
         }
 
-        for record, job in qualified:
+        for idx, (record, job) in enumerate(qualified, 1):
             uid = user_id or 0
             job_dir = _UPLOAD_BASE / str(uid) / "tailored" / str(record.id)
 
@@ -282,7 +281,7 @@ class Orchestrator:
 
             if resume_text and job.description and ai:
                 # Tailor resume
-                _emit(f"Tailoring resume for '{job.title}' …")
+                _emit(f"✏️  [{idx}/{len(qualified)}] Tailoring resume for '{job.title}' @ {job.company} …")
                 try:
                     tailored_text, ats_score = await resume_tailor.tailor_resume(
                         resume_text,
@@ -293,7 +292,7 @@ class Orchestrator:
                         target_ats_score=settings.min_ats_score,
                         max_attempts=settings.max_tailor_attempts,
                     )
-                    _emit(f"  ATS score: {ats_score:.0f}%")
+                    _emit(f"     📈 ATS score after tailoring: {ats_score:.0f}%")
 
                     # Build tailored PDF
                     pdf_path = job_dir / "resume.pdf"
@@ -302,7 +301,7 @@ class Orchestrator:
                     job.tailored_resume_path = tailored_resume_path
 
                     # Generate cover letter
-                    _emit(f"Generating cover letter for '{job.title}' …")
+                    _emit(f"     📝 Generating cover letter …")
                     cl_text = await cover_letter_svc.generate_cover_letter(
                         self.profile, job, tailored_text, ai, settings.anthropic_model
                     )
@@ -322,11 +321,11 @@ class Orchestrator:
                     logger.error(f"AI tailoring error for job {record.id}: {exc}")
 
             if settings.dry_run:
-                _emit(f"[DRY RUN] Would apply to '{job.title}' @ {job.company} ({ats_type})")
+                _emit(f"🧪 [DRY RUN] Would apply to '{job.title}' @ {job.company} (ATS: {ats_type})")
                 counts["dry_run"] += 1
                 continue
 
-            _emit(f"Applying to '{job.title}' @ {job.company} via {ats_type} …")
+            _emit(f"📤 Applying to '{job.title}' @ {job.company} (ATS: {ats_type}) …")
             applier = self._pick_applier(job)
             try:
                 async with applier as a:
@@ -343,6 +342,10 @@ class Orchestrator:
 
             status = result.status
             counts[status] = counts.get(status, 0) + 1
+            if status == ApplicationStatus.APPLIED:
+                _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
+            else:
+                _emit(f"  ⚠️  Application result for '{job.title}': {status} — {result.message or ''}")
             await self.db.update_job_status(
                 record.id,
                 status,
@@ -356,10 +359,15 @@ class Orchestrator:
                 message=result.message,
             )
             if result.new_questions:
-                _emit(f"  Learning {len(result.new_questions)} new Q&A pairs from this application …")
+                _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")
                 await self._handle_new_questions(result.new_questions, user_id)
 
-        _emit(f"Pipeline complete: {counts}")
+        _emit(
+            f"🏁 Pipeline complete — applied: {counts['applied']}, "
+            f"dry_run: {counts.get('dry_run', 0)}, "
+            f"failed: {counts['failed']}, "
+            f"skipped: {counts['skipped']}"
+        )
         return counts
 
     # ------------------------------------------------------------------

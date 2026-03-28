@@ -335,6 +335,8 @@ class LinkedInScraper(BaseScraper):
             if search_filter.max_age_days
             else None
         )
+        max_jobs = search_filter.max_jobs  # None = no limit
+        total_yielded = 0
 
         for page in range(_MAX_PAGES):
             params["start"] = page * _PAGE_SIZE
@@ -359,6 +361,11 @@ class LinkedInScraper(BaseScraper):
 
             new_this_page = 0
             for card in cards:
+                # Respect max_jobs limit
+                if max_jobs is not None and total_yielded >= max_jobs:
+                    logger.info(f"[LinkedIn] Reached max_jobs limit ({max_jobs}), stopping")
+                    return
+
                 job_id = card.get("job_id")
                 if not job_id or job_id in seen_ids:
                     continue
@@ -386,6 +393,7 @@ class LinkedInScraper(BaseScraper):
                     posted_at=posted_at,
                 )
                 new_this_page += 1
+                total_yielded += 1
                 yield job
 
             logger.info(f"[LinkedIn] Page {page + 1}: {new_this_page} new jobs")

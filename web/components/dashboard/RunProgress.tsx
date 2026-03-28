@@ -68,6 +68,7 @@ export function RunProgress({ onComplete }: Props) {
   const [expLevels, setExpLevels] = useState<string[]>([]);
   const [easyApplyOnly, setEasyApplyOnly] = useState(false);
   const [maxAgeDays, setMaxAgeDays] = useState(7);
+  const [maxJobs, setMaxJobs] = useState<string>("");  // empty = no limit
   const [boards, setBoards] = useState<string[]>(["linkedin"]);
 
   const { latest, messages, done } = useRunStream(runId);
@@ -100,6 +101,7 @@ export function RunProgress({ onComplete }: Props) {
         easy_apply_only: easyApplyOnly,
         boards,
         max_age_days: maxAgeDays,
+        max_jobs: maxJobs ? parseInt(maxJobs, 10) : undefined,
       });
       setRunId(res.run_id);
     } catch (err: any) {
@@ -129,6 +131,20 @@ export function RunProgress({ onComplete }: Props) {
                 <Label className="text-xs text-muted-foreground">Location (optional)</Label>
                 <Input value={location} onChange={(e) => setLocation(e.target.value)}
                   placeholder="New York, NY" className="mt-1" />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label className="text-xs text-muted-foreground">Max Jobs to Scrape (blank = all)</Label>
+                <Input
+                  type="number"
+                  min="1"
+                  value={maxJobs}
+                  onChange={(e) => setMaxJobs(e.target.value)}
+                  placeholder="e.g. 50"
+                  className="mt-1"
+                />
               </div>
             </div>
 
@@ -235,8 +251,16 @@ export function RunProgress({ onComplete }: Props) {
             </div>
             {messages.length > 0 && (
               <div ref={logRef}
-                className="max-h-36 overflow-y-auto text-xs text-gray-600 space-y-0.5 border-t pt-2">
-                {messages.map((m, i) => <p key={i}>{m}</p>)}
+                className="max-h-48 overflow-y-auto border-t pt-2 space-y-0.5">
+                {messages.map((m, i) => {
+                  const isError = m.includes("⚠️") || m.includes("❌") || m.includes("failed") || m.includes("ERROR");
+                  const isSuccess = m.includes("✅") || m.includes("🎉") || m.includes("🏁");
+                  return (
+                    <p key={i} className={`text-xs font-mono leading-relaxed ${
+                      isError ? "text-red-600" : isSuccess ? "text-green-700" : "text-gray-600"
+                    }`}>{m}</p>
+                  );
+                })}
               </div>
             )}
             {latest?.error_message && (

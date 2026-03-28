@@ -88,7 +88,7 @@ async def export_jobs(
         "Salary Min", "Salary Max", "Currency",
         "Easy Apply", "Skills",
         "Posted Date", "Scraped Date",
-        "URL",
+        "URL", "Description",
     ]
     ws.append(headers)
 
@@ -125,6 +125,7 @@ async def export_jobs(
             r.posted_at.strftime("%Y-%m-%d") if r.posted_at else "",
             r.scraped_at.strftime("%Y-%m-%d %H:%M") if r.scraped_at else "",
             r.url,
+            r.description or "",
         ])
 
     # Auto-size columns (approximate)
@@ -249,6 +250,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             experience_levels=exp_level_enums,
             easy_apply_only=req.easy_apply_only,
             max_age_days=req.max_age_days,
+            max_jobs=req.max_jobs,
         )
 
         # Load profile from DB for this user; fall back to sensible defaults so
@@ -337,6 +339,7 @@ def _to_response(r: JobRecord) -> JobResponse:
         title=r.title,
         company=r.company,
         location=r.location,
+        description=r.description,
         source_board=r.source_board,
         url=r.url,
         job_type=r.job_type,

@@ -13,6 +13,7 @@ export interface Job {
   title: string;
   company: string;
   location?: string;
+  description?: string | null;
   source_board: string;
   url: string;
   job_type?: string;

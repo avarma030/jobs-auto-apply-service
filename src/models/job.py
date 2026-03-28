@@ -92,3 +92,4 @@ class JobSearchFilter(BaseModel):
     salary_min: Optional[float] = None
     exclude_keywords: list[str] = Field(default_factory=list)
     max_age_days: int = 7  # only scrape jobs posted within N days
+    max_jobs: Optional[int] = None  # max jobs to scrape per board (None = no limit)

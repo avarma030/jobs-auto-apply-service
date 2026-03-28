@@ -11,6 +11,7 @@ class JobResponse(BaseModel):
     title: str
     company: str
     location: Optional[str] = None
+    description: Optional[str] = None
     source_board: str
     url: str
     job_type: Optional[str] = None
@@ -50,6 +51,8 @@ class ScrapeRequest(BaseModel):
     remote_only: bool = False
     boards: list[str] = ["linkedin"]
     max_age_days: int = 7
+    # Maximum number of jobs to scrape per board (None = no limit)
+    max_jobs: Optional[int] = None
 
 
 class JobStatusUpdate(BaseModel):
