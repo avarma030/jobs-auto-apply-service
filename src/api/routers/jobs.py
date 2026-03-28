@@ -130,20 +130,22 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
         profile = load_profile(settings.user_profile_path)
         orch = Orchestrator(profile=profile, db=db)
 
-        if settings.anthropic_api_key:
-            # Full AI pipeline: scrape → score → tailor → apply
-            counts = await orch.run_full_pipeline(
-                filt,
-                user_id=user_id,
-                progress_callback=_progress,
-            )
-            total_found = counts.get("applied", 0) + counts.get("skipped", 0) + counts.get("failed", 0) + counts.get("dry_run", 0)
-            total_applied = counts.get("applied", 0)
-        else:
-            # Scrape-only fallback (no AI key)
-            _progress("ANTHROPIC_API_KEY not set — running scrape only (no AI scoring or applying)")
-            total_found = await orch.run_scrape(filt)
-            total_applied = 0
+        # Always run the full pipeline. The orchestrator degrades gracefully:
+        # - no ANTHROPIC_API_KEY → scoring/tailoring skipped, jobs remain pending
+        # - no resume file      → scoring skipped, jobs remain pending
+        # - both present        → full scrape → score → tailor → apply flow
+        counts = await orch.run_full_pipeline(
+            filt,
+            user_id=user_id,
+            progress_callback=_progress,
+        )
+        total_found = (
+            counts.get("applied", 0)
+            + counts.get("skipped", 0)
+            + counts.get("failed", 0)
+            + counts.get("dry_run", 0)
+        )
+        total_applied = counts.get("applied", 0)
 
         async with db.session_factory() as session:
             run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()

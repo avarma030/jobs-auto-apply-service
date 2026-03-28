@@ -199,6 +199,18 @@ class Orchestrator:
                 except Exception as exc:
                     logger.error(f"[{board}] Detail fetch error: {exc}")
 
+        if not resume_text:
+            _emit(
+                "WARNING: No resume found at configured path — "
+                "scoring and tailoring disabled. "
+                "Upload a resume to data/resume.pdf to enable AI features."
+            )
+        if not ai:
+            _emit(
+                "WARNING: ANTHROPIC_API_KEY not set — "
+                "scoring and tailoring disabled."
+            )
+
         _emit(f"Scoring {len(pending)} jobs against resume …")
 
         qualified: list[tuple] = []  # (record, job)
@@ -206,8 +218,8 @@ class Orchestrator:
 
         for record in pending:
             job = self._record_to_job(record)
-            if not resume_text:
-                qualified.append((record, job))
+            if not resume_text or not ai:
+                # Cannot score — leave as pending for manual review, do not auto-qualify
                 continue
             if not job.description:
                 _emit(f"  Skipping '{job.title}' — no description available for scoring")
