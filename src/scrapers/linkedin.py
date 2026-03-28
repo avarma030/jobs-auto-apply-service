@@ -391,6 +391,7 @@ class LinkedInScraper(BaseScraper):
                     location=card.get("location"),
                     url=card.get("url", _JOB_VIEW_URL.format(job_id=job_id)),
                     posted_at=posted_at,
+                    easy_apply=card.get("easy_apply", False),
                 )
                 new_this_page += 1
                 total_yielded += 1
@@ -506,6 +507,17 @@ class LinkedInScraper(BaseScraper):
                     if "hybrid" in wt_lower:
                         job.work_mode = WorkMode.HYBRID
                         break
+
+        # Easy Apply detection via applyMethod.$type
+        # ComplexOnsiteApply / SimpleOnsiteApply = LinkedIn hosts the form (Easy Apply)
+        # OffsiteApply = redirect to external ATS (not Easy Apply)
+        apply_method = job_data.get("applyMethod") or {}
+        apply_type = apply_method.get("$type", "")
+        if apply_type:
+            job.easy_apply = "OnsiteApply" in apply_type
+            logger.debug(
+                f"[LinkedIn] Voyager applyMethod={apply_type!r} → easy_apply={job.easy_apply}"
+            )
 
         return job
 
@@ -628,9 +640,17 @@ class LinkedInScraper(BaseScraper):
             logger.debug(f"[LinkedIn] HTML snippet: {html[:600]!r}")
 
         # ── Easy Apply ─────────────────────────────────────────────────────────
-        apply_btn = soup.select_one("button.jobs-apply-button")
+        # Try multiple selectors — LinkedIn UI varies between desktop/mobile/guest HTML
+        apply_btn = (
+            soup.select_one("button.jobs-apply-button[aria-label*='Easy Apply']")
+            or soup.select_one("button[aria-label*='Easy Apply']")
+            or soup.select_one("button.jobs-apply-button")
+            or soup.select_one("a.jobs-apply-button")
+        )
         if apply_btn:
-            job.easy_apply = "easy apply" in apply_btn.get_text(strip=True).lower()
+            btn_text  = apply_btn.get_text(strip=True).lower()
+            btn_label = (apply_btn.get("aria-label") or "").lower()
+            job.easy_apply = "easy apply" in btn_text or "easy apply" in btn_label
 
         # ── Salary ─────────────────────────────────────────────────────────────
         salary_el = soup.select_one(
@@ -889,6 +909,17 @@ class LinkedInScraper(BaseScraper):
                 elif "hybrid" in loc_lower:
                     work_mode = WorkMode.HYBRID
 
+            # Easy Apply badge in search result card
+            # LinkedIn renders one of these for Easy Apply-eligible jobs
+            easy_apply = False
+            if card_el.select_one("li-icon[type='easy-apply-icon']"):
+                easy_apply = True
+            else:
+                for span in card_el.select("span.result-benefits__text"):
+                    if "easy apply" in span.get_text(strip=True).lower():
+                        easy_apply = True
+                        break
+
             cards.append(
                 {
                     "job_id": job_id,
@@ -898,6 +929,7 @@ class LinkedInScraper(BaseScraper):
                     "url": url,
                     "posted_at": posted_at,
                     "work_mode": work_mode,
+                    "easy_apply": easy_apply,
                 }
             )
         return cards

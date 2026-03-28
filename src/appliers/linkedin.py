@@ -188,8 +188,10 @@ class LinkedInApplier(BaseApplier):
 
         self._unknown_questions = []
         try:
-            if not job.easy_apply:
-                return self._skip(job, "Job does not have Easy Apply — route to ATS applier")
+            # Note: we do NOT gate on job.easy_apply here because the DB flag is often
+            # wrong (Voyager API scrape sets description but not easy_apply).
+            # _easy_apply() navigates to the actual page and checks for the button live —
+            # that is the authoritative check. If there's no Easy Apply button, it skips.
             result = await self._easy_apply(
                 job,
                 tailored_resume_path=tailored_resume_path,
