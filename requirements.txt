@@ -11,8 +11,9 @@ lxml>=5.2.2
 scrapy>=2.11.2
 
 # Data / models
-pydantic>=2.7.1
+pydantic[email]>=2.7.1
 pydantic-settings>=2.3.0
+email-validator>=2.1.0
 
 # Database
 sqlalchemy>=2.0.30
