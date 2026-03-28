@@ -94,6 +94,22 @@ async def upload_resume(
                 row.profile_json = json.dumps(merged)
                 await session.commit()
                 profile_updated = True
+
+                # Also persist to user_profile.json for CLI / orchestrator fallback
+                try:
+                    from src.models import UserProfile as _UserProfileModel
+                    profile_data = dict(merged)
+                    profile_data.setdefault("first_name", "User")
+                    profile_data.setdefault("last_name", "")
+                    profile_data.setdefault("email", "")
+                    _up = _UserProfileModel(**profile_data)
+                    settings.user_profile_path.parent.mkdir(parents=True, exist_ok=True)
+                    settings.user_profile_path.write_text(_up.model_dump_json(indent=2))
+                    from loguru import logger as _logger
+                    _logger.info(f"Profile saved to {settings.user_profile_path}")
+                except Exception as exc:
+                    from loguru import logger as _logger
+                    _logger.warning(f"Could not save profile to JSON: {exc}")
         except Exception as exc:
             from loguru import logger
             logger.warning(f"Auto-extraction failed after resume upload: {exc}")

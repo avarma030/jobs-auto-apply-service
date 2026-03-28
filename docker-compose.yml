@@ -11,6 +11,10 @@ services:
     environment:
       DATABASE_URL: "postgresql+asyncpg://jobs:jobs@postgres:5432/jobs_db"
       REDIS_URL: "redis://redis:6379/0"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      LINKEDIN_EMAIL: "${LINKEDIN_EMAIL:-}"
+      LINKEDIN_PASSWORD: "${LINKEDIN_PASSWORD:-}"
+      SECRET_KEY: "${SECRET_KEY:-changeme-replace-with-a-long-random-secret-in-production}"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

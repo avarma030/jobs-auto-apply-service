@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     use_task_queue: bool = False
 
     # ------------------------------------------------------------------
+    # Job board credentials (env-var fallback — profile UI takes priority)
+    # ------------------------------------------------------------------
+    linkedin_email: str | None = None      # LINKEDIN_EMAIL env var
+    linkedin_password: str | None = None   # LINKEDIN_PASSWORD env var
+
+    # ------------------------------------------------------------------
     # AI / Claude (for match scoring, resume tailoring, cover letters)
     # ------------------------------------------------------------------
     anthropic_api_key: str | None = None  # ANTHROPIC_API_KEY env var

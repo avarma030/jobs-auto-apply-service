@@ -260,7 +260,13 @@ class Orchestrator:
         # ------------------------------------------------------------------
         # For each qualified job: ATS detect → tailor → cover letter → apply
         # ------------------------------------------------------------------
-        counts: dict[str, int] = {"applied": 0, "failed": 0, "skipped": 0, "dry_run": 0}
+        counts: dict[str, int] = {
+            "applied": 0,
+            "failed": 0,
+            "skipped": skipped_score,  # already-skipped-by-score count
+            "dry_run": 0,
+            "scraped": jobs_found,     # total scraped — for run record
+        }
 
         for record, job in qualified:
             uid = user_id or 0

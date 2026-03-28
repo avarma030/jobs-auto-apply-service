@@ -250,6 +250,13 @@ class LinkedInScraper(BaseScraper):
             async with BrowserManager(headless=True, user_data_dir=_SESSION_DIR) as bm:
                 page = await bm.new_page()
 
+                # Resolve credentials: profile UI → environment variables fallback
+                if not creds.get("username") and settings.linkedin_email:
+                    creds = {
+                        "username": settings.linkedin_email,
+                        "password": settings.linkedin_password or "",
+                    }
+
                 # If credentials are configured, attempt login for a trusted li_at cookie.
                 if creds.get("username") and creds.get("password"):
                     logger.info("[LinkedIn] Logging in to get authenticated session cookies …")

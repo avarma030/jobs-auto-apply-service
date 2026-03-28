@@ -161,12 +161,12 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             user_id=user_id,
             progress_callback=_progress,
         )
-        total_found = (
+        total_found = counts.get("scraped", (
             counts.get("applied", 0)
             + counts.get("skipped", 0)
             + counts.get("failed", 0)
             + counts.get("dry_run", 0)
-        )
+        ))
         total_applied = counts.get("applied", 0)
 
         async with db.session_factory() as session:

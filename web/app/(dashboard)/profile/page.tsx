@@ -218,6 +218,45 @@ export default function ProfilePage() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Job Board Credentials */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Job Board Credentials</CardTitle>
+            <p className="text-xs text-muted-foreground mt-1">
+              Used to log in and apply to jobs on your behalf. Stored securely in your profile.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div>
+              <p className="text-sm font-medium text-gray-700 mb-2">LinkedIn</p>
+              <div className="grid grid-cols-2 gap-3">
+                <Field
+                  label="Email / Username"
+                  value={(profile.job_board_accounts as any)?.linkedin?.username ?? ""}
+                  onChange={(v) => set("job_board_accounts", {
+                    ...(profile.job_board_accounts ?? {}),
+                    linkedin: { ...(((profile.job_board_accounts ?? {}) as any).linkedin ?? {}), username: v },
+                  } as any)}
+                  placeholder="you@example.com"
+                />
+                <Field
+                  label="Password"
+                  type="password"
+                  value={(profile.job_board_accounts as any)?.linkedin?.password ?? ""}
+                  onChange={(v) => set("job_board_accounts", {
+                    ...(profile.job_board_accounts ?? {}),
+                    linkedin: { ...(((profile.job_board_accounts ?? {}) as any).linkedin ?? {}), password: v },
+                  } as any)}
+                  placeholder="••••••••"
+                />
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Enables authenticated scraping (bypasses CAPTCHA) and Easy Apply.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );
