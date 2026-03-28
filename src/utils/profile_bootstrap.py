@@ -119,6 +119,8 @@ DEGREE_HINTS = {
     "mba",
     "phd",
     "doctor",
+    "b.e",
+    "be",
     "bs",
     "bsc",
     "ba",
@@ -154,6 +156,7 @@ CONTACT_LABELS = {
     "website",
     "location",
 }
+BULLET_CHARS = "•▪■◆●◦"
 
 
 @dataclass(slots=True)
@@ -328,6 +331,8 @@ def extract_resume_text(resume_path: Path | str) -> str:
 def _normalize_resume_text(text: str) -> str:
     cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
     cleaned = cleaned.replace("\uf0b7", "\n")
+    for bullet in BULLET_CHARS:
+        cleaned = cleaned.replace(bullet, "\n" + bullet + " ")
     cleaned = re.sub(r"[ \t]+", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
@@ -349,7 +354,8 @@ def _split_sections(text: str) -> dict[str, list[str]]:
 
 
 def _clean_line(line: str) -> str:
-    return line.strip().strip("|").strip("-").strip()
+    cleaned = line.strip().strip("|").strip("-").strip()
+    return cleaned.strip(BULLET_CHARS).strip()
 
 
 def _is_section_heading(line: str) -> bool:
@@ -438,6 +444,16 @@ def _extract_social_links(text: str) -> SocialLinks:
 
 def _extract_address(top_lines: list[str]) -> Address | None:
     for line in top_lines[:8]:
+        location_match = re.search(r"location:\s*([^|]+)", line, re.IGNORECASE)
+        if location_match:
+            location_text = location_match.group(1).strip()
+            parts = [part.strip() for part in location_text.split(",") if part.strip()]
+            if len(parts) >= 2:
+                return Address(city=parts[0], country=parts[-1])
+            if parts:
+                return Address(city=parts[0])
+
+    for line in top_lines[:8]:
         if not line or _looks_like_contact_line(line) or "@" in line or "http" in line:
             continue
         if "," not in line:
@@ -509,14 +525,18 @@ def _extract_list_items(lines: list[str]) -> list[str]:
     items: list[str] = []
     seen: set[str] = set()
     for line in lines:
-        if not line:
+        cleaned_line = _clean_bullet(line)
+        if not cleaned_line:
             continue
-        raw_parts = re.split(r"[,\n;|]", line)
+        candidate_text = cleaned_line.split(":", 1)[1] if ":" in cleaned_line else cleaned_line
+        raw_parts = re.split(r"[,\n;|]", candidate_text)
         for part in raw_parts:
-            item = part.strip().strip("-").strip()
+            item = part.strip().strip("-").strip(BULLET_CHARS).strip()
             if not item:
                 continue
-            if len(item) > 40 or any(char.isdigit() for char in item):
+            if item.lower() in {"linkedin", "github", "portfolio", "website"}:
+                continue
+            if len(item) > 45 or any(char.isdigit() for char in item):
                 continue
             lowered = item.lower()
             if lowered in seen:
@@ -541,8 +561,8 @@ def _extract_work_experience(lines: list[str]) -> list[WorkExperience]:
 
 
 def _parse_experience_block(block: list[str]) -> WorkExperience | None:
-    lines = [_clean_bullet(line) for line in block if line.strip()]
-    if len(lines) < 2:
+    lines = [_clean_bullet(line) for line in block if _clean_bullet(line)]
+    if len(lines) < 3:
         return None
 
     date_index = next((index for index, line in enumerate(lines) if _looks_like_date_line(line)), None)
@@ -553,23 +573,19 @@ def _parse_experience_block(block: list[str]) -> WorkExperience | None:
     if start_date is None:
         return None
 
-    header_lines = [line for index, line in enumerate(lines[: max(2, date_index + 1)]) if index != date_index]
-    location = next(
-        (
-            line
-            for index, line in enumerate(lines)
-            if index != date_index and _looks_like_location_line(line)
-        ),
-        None,
-    )
-    if location:
-        header_lines = [line for line in header_lines if line != location]
-
-    title, company = _infer_title_and_company(header_lines)
+    title = _extract_experience_title(lines, date_index)
+    company = _extract_experience_company(lines, date_index, title)
+    location = _extract_experience_location(lines, date_index)
     if not title or not company:
         return None
 
-    description_lines = [line for index, line in enumerate(lines) if index > date_index and line != location]
+    description_lines = []
+    for index, line in enumerate(lines):
+        if index <= date_index:
+            continue
+        if line in {company, location}:
+            continue
+        description_lines.append(line)
     description = " ".join(description_lines).strip() or None
 
     return WorkExperience(
@@ -583,21 +599,22 @@ def _parse_experience_block(block: list[str]) -> WorkExperience | None:
 
 
 def _clean_bullet(line: str) -> str:
-    return line.lstrip("-*• ").strip()
+    return line.lstrip(f"-* {BULLET_CHARS}").strip()
 
 
 def _looks_like_date_line(line: str) -> bool:
     lowered = line.lower()
     has_month = any(month in lowered for month in MONTHS)
     has_years = len(YEAR_RE.findall(line)) >= 1
+    has_numeric_month = re.search(r"\b\d{1,2}/\d{4}\b", line) is not None
     has_range = any(token in lowered for token in {" - ", " to ", "present", "current", "now"})
-    return has_years and (has_month or has_range)
+    return has_years and (has_month or has_range or has_numeric_month)
 
 
 def _parse_date_range(line: str) -> tuple[str | None, str | None]:
     lowered = line.lower()
     token_pattern = (
-        r"(present|current|now|\d{4}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
+        r"(present|current|now|\d{4}-\d{2}|\d{1,2}/\d{4}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)"
         r"[a-z]*\s+\d{4}|\d{4})"
     )
     tokens = [match.group(0) for match in re.finditer(token_pattern, lowered, re.IGNORECASE)]
@@ -618,6 +635,9 @@ def _normalize_date_token(token: str) -> str | None:
         return None
     if re.fullmatch(r"\d{4}-\d{2}", value):
         return value
+    if re.fullmatch(r"\d{1,2}/\d{4}", value):
+        month, year = value.split("/", 1)
+        return f"{year}-{int(month):02d}"
     if re.fullmatch(r"\d{4}", value):
         return f"{value}-01"
     parts = value.split()
@@ -628,6 +648,8 @@ def _normalize_date_token(token: str) -> str | None:
 
 def _looks_like_location_line(line: str) -> bool:
     lowered = line.lower()
+    if lowered.startswith("location:"):
+        return True
     if "remote" in lowered:
         return True
     if "," not in line:
@@ -669,6 +691,49 @@ def _infer_title_and_company(lines: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _extract_experience_title(lines: list[str], date_index: int) -> str | None:
+    pre_date = [
+        line
+        for line in lines[:date_index]
+        if line and not _looks_like_location_line(line) and not _looks_like_metadata_sentence(line)
+    ]
+    if pre_date:
+        return pre_date[0]
+
+    post_date = [
+        line
+        for line in lines[date_index + 1 : date_index + 3]
+        if line and not _looks_like_location_line(line) and not _looks_like_metadata_sentence(line)
+    ]
+    return post_date[0] if post_date else None
+
+
+def _extract_experience_company(lines: list[str], date_index: int, title: str | None) -> str | None:
+    pre_date = [
+        line
+        for line in lines[:date_index]
+        if line and line != title and not _looks_like_location_line(line) and not _looks_like_metadata_sentence(line)
+    ]
+    if pre_date:
+        return pre_date[-1]
+
+    for line in lines[date_index + 1 :]:
+        if not line or line == title or _looks_like_location_line(line):
+            continue
+        if _looks_like_metadata_sentence(line):
+            continue
+        return line
+    return None
+
+
+def _extract_experience_location(lines: list[str], date_index: int) -> str | None:
+    return next((line for line in lines[date_index + 1 : date_index + 4] if _looks_like_location_line(line)), None)
+
+
+def _looks_like_metadata_sentence(line: str) -> bool:
+    return len(line.split()) > 10 or line.endswith(".")
+
+
 def _looks_like_title(value: str) -> bool:
     lowered = value.lower()
     return any(hint in lowered for hint in TITLE_HINTS)
@@ -689,8 +754,8 @@ def _extract_education(lines: list[str]) -> list[Education]:
 
 
 def _parse_education_block(block: list[str]) -> Education | None:
-    lines = [_clean_bullet(line) for line in block if line.strip()]
-    if len(lines) < 2:
+    lines = [_clean_bullet(line) for line in block if _clean_bullet(line)]
+    if not lines:
         return None
 
     date_index = next((index for index, line in enumerate(lines) if _looks_like_date_line(line)), None)
@@ -698,8 +763,22 @@ def _parse_education_block(block: list[str]) -> Education | None:
     start_date, end_date = _parse_date_range(date_line) if date_line else (None, None)
 
     header_lines = [line for index, line in enumerate(lines[: max(2, (date_index or 0) + 1)]) if index != date_index]
+    combined_line = next(
+        (
+            line
+            for line in header_lines
+            if _looks_like_degree(line) and _looks_like_institution(line)
+        ),
+        None,
+    )
     institution = next((line for line in header_lines if _looks_like_institution(line)), None)
     degree_line = next((line for line in header_lines if _looks_like_degree(line)), None)
+
+    if combined_line:
+        split_degree, split_institution = _split_education_header(combined_line)
+        if split_degree and split_institution:
+            degree_line = split_degree
+            institution = split_institution
 
     if institution is None and header_lines:
         institution = header_lines[0]
@@ -743,6 +822,18 @@ def _extract_field_of_study(value: str) -> str | None:
         if len(parts) > 1:
             return parts[-1]
     return None
+
+
+def _split_education_header(line: str) -> tuple[str | None, str | None]:
+    for separator in (" – ", " - ", "–", "-"):
+        if separator not in line:
+            continue
+        left, right = [part.strip() for part in line.split(separator, 1)]
+        if _looks_like_degree(left) and _looks_like_institution(right):
+            return left, right
+        if _looks_like_degree(right) and _looks_like_institution(left):
+            return right, left
+    return None, None
 
 
 def _extract_years_of_experience(text: str, work_experience: list[WorkExperience]) -> int | None:

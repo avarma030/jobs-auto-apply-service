@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     use_proxies: bool = False
     proxy_list_path: Path | None = None
     workday_tenant_urls: str = ""
+    linkedin_dashboard_scan_cap: int = Field(default=60, ge=10)
 
     # ------------------------------------------------------------------
     # Applying

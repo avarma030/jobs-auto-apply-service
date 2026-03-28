@@ -69,6 +69,7 @@ class Job(BaseModel):
     scraped_at: datetime = Field(default_factory=utcnow_naive)
 
     easy_apply: bool = False  # supports one-click / easy apply
+    easy_apply_confident: bool = True
     requires_cover_letter: bool = False
 
     application_status: ApplicationStatus = ApplicationStatus.PENDING

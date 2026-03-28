@@ -164,6 +164,7 @@ async def run_dashboard_search(query: DashboardQuery) -> AutopilotRun:
         scraper_cls=scraper_cls,
         search_filter=query.to_search_filter(),
         limit=query.limit,
+        scan_cap=settings.linkedin_dashboard_scan_cap if query.board == "linkedin" else None,
     )
 
 
@@ -271,8 +272,10 @@ def render_dashboard_page(
     query = query or DashboardQuery(location="Ireland")
     run = run or AutopilotRun(board=query.board)
     results = run.results
+    excluded_results = run.excluded_results
     has_results = bool(results)
-    has_run = run.total_scraped > 0 or has_results
+    has_excluded_results = bool(excluded_results)
+    has_run = run.total_scraped > 0 or has_results or has_excluded_results
     board_label = board_display_name(query.board)
 
     if error:
@@ -283,11 +286,25 @@ def render_dashboard_page(
         </div>
         """
     elif has_run:
-        visible_label = "visible Easy Apply match(es)" if query.board == "linkedin" else "visible shortlisted match(es)"
+        if query.board == "linkedin":
+            status_copy = (
+                f"Scraped {run.total_scraped} {escape_html(board_label)} job(s), "
+                f"filtered out {run.filtered_out_count} low-fit job(s), "
+                f"excluded {run.excluded_external_count} external and {run.excluded_unconfirmed_count} unconfirmed job(s), "
+                f"kept {run.shortlisted_count} visible Easy Apply match(es), "
+                f"submitted {run.auto_applied_count}, and held back {run.ats_blocked_count}{format_duration(duration_seconds)}."
+            )
+        else:
+            status_copy = (
+                f"Scraped {run.total_scraped} {escape_html(board_label)} job(s), "
+                f"filtered out {run.filtered_out_count}, "
+                f"kept {run.shortlisted_count} visible shortlisted match(es), "
+                f"submitted {run.auto_applied_count}, and held back {run.ats_blocked_count}{format_duration(duration_seconds)}."
+            )
         status_banner = f"""
         <div class="status status--success">
           <div class="status__label">Autopilot run complete</div>
-          <p>Scraped {run.total_scraped} {escape_html(board_label)} job(s), filtered out {run.filtered_out_count}, kept {run.shortlisted_count} {visible_label}, submitted {run.auto_applied_count}, and held back {run.ats_blocked_count}{format_duration(duration_seconds)}.</p>
+          <p>{status_copy}</p>
         </div>
         """
     else:
@@ -298,9 +315,40 @@ def render_dashboard_page(
         </div>
         """
 
-    result_markup = "".join(render_result_card(result, index=index) for index, result in enumerate(results, start=1))
-    if not result_markup:
-        result_markup = render_empty_state()
+    result_sections: list[str] = []
+    if has_results:
+        active_copy = (
+            "Only LinkedIn Easy Apply jobs stay in the live phase-one list."
+            if query.board == "linkedin"
+            else "Shortlisted matches stay visible here while the handler route is prepared."
+        )
+        visible_cards = "".join(
+            render_result_card(result, index=index) for index, result in enumerate(results, start=1)
+        )
+        result_sections.append(
+            f"""
+            <section class="result-block">
+              <div class="section-title">
+                <div>
+                  <h2>Active shortlist</h2>
+                  <p>{escape_html(active_copy)}</p>
+                </div>
+              </div>
+              <div class="results-grid">
+                {visible_cards}
+              </div>
+            </section>
+            """
+        )
+    elif query.board == "linkedin" and has_excluded_results:
+        result_sections.append(render_linkedin_no_visible_state(run))
+    else:
+        result_sections.append(render_empty_state())
+
+    if has_excluded_results:
+        result_sections.append(render_excluded_results_section(excluded_results))
+
+    result_markup = "".join(result_sections)
 
     options_markup = "".join(
         f'<option value="{value}"{" selected" if query.posted_within == value else ""}>{label}</option>'
@@ -1049,6 +1097,27 @@ def render_dashboard_page(
       gap: 16px;
     }}
 
+    .results-stack {{
+      display: grid;
+      gap: 18px;
+    }}
+
+    .result-block {{
+      display: grid;
+      gap: 14px;
+    }}
+
+    .result-block--muted {{
+      padding-top: 4px;
+      border-top: 1px solid rgba(17, 33, 38, 0.08);
+    }}
+
+    .result-card--excluded {{
+      border-style: dashed;
+      background:
+        linear-gradient(180deg, rgba(255, 252, 247, 0.98), rgba(248, 242, 232, 0.92));
+    }}
+
     .empty-state {{
       display: grid;
       gap: 16px;
@@ -1059,6 +1128,12 @@ def render_dashboard_page(
         linear-gradient(180deg, rgba(255, 252, 247, 0.94), rgba(255, 250, 242, 0.84));
       border: 1px dashed rgba(17, 33, 38, 0.18);
       box-shadow: var(--shadow-card);
+    }}
+
+    .empty-state--diagnostic {{
+      background:
+        radial-gradient(circle at top right, rgba(196, 154, 53, 0.18), transparent 24%),
+        linear-gradient(180deg, rgba(255, 252, 247, 0.96), rgba(251, 246, 238, 0.9));
     }}
 
     .empty-state h3 {{
@@ -1305,7 +1380,7 @@ def render_dashboard_page(
         {status_banner}
         {render_stat_cards(run, duration_seconds)}
         <div class="query-strip">{render_query_chips(query)}</div>
-        <div class="results-grid">
+        <div class="results-stack">
           {result_markup}
         </div>
       </section>
@@ -1490,14 +1565,29 @@ def render_dashboard_page(
 
 
 def render_stat_cards(run: AutopilotRun, duration_seconds: float | None) -> str:
-    cards = [
-        ("Scraped", str(run.total_scraped)),
-        ("Filtered out", str(run.filtered_out_count)),
-        ("Visible", str(run.shortlisted_count)),
-        ("Applied", str(run.auto_applied_count)),
-        ("Needs review", str(run.ats_blocked_count)),
-        ("Runtime", format_runtime(duration_seconds)),
-    ]
+    cards = [("Scraped", str(run.total_scraped))]
+    if run.board == "linkedin":
+        cards.extend(
+            [
+                ("Low fit", str(run.filtered_out_count)),
+                ("Excluded ext", str(run.excluded_external_count)),
+                ("Excluded unsure", str(run.excluded_unconfirmed_count)),
+                ("Visible", str(run.shortlisted_count)),
+                ("Applied", str(run.auto_applied_count)),
+                ("Needs review", str(run.ats_blocked_count)),
+                ("Runtime", format_runtime(duration_seconds)),
+            ]
+        )
+    else:
+        cards.extend(
+            [
+                ("Filtered out", str(run.filtered_out_count)),
+                ("Visible", str(run.shortlisted_count)),
+                ("Applied", str(run.auto_applied_count)),
+                ("Needs review", str(run.ats_blocked_count)),
+                ("Runtime", format_runtime(duration_seconds)),
+            ]
+        )
     markup = "".join(
         f"""
         <article class="stat-card">
@@ -1557,6 +1647,29 @@ def render_empty_state() -> str:
         <div class="empty-card">
           <strong>Inspect the handoff</strong>
           <span>Each result shows the handler, ATS score, and apply status instead of just dumping raw scrape output.</span>
+        </div>
+      </div>
+    </article>
+    """
+
+
+def render_linkedin_no_visible_state(run: AutopilotRun) -> str:
+    return f"""
+    <article class="empty-state empty-state--diagnostic">
+      <h3>No Easy Apply jobs cleared the active LinkedIn shortlist yet.</h3>
+      <p>The search still found promising LinkedIn jobs, but {run.excluded_external_count} use external apply flows and {run.excluded_unconfirmed_count} could not confirm Easy Apply. They are listed below so you can inspect what was excluded instead of seeing a blank shortlist.</p>
+      <div class="empty-grid">
+        <div class="empty-card">
+          <strong>Visible list stays strict</strong>
+          <span>Phase one only keeps confirmed Easy Apply jobs in the active shortlist.</span>
+        </div>
+        <div class="empty-card">
+          <strong>Excluded jobs stay inspectable</strong>
+          <span>High-fit external or unconfirmed roles are still shown with their route and exclusion reason.</span>
+        </div>
+        <div class="empty-card">
+          <strong>Search can scan deeper</strong>
+          <span>The dashboard keeps scanning past excluded jobs until it hits the LinkedIn scan cap or finds enough visible Easy Apply matches.</span>
         </div>
       </div>
     </article>
@@ -1628,6 +1741,26 @@ def render_action_panel(results: list[JobAutomationResult]) -> str:
     """
 
 
+def render_excluded_results_section(results: list[JobAutomationResult]) -> str:
+    cards = "".join(
+        render_excluded_result_card(result, index=index)
+        for index, result in enumerate(results, start=1)
+    )
+    return f"""
+    <section class="result-block result-block--muted">
+      <div class="section-title">
+        <div>
+          <h2>Excluded from active LinkedIn list</h2>
+          <p>These jobs scored well enough to inspect, but they are outside the current Easy Apply-only live flow.</p>
+        </div>
+      </div>
+      <div class="results-grid">
+        {cards}
+      </div>
+    </section>
+    """
+
+
 def render_result_card(result: JobAutomationResult, *, index: int) -> str:
     job = result.job
     meta_items = [
@@ -1693,6 +1826,51 @@ def render_result_card(result: JobAutomationResult, *, index: int) -> str:
     """
 
 
+def render_excluded_result_card(result: JobAutomationResult, *, index: int) -> str:
+    job = result.job
+    meta_items = [
+        render_pill(job.location or "Location not listed"),
+        render_pill(format_posted_at(job.posted_at), kind="warm"),
+        render_pill(f"Match {result.compatibility_score}%", kind="signal"),
+        render_pill(route_display_name(result.route)),
+        render_pill(exclusion_reason_label(result.exclusion_reason), kind="warm"),
+    ]
+    description = escape_html(shorten(job.description or "No description available yet.", limit=260))
+    apply_href = escape_html(job.url)
+    reason = exclusion_reason_help(result.exclusion_reason)
+    signal_terms = "".join(
+        render_pill(term, kind="signal") for term in result.compatibility_reasons[:3]
+    ) or render_pill("High-fit result")
+    return f"""
+    <article class="result-card result-card--excluded">
+      <div class="company-badge" style="background: {company_gradient(job.company)};">{escape_html(company_monogram(job.company))}</div>
+      <div class="result-card__content">
+        <div class="result-card__top">
+          <div class="result-card__title-wrap">
+            <div class="result-card__flag">Excluded #{index:02d}</div>
+            <h3 class="result-card__title">{escape_html(job.title)}</h3>
+            <p class="result-card__company">{escape_html(job.company)}</p>
+          </div>
+        </div>
+        <div class="result-card__meta">
+          {''.join(meta_items)}
+        </div>
+        <p class="result-card__description">{description}</p>
+        <div class="result-card__tags">
+          {signal_terms}
+        </div>
+        <div class="result-card__footer">
+          <p class="result-card__note">{escape_html(reason)}</p>
+          <div class="result-card__actions">
+            <button type="button" class="link-button link-button--secondary" data-copy-url="{apply_href}">Copy link</button>
+            <a class="link-button link-button--primary" href="{apply_href}" target="_blank" rel="noopener">Open job page</a>
+          </div>
+        </div>
+      </div>
+    </article>
+    """
+
+
 def render_pill(label: str, *, kind: str | None = None) -> str:
     class_name = "pill"
     if kind == "signal":
@@ -1735,6 +1913,22 @@ def route_display_name(route: object) -> str:
         "generic": "Generic handler",
     }
     return labels.get(str(route_value), str(route_value).replace("_", " ").title())
+
+
+def exclusion_reason_label(reason: str | None) -> str:
+    labels = {
+        "linkedin_external": "External apply",
+        "easy_apply_unconfirmed": "Easy Apply unconfirmed",
+    }
+    return labels.get(str(reason), "Excluded")
+
+
+def exclusion_reason_help(reason: str | None) -> str:
+    messages = {
+        "linkedin_external": "This job matched the profile, but LinkedIn routed it to an external application page instead of Easy Apply.",
+        "easy_apply_unconfirmed": "This job matched the profile, but the scraper could not confirm an Easy Apply flow after fetching the detail page.",
+    }
+    return messages.get(str(reason), "This job was excluded from the current active shortlist.")
 
 
 def automation_state_label(state: AutomationState) -> str:

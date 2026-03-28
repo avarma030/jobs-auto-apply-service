@@ -56,6 +56,20 @@ def build_result(
     )
 
 
+def build_excluded_result(*, reason: str = "linkedin_external") -> JobAutomationResult:
+    result = build_result(
+        route=ApplicationRoute.LINKEDIN_EXTERNAL,
+        state=AutomationState.READY,
+        handler_name="ExternalSiteHandler",
+    )
+    result.job.easy_apply = False
+    result.package = ApplicationPackage()
+    result.excluded_from_active_list = True
+    result.exclusion_reason = reason
+    result.auto_apply_message = "High-fit LinkedIn job excluded from the active list because it uses an external apply flow."
+    return result
+
+
 def test_split_keywords_preserves_single_phrase() -> None:
     assert split_keywords("project manager") == ["project manager"]
 
@@ -102,6 +116,7 @@ def test_render_dashboard_page_shows_autopilot_result_cards() -> None:
         results=[build_result(state=AutomationState.APPLIED)],
         total_scraped=4,
         filtered_out_count=2,
+        excluded_external_count=1,
         auto_applied_count=1,
     )
 
@@ -119,7 +134,8 @@ def test_render_dashboard_page_shows_autopilot_result_cards() -> None:
 
     assert "Search once. Let the application system take it from there." in html
     assert "Autopilot run complete" in html
-    assert "Scraped 4 LinkedIn job(s), filtered out 2, kept 1 visible Easy Apply match(es), submitted 1, and held back 0" in html
+    assert "Scraped 4 LinkedIn job(s), filtered out 2 low-fit job(s), excluded 1 external and 0 unconfirmed job(s), kept 1 visible Easy Apply match(es), submitted 1, and held back 0" in html
+    assert "Active shortlist" in html
     assert "Match 92%" in html
     assert "ATS 95%" in html
     assert "Applied via LinkedInApplier." in html
@@ -161,6 +177,35 @@ def test_render_dashboard_page_supports_workday_selection() -> None:
     assert "Queued via WorkdayApplier." in html
 
 
+def test_render_dashboard_page_shows_excluded_linkedin_results_when_no_visible_matches() -> None:
+    run = AutopilotRun(
+        board="linkedin",
+        results=[],
+        excluded_results=[build_excluded_result()],
+        total_scraped=6,
+        filtered_out_count=3,
+        excluded_external_count=1,
+    )
+
+    html = render_dashboard_page(
+        query=DashboardQuery(
+            board="linkedin",
+            keywords_raw="software engineer",
+            location="Ireland",
+            posted_within="24h",
+            remote_only=False,
+            limit=10,
+        ),
+        run=run,
+        duration_seconds=1.1,
+    )
+
+    assert "No Easy Apply jobs cleared the active LinkedIn shortlist yet." in html
+    assert "Excluded from active LinkedIn list" in html
+    assert "External apply" in html
+    assert "Open job page" in html
+
+
 def test_render_dashboard_page_shows_empty_state() -> None:
     html = render_dashboard_page()
 
@@ -179,12 +224,13 @@ async def test_run_dashboard_search_dispatches_to_autopilot(monkeypatch: pytest.
             self.profile = profile
             self.live_apply_routes = live_apply_routes
 
-        async def run_search(self, *, board, scraper_cls, search_filter, limit):
+        async def run_search(self, *, board, scraper_cls, search_filter, limit, scan_cap):
             assert board == "workday"
             assert scraper_cls is object
             assert search_filter.keywords == ["program manager"]
             assert search_filter.location == "Ireland"
             assert limit == 10
+            assert scan_cap is None
             assert self.live_apply_routes == set()
             return expected
 
@@ -201,6 +247,40 @@ async def test_run_dashboard_search_dispatches_to_autopilot(monkeypatch: pytest.
         DashboardQuery(
             board="workday",
             keywords_raw="program manager",
+            location="Ireland",
+            posted_within="24h",
+            remote_only=False,
+            limit=10,
+        )
+    )
+
+    assert run == expected
+
+
+@pytest.mark.asyncio
+async def test_run_dashboard_search_uses_linkedin_scan_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = AutopilotRun(board="linkedin", total_scraped=4)
+
+    class StubEngine:
+        def __init__(self, profile, live_apply_routes) -> None:
+            self.profile = profile
+            self.live_apply_routes = live_apply_routes
+
+        async def run_search(self, *, board, scraper_cls, search_filter, limit, scan_cap):
+            assert board == "linkedin"
+            assert scan_cap == 42
+            assert self.live_apply_routes == {ApplicationRoute.LINKEDIN_EASY_APPLY}
+            return expected
+
+    monkeypatch.setattr(dashboard_module, "AutopilotEngine", StubEngine)
+    monkeypatch.setattr(dashboard_module, "load_profile", lambda _path: object())
+    monkeypatch.setitem(dashboard_module.SCRAPER_REGISTRY, "linkedin", object)
+    monkeypatch.setattr(dashboard_module.settings, "linkedin_dashboard_scan_cap", 42)
+
+    run = await run_dashboard_search(
+        DashboardQuery(
+            board="linkedin",
+            keywords_raw="software engineer",
             location="Ireland",
             posted_within="24h",
             remote_only=False,

@@ -85,6 +85,19 @@ class LinkedInScraper(BaseScraper):
         r"(?P<count>\d+)\s+(?P<unit>hour|day|week|month)s?\s+ago",
         re.IGNORECASE,
     )
+    EASY_APPLY_CARD_SELECTORS = (
+        ".job-search-card__easy-apply-label, "
+        ".base-search-card__metadata .job-search-card__easy-apply-label, "
+        "[data-test-easy-apply-label]"
+    )
+    EASY_APPLY_DETAIL_SELECTORS = (
+        ".top-card-layout__cta, "
+        "button.jobs-apply-button, "
+        "button[aria-label*='Apply'], "
+        "button[data-control-name*='inapply'], "
+        "a.jobs-apply-button, "
+        "a[data-control-name*='inapply']"
+    )
 
     def __init__(self, credentials: dict | None = None):
         super().__init__(credentials=credentials)
@@ -121,11 +134,18 @@ class LinkedInScraper(BaseScraper):
         start = 0
 
         while True:
-            response = await client.get(
-                self.JOBS_API_URL,
-                params=self._build_search_params(search_filter, start=start),
-            )
-            response.raise_for_status()
+            try:
+                response = await client.get(
+                    self.JOBS_API_URL,
+                    params=self._build_search_params(search_filter, start=start),
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                self._log(
+                    f"Search page starting at offset {start} failed: {exc}",
+                    level="warning",
+                )
+                break
             html = response.text.strip()
             if not html:
                 break
@@ -134,6 +154,7 @@ class LinkedInScraper(BaseScraper):
             if not jobs:
                 break
 
+            batch_size = max(len(jobs), 1)
             new_jobs = 0
             for job in jobs:
                 dedupe_key = job.external_id or job.url
@@ -141,18 +162,11 @@ class LinkedInScraper(BaseScraper):
                     continue
                 seen.add(dedupe_key)
                 new_jobs += 1
-                try:
-                    yield await self.get_job_details(job)
-                except Exception as exc:
-                    self._log(
-                        f"Failed to enrich job {job.external_id or job.url}: {exc}",
-                        level="warning",
-                    )
-                    yield job
+                yield job
 
-            if len(jobs) < self.PAGE_SIZE or new_jobs == 0:
+            if new_jobs == 0:
                 break
-            start += self.PAGE_SIZE
+            start += batch_size
 
     async def get_job_details(self, job: Job) -> Job:
         """Fetch the full job description page and enrich *job*."""
@@ -244,7 +258,8 @@ class LinkedInScraper(BaseScraper):
             url=url,
             external_id=self._extract_external_id(card, url),
             posted_at=self._parse_posted_at(card),
-            easy_apply="easy apply" in card.get_text(" ", strip=True).lower(),
+            easy_apply=self._is_easy_apply_card(card),
+            easy_apply_confident=self._is_easy_apply_card(card),
         )
 
     def _enrich_job_details(self, job: Job, html: str) -> Job:
@@ -281,6 +296,7 @@ class LinkedInScraper(BaseScraper):
                 "work_mode": work_mode,
                 "tags": tags,
                 "easy_apply": easy_apply,
+                "easy_apply_confident": True,
                 "posted_at": posted_at,
             }
         )
@@ -327,10 +343,58 @@ class LinkedInScraper(BaseScraper):
         return tags
 
     def _is_easy_apply_detail_page(self, soup: BeautifulSoup) -> bool:
-        for cta in soup.select(".top-card-layout__cta"):
-            if "easy apply" in self._clean_text(cta).lower():
+        for cta in soup.select(self.EASY_APPLY_DETAIL_SELECTORS):
+            signals = [
+                self._clean_text(cta).lower(),
+                str(cta.get("aria-label", "")).strip().lower(),
+                str(cta.get("data-control-name", "")).strip().lower(),
+                str(cta.get("href", "")).strip().lower(),
+            ]
+            combined = " ".join(signal for signal in signals if signal)
+            if "easy apply" in combined or "inapply" in combined or "/easy-apply/" in combined:
                 return True
         return False
+
+    def _is_easy_apply_card(self, card: Tag) -> bool:
+        if card.select_one(self.EASY_APPLY_CARD_SELECTORS):
+            return True
+
+        signals = [card.get_text(" ", strip=True).lower()]
+        for selector in ("a", "button", "span", "div"):
+            for element in card.select(selector):
+                signals.extend(
+                    [
+                        str(element.get("aria-label", "")).strip().lower(),
+                        str(element.get("data-control-name", "")).strip().lower(),
+                        str(element.get("class", "")).strip().lower(),
+                    ]
+                )
+
+        combined = " ".join(signal for signal in signals if signal)
+        return "easy apply" in combined or "inapply" in combined
+
+    def _mark_easy_apply_uncertain(self, job: Job, reason: str) -> Job:
+        if job.easy_apply:
+            return job
+
+        note = f"easy_apply_unconfirmed: {reason}"
+        if job.notes:
+            if note in job.notes:
+                merged = job.notes
+            else:
+                merged = f"{job.notes}\n{note}"
+        else:
+            merged = note
+
+        return job.model_copy(
+            update={
+                "easy_apply_confident": False,
+                "notes": merged,
+            }
+        )
+
+    def mark_easy_apply_uncertain(self, job: Job, reason: str) -> Job:
+        return self._mark_easy_apply_uncertain(job, reason)
 
     def _extract_external_id(self, card: Tag, url: str) -> str | None:
         for attr_name in ("data-entity-urn", "data-job-id"):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
 import pytest
 
 from src.appliers.base import ApplicationResult, BaseApplier
@@ -123,6 +124,46 @@ class StubLinkedInApplier(BaseApplier):
         )
 
 
+class StubLinkedInScraper:
+    def __init__(self, *args, **kwargs) -> None:
+        self.job = Job(
+            title="AI Engineer",
+            company="Acme AI",
+            location="Frankfurt, Germany",
+            description=None,
+            url="https://www.linkedin.com/jobs/view/456/",
+            source_board="linkedin",
+            external_id="456",
+            easy_apply=False,
+            easy_apply_confident=True,
+            tags=["LLM", "Agents"],
+        )
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+    async def search(self, _search_filter: JobSearchFilter):
+        yield self.job
+
+    async def get_job_details(self, job: Job) -> Job:
+        raise httpx.HTTPStatusError(
+            "blocked",
+            request=httpx.Request("GET", job.url),
+            response=httpx.Response(429, request=httpx.Request("GET", job.url)),
+        )
+
+    def mark_easy_apply_uncertain(self, job: Job, reason: str) -> Job:
+        return job.model_copy(
+            update={
+                "easy_apply_confident": False,
+                "notes": f"easy_apply_unconfirmed: {reason}",
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_autopilot_auto_applies_when_live_route_is_enabled(tmp_path: Path) -> None:
     profile = build_profile()
@@ -166,7 +207,7 @@ async def test_autopilot_routes_workday_jobs_to_workday_handler(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_autopilot_hides_linkedin_external_apply_jobs(tmp_path: Path) -> None:
+async def test_autopilot_surfaces_linkedin_external_apply_jobs_as_excluded(tmp_path: Path) -> None:
     profile = build_profile()
     engine = AutopilotEngine(profile=profile, artifact_dir=tmp_path)
 
@@ -177,5 +218,141 @@ async def test_autopilot_hides_linkedin_external_apply_jobs(tmp_path: Path) -> N
     )
 
     assert run.total_scraped == 1
-    assert run.filtered_out_count == 1
+    assert run.filtered_out_count == 0
     assert run.shortlisted_count == 0
+    assert run.excluded_external_count == 1
+    assert len(run.excluded_results) == 1
+    excluded = run.excluded_results[0]
+    assert excluded.excluded_from_active_list is True
+    assert excluded.exclusion_reason == "linkedin_external"
+    assert excluded.route == ApplicationRoute.LINKEDIN_EXTERNAL
+    assert excluded.package.resume_path is None
+    assert "external apply flow" in excluded.auto_apply_message
+
+
+def test_autopilot_scoring_does_not_overreward_generic_stopwords() -> None:
+    profile = build_profile()
+    engine = AutopilotEngine(profile=profile)
+    generic_job = Job(
+        title="Customer Success Manager",
+        company="Generic Corp",
+        location="Remote",
+        description=(
+            "The team is looking for a strong hands-on partner working across products. "
+            "The role is focused on building better customer outcomes while working with the team."
+        ),
+        url="https://example.com/jobs/555",
+        source_board="linkedin",
+        external_id="555",
+        easy_apply=False,
+    )
+
+    score, matched, missing, reasons = engine._score_job(
+        generic_job,
+        JobSearchFilter(keywords=["customer success"], location="Remote", max_age_days=1),
+    )
+
+    assert score < 75
+    assert "strong" not in matched
+    assert "hands" not in matched
+
+
+def test_autopilot_scoring_rewards_ai_ml_concept_matches() -> None:
+    profile = UserProfile(
+        first_name="Akshay",
+        last_name="Varma",
+        email="akshay@example.com",
+        headline="Gen AI Engineer",
+        summary=(
+            "Generative AI engineer building LLM products, machine learning systems, "
+            "software platforms, and evaluation workflows."
+        ),
+        years_of_experience=4,
+        skills=[
+            "AI",
+            "LLM",
+            "Python",
+            "LangChain",
+            "Agents",
+            "Machine learning",
+            "Software engineering",
+            "Evaluation",
+        ],
+        work_experience=[
+            WorkExperience(
+                company="Workhuman",
+                title="Senior GenAI Engineer",
+                start_date="2024-10",
+                description=(
+                    "Built production AI assistants, machine learning systems, software products, "
+                    "and evaluation workflows."
+                ),
+            )
+        ],
+    )
+    engine = AutopilotEngine(profile=profile)
+    job = Job(
+        title="Graduate AI software engineer",
+        company="Bending Spoons",
+        location="Frankfurt, Germany",
+        description=(
+            "Build AI software products, machine learning systems, evaluation tooling, "
+            "and scalable engineering workflows."
+        ),
+        url="https://example.com/jobs/ai-software-engineer",
+        source_board="linkedin",
+        external_id="ai-software-engineer",
+        easy_apply=False,
+        job_type="full_time",
+        skills=["AI", "Machine learning", "Evaluation", "Software engineering"],
+        tags=["LLM", "Platform"],
+    )
+
+    score, matched, missing, reasons = engine._score_job(
+        job,
+        JobSearchFilter(keywords=["AI Engineer"], location="Frankfurt", max_age_days=30),
+    )
+
+    assert score >= 75
+    assert any("concept alignment" in reason for reason in reasons)
+    assert "ai" in [value.lower() for value in matched]
+
+
+@pytest.mark.asyncio
+async def test_autopilot_marks_linkedin_detail_fetch_failure_as_unconfirmed_exclusion(tmp_path: Path) -> None:
+    profile = UserProfile(
+        first_name="Akshay",
+        last_name="Varma",
+        email="akshay@example.com",
+        headline="Gen AI Engineer",
+        summary="Generative AI engineer building LLM and agent systems.",
+        years_of_experience=4,
+        skills=["AI", "LLM", "Python", "LangChain", "Agents"],
+        work_experience=[
+            WorkExperience(
+                company="Workhuman",
+                title="Gen AI Engineer",
+                start_date="2024-10",
+                description="Built LLM, RAG, and agentic AI products in production.",
+            )
+        ],
+    )
+    engine = AutopilotEngine(profile=profile, artifact_dir=tmp_path)
+
+    run = await engine.run_search(
+        board="linkedin",
+        scraper_cls=StubLinkedInScraper,
+        search_filter=JobSearchFilter(keywords=["ai engineer"], location="Frankfurt", max_age_days=30),
+        limit=20,
+        scan_cap=20,
+    )
+
+    assert run.total_scraped == 1
+    assert run.filtered_out_count == 0
+    assert run.shortlisted_count == 0
+    assert run.excluded_unconfirmed_count == 1
+    assert len(run.excluded_results) == 1
+    excluded = run.excluded_results[0]
+    assert excluded.exclusion_reason == "easy_apply_unconfirmed"
+    assert excluded.job.easy_apply_confident is False
+    assert excluded.job.notes and "easy_apply_unconfirmed" in excluded.job.notes

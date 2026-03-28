@@ -47,6 +47,46 @@ LANGUAGES
 English, French
 """.strip()
 
+REALISTIC_RESUME_TEXT = """
+Akshay Varma
+Gen AI Engineer
+Location: Pune, India | Phone: +91 7773996608 | Email: avarma030@gmail.com | LinkedIn
+
+PROFILE
+Generative AI engineer with 4+ years of experience building production AI systems.
+
+CORE COMPETENCIES
+▪
+Programming Languages: Python, R, SQL
+▪
+GenAI & LLMs: LangChain, LangGraph, Agentic AI, Transformers
+▪
+Cloud Platforms: AWS, GCP
+
+PROFESSIONAL EXPERIENCE
+Senior GenAI Engineer
+10/2024 – Present
+Workhuman
+Dublin, Ireland
+Built and launched production AI assistants with retrieval, evaluation, and guardrails.
+
+Data Scientist
+07/2022 – 09/2024
+Rita Data
+Amsterdam, Netherlands
+Developed consent-aware RAG systems and analytics assistants.
+
+Software Development Engineer
+12/2019 – 12/2020
+Accenture
+Mumbai, India
+Developed product features with automated tests and continuous delivery.
+
+EDUCATION
+B.E. Electronics & Telecommunications Engineering – Savitribai Phule Pune University, India
+Graduated: 06/2019
+""".strip()
+
 
 def test_build_profile_from_resume_text_extracts_core_fields() -> None:
     result = build_profile_from_resume_text(RESUME_TEXT, resume_path=Path("data/resume.txt"))
@@ -130,3 +170,74 @@ def test_load_profile_missing_message_mentions_bootstrap(tmp_path: Path) -> None
         raise AssertionError("Expected a missing profile to raise FileNotFoundError")
 
     assert "profile bootstrap" in message
+
+
+def test_build_profile_from_realistic_resume_text_cleans_skills_and_extracts_work_history() -> None:
+    result = build_profile_from_resume_text(
+        REALISTIC_RESUME_TEXT,
+        resume_path=Path("data/resume.txt"),
+    )
+
+    profile = result.profile
+    assert profile.address and profile.address.city == "Pune"
+    assert profile.address.country == "India"
+    assert "▪" not in profile.skills
+    assert "Programming Languages: Python" not in profile.skills
+    assert profile.skills[:4] == ["Python", "R", "SQL", "LangChain"]
+    assert len(profile.work_experience) == 3
+    assert profile.work_experience[0].title == "Senior GenAI Engineer"
+    assert profile.work_experience[0].company == "Workhuman"
+    assert profile.work_experience[0].location == "Dublin, Ireland"
+    assert profile.work_experience[1].company == "Rita Data"
+    assert profile.education[0].institution == "Savitribai Phule Pune University, India"
+
+
+def test_load_profile_auto_refreshes_stale_resume_backed_profile(tmp_path: Path) -> None:
+    resume_path = tmp_path / "resume.txt"
+    profile_path = tmp_path / "user_profile.json"
+    resume_path.write_text(REALISTIC_RESUME_TEXT, encoding="utf-8")
+    profile_path.write_text(
+        json.dumps(
+            {
+                "first_name": "Akshay",
+                "last_name": "Varma",
+                "email": "avarma030@gmail.com",
+                "headline": "Gen AI Engineer",
+                "summary": "Generative AI engineer with 4+ years of experience building production AI systems.",
+                "skills": ["▪", "Programming Languages: Python", "R", "SQL"],
+                "languages": ["English"],
+                "work_experience": [],
+                "education": [
+                    {
+                        "institution": "B.E. Electronics & Telecommunications Engineering – Savitribai Phule Pune University, India",
+                        "degree": "B.E. Electronics & Telecommunications Engineering – Savitribai Phule Pune University, India",
+                        "field_of_study": "India",
+                    }
+                ],
+                "resume_path": str(resume_path),
+                "preferences": {
+                    "auto_apply": False,
+                    "min_match_score": 75,
+                    "min_ats_score": 90,
+                },
+                "custom_answers": {
+                    "Are you legally authorized to work in Ireland?": "Yes",
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_profile(profile_path)
+
+    assert profile.skills[:4] == ["Python", "R", "SQL", "LangChain"]
+    assert len(profile.work_experience) == 3
+    assert profile.work_experience[0].company == "Workhuman"
+    assert profile.education[0].institution == "Savitribai Phule Pune University, India"
+    assert profile.preferences.auto_apply is False
+    assert profile.custom_answers["Are you legally authorized to work in Ireland?"] == "Yes"
+
+    saved = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert len(saved["work_experience"]) == 3
+    assert saved["skills"][:4] == ["Python", "R", "SQL", "LangChain"]

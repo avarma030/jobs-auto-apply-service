@@ -48,43 +48,78 @@ DEFAULT_APPLIERS: list[Type[BaseApplier]] = [
 STOPWORDS = {
     "able",
     "about",
+    "across",
     "after",
+    "again",
+    "all",
+    "already",
     "also",
     "among",
     "and",
+    "any",
     "around",
+    "based",
     "because",
     "been",
     "before",
     "being",
+    "better",
     "build",
+    "building",
     "care",
+    "can",
+    "core",
     "company",
     "cross",
     "data",
     "deliver",
     "delivery",
+    "driven",
+    "each",
+    "engineers",
     "experience",
+    "focused",
     "from",
+    "full",
+    "great",
+    "hands",
+    "help",
+    "high",
     "into",
     "job",
     "jobs",
     "lead",
+    "looking",
+    "make",
     "more",
     "must",
     "need",
+    "other",
     "our",
     "over",
+    "own",
+    "products",
+    "product",
+    "strong",
     "role",
     "team",
     "their",
     "them",
+    "there",
+    "these",
+    "they",
+    "through",
     "this",
+    "than",
+    "while",
     "using",
+    "various",
     "with",
     "work",
+    "working",
     "you",
     "your",
+    "the",
 }
 TITLE_LEVEL_REQUIREMENTS = {
     "entry": 1,
@@ -92,6 +127,10 @@ TITLE_LEVEL_REQUIREMENTS = {
     "senior": 5,
     "lead": 7,
     "executive": 10,
+}
+EXCLUSION_MESSAGES = {
+    "linkedin_external": "High-fit LinkedIn job excluded from the active list because it uses an external apply flow.",
+    "easy_apply_unconfirmed": "High-fit LinkedIn job excluded because Easy Apply could not be confirmed after detail enrichment.",
 }
 
 
@@ -119,10 +158,10 @@ class AutopilotEngine:
             profile.preferences.min_ats_score if min_ats_score is None else min_ats_score
         )
         self._open_appliers: dict[str, BaseApplier] = {}
-        self._profile_terms = ordered_terms(
-            self.profile.headline or "",
-            self.profile.summary or "",
-            " ".join(self.profile.skills),
+        self._profile_title_terms = ordered_terms(self.profile.headline or "")
+        self._profile_summary_terms = ordered_terms(self.profile.summary or "")
+        self._profile_skill_terms = ordered_terms(" ".join(self.profile.skills))
+        self._profile_experience_terms = ordered_terms(
             *[
                 " ".join(
                     filter(
@@ -136,9 +175,36 @@ class AutopilotEngine:
                     )
                 )
                 for experience in self.profile.work_experience
-            ],
+            ]
+        )
+        self._profile_terms = unique_in_order(
+            [
+                *self._profile_title_terms,
+                *self._profile_skill_terms,
+                *self._profile_experience_terms,
+                *self._profile_summary_terms,
+            ]
         )
         self._profile_term_set = {term.lower() for term in self._profile_terms}
+        self._profile_role_term_set = {
+            term.lower()
+            for term in unique_in_order(
+                [
+                    *self._profile_title_terms,
+                    *self._profile_skill_terms,
+                    *self._profile_experience_terms,
+                ]
+            )
+        }
+        self._profile_skill_term_set = {
+            term.lower()
+            for term in unique_in_order(
+                [
+                    *self._profile_skill_terms,
+                    *self._profile_experience_terms,
+                ]
+            )
+        }
 
     async def run_search(
         self,
@@ -147,20 +213,34 @@ class AutopilotEngine:
         scraper_cls: Type[BaseScraper],
         search_filter: JobSearchFilter,
         limit: int = 10,
+        scan_cap: int | None = None,
     ) -> AutopilotRun:
         counts = _RunCounts()
         results: list[JobAutomationResult] = []
-        max_candidates = max(limit * 4, limit + 5)
+        excluded_results: list[JobAutomationResult] = []
+        max_candidates = (
+            max(limit, scan_cap)
+            if scan_cap is not None
+            else max(limit * 4, limit + 5)
+        )
 
         try:
             async with scraper_cls() as scraper:
                 async for job in scraper.search(search_filter):
                     counts.total_scraped += 1
-                    evaluation = await self._evaluate_job(job, search_filter)
+                    prepared_job = await self._prepare_job_for_evaluation(
+                        job,
+                        search_filter,
+                        scraper=scraper,
+                    )
+                    evaluation = await self._evaluate_job(prepared_job, search_filter)
                     if evaluation is None:
                         counts.filtered_out_count += 1
                     else:
-                        results.append(evaluation)
+                        if evaluation.excluded_from_active_list:
+                            excluded_results.append(evaluation)
+                        else:
+                            results.append(evaluation)
                         counts.capture(evaluation)
                         if len(results) >= limit:
                             break
@@ -174,7 +254,7 @@ class AutopilotEngine:
         finally:
             await self._close_open_appliers()
 
-        return self._finalize_run(board, results, counts)
+        return self._finalize_run(board, results, excluded_results, counts)
 
     async def process_jobs(
         self,
@@ -186,6 +266,7 @@ class AutopilotEngine:
     ) -> AutopilotRun:
         counts = _RunCounts()
         results: list[JobAutomationResult] = []
+        excluded_results: list[JobAutomationResult] = []
 
         try:
             for job in jobs:
@@ -195,14 +276,17 @@ class AutopilotEngine:
                     counts.filtered_out_count += 1
                     continue
 
-                results.append(evaluation)
+                if evaluation.excluded_from_active_list:
+                    excluded_results.append(evaluation)
+                else:
+                    results.append(evaluation)
                 counts.capture(evaluation)
                 if limit is not None and len(results) >= limit:
                     break
         finally:
             await self._close_open_appliers()
 
-        return self._finalize_run(board, results, counts)
+        return self._finalize_run(board, results, excluded_results, counts)
 
     async def _evaluate_job(
         self,
@@ -221,7 +305,12 @@ class AutopilotEngine:
 
         route = detect_application_route(job)
         if job.source_board == "linkedin" and route != ApplicationRoute.LINKEDIN_EASY_APPLY:
-            return None
+            return self._build_excluded_result(
+                job,
+                compatibility_score=compatibility_score,
+                reasons=reasons,
+                route=route,
+            )
 
         package = self._build_application_package(
             job,
@@ -282,6 +371,77 @@ class AutopilotEngine:
         else:
             result.automation_state = AutomationState.NEEDS_REVIEW
         return result
+
+    async def _prepare_job_for_evaluation(
+        self,
+        job: Job,
+        search_filter: JobSearchFilter,
+        *,
+        scraper: BaseScraper,
+    ) -> Job:
+        if job.source_board != "linkedin" or job.description:
+            return job
+
+        if not self._should_enrich_linkedin_job(job, search_filter):
+            return job
+
+        try:
+            return await scraper.get_job_details(job)
+        except Exception as exc:
+            logger.warning(f"[LinkedIn] Failed to enrich job {job.external_id or job.url}: {exc}")
+            mark_uncertain = getattr(scraper, "mark_easy_apply_uncertain", None)
+            if callable(mark_uncertain):
+                return mark_uncertain(job, f"detail enrichment failed: {exc}")
+            return job
+
+    def _should_enrich_linkedin_job(
+        self,
+        job: Job,
+        search_filter: JobSearchFilter,
+    ) -> bool:
+        preliminary_score, _, _, _ = self._score_job(job, search_filter)
+        search_terms = ordered_terms(" ".join(search_filter.keywords))
+        title_terms = {term.lower() for term in ordered_terms(job.title)}
+        matched_title_terms = {
+            term.lower() for term in search_terms if term.lower() in title_terms
+        }
+        has_phrase_overlap = any(
+            keyword.strip() and keyword.lower() in job.title.lower()
+            for keyword in search_filter.keywords
+        )
+        detail_fetch_floor = max(50, self.min_match_score - 15)
+
+        return (
+            job.easy_apply
+            or preliminary_score >= detail_fetch_floor
+            or has_phrase_overlap
+            or (has_ai_concept(search_terms) and has_ai_concept(title_terms))
+            or len(matched_title_terms) >= max(1, min(2, len(search_terms)))
+        )
+
+    def _build_excluded_result(
+        self,
+        job: Job,
+        *,
+        compatibility_score: int,
+        reasons: list[str],
+        route: ApplicationRoute,
+    ) -> JobAutomationResult:
+        exclusion_reason = (
+            "easy_apply_unconfirmed"
+            if not getattr(job, "easy_apply_confident", True)
+            else "linkedin_external"
+        )
+        return JobAutomationResult(
+            job=job,
+            compatibility_score=compatibility_score,
+            compatibility_reasons=reasons,
+            route=route,
+            handler_name=ROUTE_HANDLER_NAMES[route],
+            auto_apply_message=EXCLUSION_MESSAGES[exclusion_reason],
+            excluded_from_active_list=True,
+            exclusion_reason=exclusion_reason,
+        )
 
     async def _get_open_applier(self, job: Job) -> BaseApplier:
         for applier_cls in self.applier_classes:
@@ -348,44 +508,114 @@ class AutopilotEngine:
                 ],
             )
         ).lower()
-        job_terms = ordered_terms(
-            job.title,
-            job.description or "",
-            " ".join(job.skills),
-            " ".join(job.tags),
-        )
-        job_term_set = {term.lower() for term in job_terms}
-        matched_keywords = [term for term in job_terms if term.lower() in self._profile_term_set][:8]
-        missing_keywords = [term for term in job_terms if term.lower() not in self._profile_term_set][:6]
+        search_terms = ordered_terms(" ".join(search_filter.keywords))
+        job_title_terms = ordered_terms(job.title)
+        job_skill_terms = ordered_terms(" ".join(job.skills), " ".join(job.tags))
+        job_description_terms = ordered_terms(job.description or "")
+        job_terms = unique_in_order([*job_title_terms, *job_skill_terms, *job_description_terms])
+        search_term_set = {term.lower() for term in search_terms}
+        job_title_term_set = {term.lower() for term in job_title_terms}
+        job_skill_term_set = {term.lower() for term in job_skill_terms}
+        job_description_term_set = {term.lower() for term in job_description_terms}
 
-        search_hits = 0
-        if search_phrases:
-            for phrase in search_phrases:
-                if phrase in title_text:
-                    search_hits += 2
-                elif phrase in searchable_text:
-                    search_hits += 1
-            search_score = min(25, int(round((search_hits / (len(search_phrases) * 2)) * 25)))
-        else:
-            search_score = 18
+        matched_keywords = unique_in_order(
+            [term for term in job_terms if term.lower() in self._profile_term_set]
+        )[:8]
+        missing_keywords = unique_in_order(
+            [term for term in job_terms if term.lower() not in self._profile_term_set]
+        )[:6]
 
-        overlap_ratio = len(matched_keywords) / max(1, min(len(job_term_set), 10))
-        overlap_score = min(40, int(round(overlap_ratio * 52)))
+        search_signal = 0.0
+        for phrase in search_phrases:
+            if phrase in title_text:
+                search_signal += 2.0
+            elif phrase in searchable_text:
+                search_signal += 1.0
+        for term in search_terms:
+            if term in job_title_terms:
+                search_signal += 1.0
+            elif term in searchable_text:
+                search_signal += 0.5
+        search_denominator = max(1.0, (len(search_phrases) * 2) + len(search_terms))
+        search_score = min(20, int(round((search_signal / search_denominator) * 20)))
 
-        description_coverage = len(matched_keywords) / max(1, min(len(job_terms), 12))
-        description_score = min(20, int(round(description_coverage * 32)))
+        title_matches = [term for term in job_title_terms if term.lower() in self._profile_role_term_set]
+        title_score = 0
+        if job_title_terms:
+            title_score = min(
+                30,
+                int(round((len(title_matches) / max(1, min(len(job_title_terms), 4))) * 30)),
+            )
 
+        skill_matches = [term for term in job_skill_terms if term.lower() in self._profile_skill_term_set]
+        skill_score = 0
+        if job_skill_terms:
+            skill_score = min(
+                20,
+                int(round((len(skill_matches) / max(1, min(len(job_skill_terms), 6))) * 20)),
+            )
+
+        description_focus_terms = [
+            term for term in job_description_terms if term.lower() not in {token.lower() for token in job_title_terms}
+        ]
+        description_matches = [
+            term for term in description_focus_terms if term.lower() in self._profile_term_set
+        ]
+        description_score = 0
+        if description_focus_terms:
+            description_score = min(
+                15,
+                int(
+                    round(
+                        (len(description_matches) / max(1, min(len(description_focus_terms), 12)))
+                        * 15
+                    )
+                ),
+            )
+
+        concept_score = 0
+        if search_terms and job_title_term_set:
+            matched_query_terms = sum(1 for term in search_term_set if term in job_title_term_set)
+            if matched_query_terms == len(search_term_set):
+                concept_score += 4
+            elif matched_query_terms >= max(1, len(search_term_set) - 1):
+                concept_score += 2
+
+        if has_ai_concept(search_term_set) and (
+            has_ai_concept(job_title_term_set)
+            or has_ai_concept(job_skill_term_set)
+            or has_ai_concept(job_description_term_set)
+        ):
+            concept_score += 3
+
+        if has_ai_concept(self._profile_role_term_set) and (
+            has_ai_concept(job_title_term_set)
+            or has_ai_concept(job_skill_term_set)
+            or has_ai_concept(job_description_term_set)
+        ):
+            concept_score += 3
+
+        concept_score = min(10, concept_score)
         experience_score = self._experience_score(job)
         preference_score = self._preference_score(job, search_filter)
         total_score = min(
             100,
-            search_score + overlap_score + description_score + experience_score + preference_score,
+            search_score
+            + title_score
+            + skill_score
+            + description_score
+            + concept_score
+            + experience_score
+            + preference_score,
         )
         reasons = [
             f"{search_score}% search alignment",
-            f"{overlap_score}% resume-to-job keyword overlap",
-            f"{description_score}% description coverage",
+            f"{title_score}% role alignment",
+            f"{skill_score}% explicit skill alignment",
+            f"{description_score}% description support",
         ]
+        if concept_score:
+            reasons.append(f"{concept_score}% concept alignment")
         if experience_score:
             reasons.append(f"{experience_score}% experience alignment")
         if preference_score:
@@ -469,13 +699,17 @@ class AutopilotEngine:
         self,
         board: str,
         results: list[JobAutomationResult],
+        excluded_results: list[JobAutomationResult],
         counts: "_RunCounts",
     ) -> AutopilotRun:
         run = AutopilotRun(
             board=board,
             results=results,
+            excluded_results=excluded_results,
             total_scraped=counts.total_scraped,
             filtered_out_count=counts.filtered_out_count,
+            excluded_external_count=counts.excluded_external_count,
+            excluded_unconfirmed_count=counts.excluded_unconfirmed_count,
             auto_applied_count=counts.auto_applied_count,
             queued_count=counts.queued_count,
             failed_count=counts.failed_count,
@@ -506,12 +740,20 @@ class _RunCounts:
     def __init__(self) -> None:
         self.total_scraped = 0
         self.filtered_out_count = 0
+        self.excluded_external_count = 0
+        self.excluded_unconfirmed_count = 0
         self.auto_applied_count = 0
         self.queued_count = 0
         self.failed_count = 0
         self.ats_blocked_count = 0
 
     def capture(self, result: JobAutomationResult) -> None:
+        if result.excluded_from_active_list:
+            if result.exclusion_reason == "easy_apply_unconfirmed":
+                self.excluded_unconfirmed_count += 1
+            else:
+                self.excluded_external_count += 1
+            return
         if result.automation_state == AutomationState.APPLIED:
             self.auto_applied_count += 1
         elif result.automation_state == AutomationState.QUEUED:
@@ -666,6 +908,17 @@ def unique_in_order(values: Iterable[str]) -> list[str]:
         seen.add(lowered)
         ordered.append(normalized)
     return ordered
+
+
+def has_ai_concept(terms: Iterable[str]) -> bool:
+    normalized = {term.strip().lower() for term in terms if term.strip()}
+    if normalized & {"ai", "genai", "llm", "ml"}:
+        return True
+    if {"machine", "learning"}.issubset(normalized):
+        return True
+    if {"artificial", "intelligence"}.issubset(normalized):
+        return True
+    return False
 
 
 def slugify(value: str) -> str:
