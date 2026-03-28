@@ -56,8 +56,21 @@ async def upload_resume(
 
     extracted: dict | None = None
     profile_updated = False
+    extraction_error: str | None = None
+    ai_enabled = bool(settings.anthropic_api_key)
 
-    if settings.anthropic_api_key:
+    # Also copy to the global resume path so the orchestrator can find it.
+    # The orchestrator tries data/uploads/{user_id}/resume.pdf first (per-user),
+    # then falls back to settings.resume_path. Copying here keeps CLI / single-user
+    # mode working without any code changes in the orchestrator.
+    try:
+        settings.resume_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dest, settings.resume_path)
+    except Exception as exc:
+        from loguru import logger
+        logger.warning(f"Could not copy resume to global path: {exc}")
+
+    if ai_enabled:
         try:
             import anthropic as _anthropic
             from src.services import profile_extractor, resume_parser
@@ -84,12 +97,15 @@ async def upload_resume(
         except Exception as exc:
             from loguru import logger
             logger.warning(f"Auto-extraction failed after resume upload: {exc}")
+            extraction_error = str(exc)
 
     return ResumeUploadResponse(
         resume_path=str(dest),
         filename=file.filename,
         extracted_profile=extracted,
         profile_updated=profile_updated,
+        ai_extraction_enabled=ai_enabled,
+        extraction_error=extraction_error,
     )
 
 

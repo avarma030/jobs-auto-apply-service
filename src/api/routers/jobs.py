@@ -98,15 +98,17 @@ async def trigger_scrape(
 async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
     """Run the full AI pipeline (scrape → score → tailor → apply) as a background task.
 
-    Falls back to scrape-only if ANTHROPIC_API_KEY is not set.
+    Profile is loaded from the database for the triggering user.
     Progress messages are pushed to the SSE stream via append_run_progress().
     """
+    import json as _json
+
     from src.api.routers.runs import append_run_progress
     from src.config import settings
     from src.database.db import Database
-    from src.models import JobSearchFilter
+    from src.database.models import UserProfile as UserProfileRecord
+    from src.models import JobSearchFilter, UserProfile
     from src.orchestrator import Orchestrator
-    from src.utils import load_profile
 
     db = Database(settings.database_url)
     await db.init()
@@ -127,7 +129,27 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             max_age_days=req.max_age_days,
         )
 
-        profile = load_profile(settings.user_profile_path)
+        # Load profile from DB for this user; fall back to sensible defaults so
+        # the pipeline always runs even for a freshly-registered user.
+        async with db.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(UserProfileRecord).where(UserProfileRecord.user_id == user_id)
+                )
+            ).scalar_one_or_none()
+        profile_data: dict = _json.loads(row.profile_json) if (row and row.profile_json) else {}
+        profile_data.setdefault("first_name", "User")
+        profile_data.setdefault("last_name", "")
+        profile_data.setdefault("email", "")
+        try:
+            profile = UserProfile(**profile_data)
+        except Exception:
+            profile = UserProfile.model_construct(
+                first_name=profile_data.get("first_name", "User"),
+                last_name=profile_data.get("last_name", ""),
+                email=profile_data.get("email", ""),
+            )
+
         orch = Orchestrator(profile=profile, db=db)
 
         # Always run the full pipeline. The orchestrator degrades gracefully:

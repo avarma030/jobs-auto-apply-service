@@ -68,10 +68,12 @@ export default function ProfilePage() {
       } else {
         set("resume_path" as any, `data/uploads/${file.name}`);
         if (res.extracted_profile === null || res.extracted_profile === undefined) {
-          setExtractionToast({
-            type: "error",
-            message: "Resume uploaded, but auto-extraction is disabled (set ANTHROPIC_API_KEY to enable).",
-          });
+          const msg = res.ai_extraction_enabled
+            ? res.extraction_error
+              ? `Resume uploaded. Profile auto-extraction failed: ${res.extraction_error} — please fill in your profile manually.`
+              : "Resume uploaded. Profile auto-extraction returned no data — please fill in your profile manually."
+            : "Resume uploaded, but auto-extraction is disabled (set ANTHROPIC_API_KEY to enable).";
+          setExtractionToast({ type: "error", message: msg });
         }
       }
     } catch {

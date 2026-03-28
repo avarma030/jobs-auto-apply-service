@@ -77,13 +77,16 @@ class Database:
             await session.commit()
             return record
 
-    async def get_pending_jobs(self, limit: int = 100) -> list[JobRecord]:
+    async def get_pending_jobs(
+        self, limit: int = 100, user_id: int | None = None
+    ) -> list[JobRecord]:
         async with self.session_factory() as session:
-            result = await session.execute(
-                select(JobRecord)
-                .where(JobRecord.application_status == ApplicationStatus.PENDING)
-                .limit(limit)
+            q = select(JobRecord).where(
+                JobRecord.application_status == ApplicationStatus.PENDING
             )
+            if user_id is not None:
+                q = q.where(JobRecord.user_id == user_id)
+            result = await session.execute(q.limit(limit))
             return list(result.scalars().all())
 
     async def update_job_status(

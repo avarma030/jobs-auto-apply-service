@@ -87,9 +87,9 @@ class Orchestrator:
         logger.info(f"Scraping complete — {total} new jobs found")
         return total
 
-    async def run_apply(self) -> dict:
+    async def run_apply(self, user_id: int | None = None) -> dict:
         """Apply to all pending jobs. Returns status counts."""
-        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run)
+        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run, user_id=user_id)
         logger.info(f"Applying to {len(pending)} pending jobs")
 
         counts: dict[str, int] = {}
@@ -154,19 +154,24 @@ class Orchestrator:
         jobs_found = await self.run_scrape(search_filter, user_id=user_id)
         _emit(f"Scrape complete: {jobs_found} jobs found")
 
-        # Parse resume once
+        # Parse resume once — try per-user path first, then global fallback
         resume_text = ""
-        if settings.resume_path.exists():
+        resume_path = settings.resume_path
+        if user_id is not None:
+            user_resume = Path("data/uploads") / str(user_id) / "resume.pdf"
+            if user_resume.exists():
+                resume_path = user_resume
+        if resume_path.exists():
             try:
-                resume_text = resume_parser.parse_resume(settings.resume_path)
+                resume_text = resume_parser.parse_resume(resume_path)
                 _emit(f"Resume parsed ({len(resume_text)} chars)")
             except Exception as exc:
                 logger.error(f"Resume parse error: {exc}")
 
         ai = self._get_ai_client()
 
-        # Load pending jobs
-        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run)
+        # Load pending jobs — scoped to this user to avoid processing other users' jobs
+        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run, user_id=user_id)
 
         # ------------------------------------------------------------------
         # Enrich jobs with full descriptions before scoring
