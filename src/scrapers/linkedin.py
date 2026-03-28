@@ -59,9 +59,10 @@ _JOB_VIEW_URL = "https://www.linkedin.com/jobs/view/{job_id}/"
 _JOB_POSTING_API_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
 # LinkedIn's internal Voyager JSON API — returns rich structured data when authenticated.
 # Requires li_at + JSESSIONID cookies; JSESSIONID value used as the csrf-token header.
+# Response is a flat JSON object: {"description": {"text": "..."}, "employmentStatus": "...", ...}
 _VOYAGER_JOB_URL = (
     "https://www.linkedin.com/voyager/api/jobs/jobPostings/{job_id}"
-    "?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebFullJobPosting-14"
+    "?decorationId=com.linkedin.voyager.deco.jobs.web.shared.WebLightJobPosting-23"
 )
 
 # Cookie / session persistence
@@ -477,17 +478,19 @@ class LinkedInScraper(BaseScraper):
                 job_data.get("employmentStatus", "")
             )
 
-        # Remote/hybrid from workplaceTypes list
+        # Remote/hybrid — prefer workRemoteAllowed bool, fall back to workplaceTypes list
         if not job.work_mode:
-            wt_list = job_data.get("workplaceTypes") or []
-            for wt in wt_list:
-                wt_lower = str(wt).lower()
-                if "remote" in wt_lower:
-                    job.work_mode = WorkMode.REMOTE
-                    break
-                if "hybrid" in wt_lower:
-                    job.work_mode = WorkMode.HYBRID
-                    break
+            if job_data.get("workRemoteAllowed") is True:
+                job.work_mode = WorkMode.REMOTE
+            else:
+                for wt in (job_data.get("workplaceTypes") or []):
+                    wt_lower = str(wt).lower()
+                    if "remote" in wt_lower:
+                        job.work_mode = WorkMode.REMOTE
+                        break
+                    if "hybrid" in wt_lower:
+                        job.work_mode = WorkMode.HYBRID
+                        break
 
         return job
 
