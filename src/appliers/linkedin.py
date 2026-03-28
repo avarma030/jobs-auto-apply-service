@@ -60,8 +60,8 @@ _FEED_URL  = "https://www.linkedin.com/feed/"
 # Verified against LinkedIn login page source.
 # name= attributes are tied to the form POST and are the most stable.
 # id= values are a reliable secondary fallback.
-_EMAIL_SEL = "input[name='session_key'], #username"
-_PASS_SEL  = "input[name='session_password'], #password"
+_EMAIL_SEL = "input#username, input[name='session_key']:not([type='hidden'])"
+_PASS_SEL  = "input#password, input[name='session_password']:not([type='hidden'])"
 
 # Presence of any of these means the session is authenticated.
 _LOGGED_IN_SELECTORS = [

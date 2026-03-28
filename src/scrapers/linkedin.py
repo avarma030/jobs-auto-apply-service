@@ -270,16 +270,8 @@ class LinkedInScraper(BaseScraper):
                     if "/login" in page.url:
                         # On the login page — fill the form
                         try:
-                            email_sel = (
-                                "input[name='session_key'], "
-                                "#username, "
-                                "input[type='email']"
-                            )
-                            pass_sel = (
-                                "input[name='session_password'], "
-                                "#password, "
-                                "input[type='password']"
-                            )
+                            email_sel = "input#username, input[name='session_key']:not([type='hidden'])"
+                            pass_sel  = "input#password, input[name='session_password']:not([type='hidden'])"
                             await page.locator(email_sel).first.fill(
                                 creds["username"], timeout=10_000
                             )
