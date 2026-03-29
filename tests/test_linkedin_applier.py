@@ -287,6 +287,54 @@ class _FakeSaveDialogPage:
         return self.empty
 
 
+class _FakeFileInput:
+    def __init__(self, accept: str = "", name: str = "upload", visible: bool = True, enabled: bool = True):
+        self.accept = accept
+        self.name = name
+        self.visible = visible
+        self.enabled = enabled
+        self.uploads: list[str] = []
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    async def is_enabled(self) -> bool:
+        return self.enabled
+
+    async def get_attribute(self, name: str) -> str | None:
+        mapping = {
+            "accept": self.accept,
+            "name": self.name,
+        }
+        return mapping.get(name)
+
+    async def set_input_files(self, path: str) -> None:
+        self.uploads.append(path)
+
+    async def evaluate(self, _script: str) -> str:
+        return ""
+
+
+class _FakeAllLocator:
+    def __init__(self, items):
+        self.items = items
+
+    async def all(self):
+        return self.items
+
+
+class _FakeResumePage:
+    def __init__(self, inputs):
+        self.inputs = inputs
+        self.wait_calls: list[tuple[str, int | None]] = []
+
+    def locator(self, _selector: str):
+        return _FakeAllLocator(self.inputs)
+
+    async def wait_for_selector(self, selector: str, timeout=None) -> None:
+        self.wait_calls.append((selector, timeout))
+
+
 # ── Tests: can_apply ──────────────────────────────────────────────────────────
 
 class TestCanApply:
@@ -502,6 +550,69 @@ def test_prepare_text_input_value_uses_job_salary_for_numeric_salary_question():
     )
 
     assert value == "90000"
+
+
+def test_is_non_resume_upload_field_detects_photo_context():
+    assert LinkedInApplier._is_non_resume_upload_field("", "photo profile picture") is True
+
+
+def test_is_resume_upload_field_detects_document_accept_types():
+    assert LinkedInApplier._is_resume_upload_field("application/pdf,.docx", "upload file") is True
+
+
+@pytest.mark.asyncio
+async def test_find_resume_upload_input_skips_photo_field_and_uses_resume_field():
+    applier = make_applier()
+    progress_messages: list[str] = []
+    applier.progress_callback = progress_messages.append
+    photo_input = _FakeFileInput(accept="image/png,image/jpeg", name="photo")
+    resume_input = _FakeFileInput(accept="application/pdf,.docx", name="resume")
+    page = _FakeResumePage([photo_input, resume_input])
+    applier._describe_upload_field = AsyncMock(
+        side_effect=[
+            ("Photo", "image/png,image/jpeg", "photo image"),
+            ("Resume", "application/pdf,.docx", "resume document"),
+        ]
+    )
+
+    found = await applier._find_resume_upload_input(page)
+
+    assert found is resume_input
+    assert progress_messages == ["[LinkedIn][Resume] Skipping non-resume upload field: Photo"]
+
+
+@pytest.mark.asyncio
+async def test_handle_resume_upload_skips_photo_only_steps(tmp_path):
+    resume_path = tmp_path / "resume.pdf"
+    resume_path.write_text("resume", encoding="utf-8")
+    profile = make_profile(resume_path=resume_path)
+    applier = make_applier(profile)
+    page = _FakeResumePage([_FakeFileInput(accept="image/png,image/jpeg", name="photo")])
+    applier._find_resume_upload_input = AsyncMock(return_value=None)
+
+    await applier._handle_resume_upload(page)
+
+    applier._find_resume_upload_input.assert_awaited_once_with(page)
+    assert page.inputs[0].uploads == []
+
+
+@pytest.mark.asyncio
+async def test_handle_resume_upload_uses_document_field(tmp_path):
+    resume_path = tmp_path / "resume.pdf"
+    resume_path.write_text("resume", encoding="utf-8")
+    profile = make_profile(resume_path=resume_path)
+    applier = make_applier(profile)
+    progress_messages: list[str] = []
+    applier.progress_callback = progress_messages.append
+    resume_input = _FakeFileInput(accept="application/pdf,.docx", name="resume")
+    page = _FakeResumePage([resume_input])
+    applier._find_resume_upload_input = AsyncMock(return_value=resume_input)
+
+    await applier._handle_resume_upload(page)
+
+    assert resume_input.uploads == [str(resume_path)]
+    assert any("Uploaded resume: resume.pdf" in message for message in progress_messages)
+    assert page.wait_calls
 
 
 @pytest.mark.asyncio

@@ -148,6 +148,24 @@ _RESUME_CARD = (
     "label.jobs-document-upload-redesign-card, "
     "li.jobs-resume-picker__resume"
 )
+_DOCUMENT_UPLOAD_HINTS = (
+    "resume",
+    "cv",
+    "curriculum vitae",
+    "cover letter",
+    "document",
+    "attachment",
+    "portfolio",
+)
+_IMAGE_UPLOAD_HINTS = (
+    "photo",
+    "picture",
+    "image",
+    "avatar",
+    "headshot",
+    "profile picture",
+    "profile photo",
+)
 
 
 class LinkedInApplier(BaseApplier):
@@ -1481,12 +1499,12 @@ class LinkedInApplier(BaseApplier):
             elif settings.resume_path:
                 resume_path = Path(settings.resume_path)
 
-        file_input = page.locator(self._modal_descendants(_FILE_INPUT)).first
-        if await file_input.count() == 0:
-            return
-
         if not resume_path or not resume_path.exists():
             logger.debug("[LinkedIn] No resume file found, skipping upload")
+            return
+
+        file_input = await self._find_resume_upload_input(page)
+        if file_input is None:
             return
 
         await file_input.set_input_files(str(resume_path))
@@ -1497,6 +1515,110 @@ class LinkedInApplier(BaseApplier):
         except PWTimeoutError:
             logger.debug("[LinkedIn] Resume upload progress indicator not detected (may be fine)")
         await asyncio.sleep(0.5)
+
+    async def _find_resume_upload_input(self, page: Page) -> Locator | None:
+        inputs = await page.locator(self._modal_descendants(_FILE_INPUT)).all()
+        if not inputs:
+            return None
+
+        ambiguous_candidates: list[Locator] = []
+        for file_input in inputs:
+            try:
+                if not await file_input.is_visible() or not await file_input.is_enabled():
+                    continue
+            except Exception:
+                continue
+
+            label, accept, context = await self._describe_upload_field(page, file_input)
+            target_name = label or "file upload"
+            if self._is_non_resume_upload_field(accept, context):
+                self._report_progress(
+                    f"[LinkedIn][Resume] Skipping non-resume upload field: {target_name}"
+                )
+                continue
+            if self._is_resume_upload_field(accept, context):
+                return file_input
+            ambiguous_candidates.append(file_input)
+
+        if len(ambiguous_candidates) == 1:
+            logger.debug("[LinkedIn] Using fallback resume upload input with no explicit label")
+            return ambiguous_candidates[0]
+
+        if len(ambiguous_candidates) > 1:
+            logger.debug("[LinkedIn] Multiple ambiguous file inputs detected, skipping upload")
+        return None
+
+    async def _describe_upload_field(self, page: Page, file_input: Locator) -> tuple[str, str, str]:
+        label = normalize_question_text(await self._get_field_label(page, file_input))
+        accept = ((await file_input.get_attribute("accept")) or "").strip().lower()
+        name = ((await file_input.get_attribute("name")) or "").strip().lower()
+        aria_label = normalize_question_text((await file_input.get_attribute("aria-label")) or "")
+        nearby_text = ""
+        try:
+            nearby_text = await file_input.evaluate(
+                """(el) => {
+                    let node = el.parentElement;
+                    for (let depth = 0; depth < 4 && node; depth += 1, node = node.parentElement) {
+                        const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (text) {
+                            return text.slice(0, 240);
+                        }
+                    }
+                    return '';
+                }"""
+            )
+        except Exception:
+            nearby_text = ""
+
+        context = " ".join(
+            part
+            for part in (
+                label.lower(),
+                accept,
+                name,
+                aria_label.lower(),
+                normalize_question_text(nearby_text).lower(),
+            )
+            if part
+        )
+        return label, accept, context
+
+    @staticmethod
+    def _is_resume_upload_field(accept: str, context: str) -> bool:
+        accepts_documents = any(
+            token in accept
+            for token in (
+                "application/pdf",
+                ".pdf",
+                "msword",
+                "officedocument",
+                ".doc",
+                ".docx",
+                "wordprocessingml",
+            )
+        )
+        return accepts_documents or any(hint in context for hint in _DOCUMENT_UPLOAD_HINTS)
+
+    @staticmethod
+    def _is_non_resume_upload_field(accept: str, context: str) -> bool:
+        accepts_documents = LinkedInApplier._is_resume_upload_field(accept, context)
+        accepts_images = any(
+            token in accept
+            for token in (
+                "image/",
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".gif",
+                "jpg",
+                "jpeg",
+                "png",
+                "gif",
+            )
+        )
+        if any(hint in context for hint in _IMAGE_UPLOAD_HINTS) and not accepts_documents:
+            return True
+        return accepts_images and not accepts_documents
 
     # ------------------------------------------------------------------
     # Label / answer helpers
