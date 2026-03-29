@@ -8,7 +8,6 @@ import { StatusBadge } from "@/components/applications/StatusBadge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent } from "@/components/ui/card";
 import { ExternalLink, Check, X, ChevronLeft, ChevronRight, Download, ChevronDown, ChevronUp } from "lucide-react";
 import { formatDistanceToNow } from "date-fns";
 
@@ -52,6 +51,13 @@ function AtsBadge({ score, atsType }: { score?: number | null; atsType?: string 
       )}
       {atsType && <span className="text-xs text-gray-500 capitalize">{atsType}</span>}
     </div>
+  );
+}
+
+function hasDownloadableArtifacts(job: Job) {
+  return (
+    job.application_status === "applied" &&
+    Boolean(job.tailored_resume_path || job.cover_letter_path)
   );
 }
 
@@ -153,6 +159,7 @@ export default function JobsPage() {
               ) : (
                 data.items.flatMap((job) => {
                   const isExpanded = expandedId === job.id;
+                  const showArtifacts = hasDownloadableArtifacts(job);
                   return [
                     <tr key={job.id} className="hover:bg-gray-50 cursor-pointer"
                       onClick={() => setExpandedId(isExpanded ? null : job.id)}>
@@ -177,6 +184,7 @@ export default function JobsPage() {
                               </Badge>
                             )}
                             {job.tailored_resume_path && <Badge variant="outline" className="text-xs py-0 text-purple-700 border-purple-300">Tailored</Badge>}
+                            {showArtifacts && <Badge variant="outline" className="text-xs py-0 text-blue-700 border-blue-300">Downloads</Badge>}
                           </div>
                         </div>
                       </td>
@@ -217,13 +225,51 @@ export default function JobsPage() {
                         </div>
                       </td>
                     </tr>,
-                    isExpanded && job.description ? (
+                    isExpanded && (job.description || showArtifacts) ? (
                       <tr key={`${job.id}-desc`} className="bg-blue-50/40">
                         <td colSpan={7} className="px-6 py-4">
-                          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Job Description</p>
-                          <p className="text-sm text-gray-700 whitespace-pre-line leading-relaxed max-h-64 overflow-y-auto">
-                            {job.description}
-                          </p>
+                          <div className="space-y-4">
+                            {showArtifacts && (
+                              <div>
+                                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Application Files</p>
+                                <div className="flex flex-wrap gap-2">
+                                  {job.tailored_resume_path && (
+                                    <a
+                                      href={jobsApi.artifactUrl(job.id, "resume")}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                    >
+                                      <Button variant="outline" size="sm" className="gap-2">
+                                        <Download className="h-4 w-4" />
+                                        Tailored Resume
+                                      </Button>
+                                    </a>
+                                  )}
+                                  {job.cover_letter_path && (
+                                    <a
+                                      href={jobsApi.artifactUrl(job.id, "cover-letter")}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                    >
+                                      <Button variant="outline" size="sm" className="gap-2">
+                                        <Download className="h-4 w-4" />
+                                        Cover Letter
+                                      </Button>
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+
+                            {job.description && (
+                              <div>
+                                <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Job Description</p>
+                                <p className="text-sm text-gray-700 whitespace-pre-line leading-relaxed max-h-64 overflow-y-auto">
+                                  {job.description}
+                                </p>
+                              </div>
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ) : null,

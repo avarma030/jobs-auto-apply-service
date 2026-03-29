@@ -81,6 +81,12 @@ export const jobs = {
     if (token) q.set("token", token);
     return `${BASE}/jobs/export?${q}`;
   },
+  artifactUrl: (jobId: number, artifact: "resume" | "cover-letter"): string => {
+    const q = new URLSearchParams();
+    const token = getToken();
+    if (token) q.set("token", token);
+    return `${BASE}/jobs/${jobId}/artifacts/${artifact}?${q}`;
+  },
 };
 
 // Applications

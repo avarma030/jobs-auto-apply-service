@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import openpyxl
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -18,6 +20,7 @@ from src.api.schemas.jobs import JobResponse, JobStatusUpdate, JobsPage, ScrapeR
 from src.database.models import JobRecord, ScrapeRun, User
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+_ARTIFACT_ROOT = (Path.cwd() / "data" / "uploads").resolve()
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +155,30 @@ async def get_job(
 ):
     r = await _get_job_or_404(job_id, current_user.id, session)
     return _to_response(r)
+
+
+@router.get("/{job_id}/artifacts/{artifact}")
+async def download_job_artifact(
+    job_id: int,
+    artifact: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    r = await _get_job_or_404(job_id, current_user.id, session)
+    if r.application_status != "applied":
+        raise HTTPException(status_code=409, detail="Artifacts are only available after a successful application")
+
+    resolved_path = _resolve_job_artifact_path(r, artifact)
+    if resolved_path is None or not resolved_path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found")
+
+    filename = _artifact_filename(r, artifact, resolved_path.suffix)
+    media_type = "application/pdf" if resolved_path.suffix.lower() == ".pdf" else "text/markdown; charset=utf-8"
+    return FileResponse(
+        path=resolved_path,
+        media_type=media_type,
+        filename=filename,
+    )
 
 
 @router.put("/{job_id}/status", response_model=JobResponse)
@@ -327,6 +354,36 @@ async def _get_job_or_404(job_id: int, user_id: int, session: AsyncSession) -> J
     if r is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return r
+
+
+def _resolve_job_artifact_path(r: JobRecord, artifact: str) -> Path | None:
+    raw_path = {
+        "resume": r.tailored_resume_path,
+        "cover-letter": r.cover_letter_path,
+    }.get(artifact)
+    if not raw_path:
+        return None
+
+    candidate = Path(raw_path)
+    resolved = (candidate if candidate.is_absolute() else (Path.cwd() / candidate)).resolve()
+    try:
+        resolved.relative_to(_ARTIFACT_ROOT)
+    except ValueError:
+        return None
+    return resolved
+
+
+def _artifact_filename(r: JobRecord, artifact: str, suffix: str) -> str:
+    company = _slug_part(r.company)
+    title = _slug_part(r.title)
+    base = "cover-letter" if artifact == "cover-letter" else "resume"
+    ext = suffix or (".md" if artifact == "cover-letter" else ".pdf")
+    return f"{company}_{title}_{base}{ext}"
+
+
+def _slug_part(value: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return cleaned or "job"
 
 
 def _to_response(r: JobRecord) -> JobResponse:
