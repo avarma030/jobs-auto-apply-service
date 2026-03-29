@@ -78,6 +78,7 @@ def make_applier(profile: UserProfile | None = None) -> LinkedInApplier:
     applier._unknown_question_prompts = {}
     applier._answered_questions = []
     applier._learned_answers = {}
+    applier._answered_question_index = {}
     return applier
 
 
@@ -105,6 +106,43 @@ class _FakeCheckbox:
     async def get_attribute(self, name: str) -> str | None:
         if name == "name":
             return self.name
+        return None
+
+
+class _FakeLabel:
+    def __init__(self, target):
+        self.target = target
+        self.calls: list[tuple] = []
+        self.first = self
+
+    async def click(self, timeout=None, force=False) -> None:
+        self.calls.append(("click", timeout, force))
+        self.target.checked = True
+
+
+class _FakeRadio:
+    def __init__(self, checked: bool = False, value: str = "Yes", name: str = "visaSponsorship"):
+        self.checked = checked
+        self.value = value
+        self.name = name
+        self.calls: list[tuple] = []
+
+    async def is_checked(self) -> bool:
+        return self.checked
+
+    async def check(self, timeout=None, force=False) -> None:
+        self.calls.append(("check", timeout, force))
+        raise RuntimeError("pointer intercepted")
+
+    async def evaluate(self, _script) -> None:
+        self.calls.append(("evaluate", None))
+        self.checked = True
+
+    async def get_attribute(self, name: str) -> str | None:
+        if name == "name":
+            return self.name
+        if name == "value":
+            return self.value
         return None
 
 
@@ -227,6 +265,24 @@ async def test_set_checkbox_state_falls_back_to_dom_toggle_when_clicks_are_block
 
 
 @pytest.mark.asyncio
+async def test_set_radio_state_falls_back_to_label_click_when_input_is_blocked():
+    applier = make_applier()
+    radio = _FakeRadio(checked=False)
+    label = _FakeLabel(radio)
+
+    await applier._set_radio_state(
+        radio,
+        label="Will you now or in the future require sponsorship for employment visa status?",
+        option_label="Yes",
+        label_el=label,
+    )
+
+    assert radio.checked is True
+    assert ("check", 2_000, False) in radio.calls
+    assert ("click", 2_000, True) in label.calls
+
+
+@pytest.mark.asyncio
 async def test_resolve_answer_learns_inferred_answers_for_future_runs():
     applier = make_applier()
 
@@ -336,6 +392,44 @@ def test_record_prefilled_answer_logs_visible_question_and_answer():
         "[LinkedIn][Question][prefilled] Email address -> jane@example.com" in message
         for message in messages
     )
+
+
+def test_record_answer_logs_each_question_only_once_per_application():
+    applier = make_applier()
+    messages: list[str] = []
+    applier.progress_callback = messages.append
+
+    applier._record_answer("Mark job as a top choice", "Yes", "ai", "checkbox")
+    applier._record_prefilled_answer("Mark job as a top choice", "Yes", "checkbox")
+
+    assert len(applier._answered_questions) == 1
+    assert applier._answered_questions[0].question == "Mark job as a top choice"
+    assert applier._answered_questions[0].answer == "Yes"
+    assert sum(
+        1
+        for message in messages
+        if "[LinkedIn][Question][ai] Mark job as a top choice -> Yes" in message
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_answer_does_not_emit_duplicate_request_progress_logs():
+    applier = make_applier()
+    applier.answer_resolver = AsyncMock(
+        return_value={"Will you now or in the future require sponsorship for employment visa status?": "No"}
+    )
+    messages: list[str] = []
+    applier.progress_callback = messages.append
+
+    answer, source = await applier._resolve_answer(
+        "Will you now or in the future require sponsorship for employment visa status?",
+        "radio",
+        options=["Yes", "No"],
+    )
+
+    assert answer == "No"
+    assert source == "ai"
+    assert messages == []
 
 
 class TestInferValueFromLabel:

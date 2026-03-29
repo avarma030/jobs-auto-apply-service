@@ -134,6 +134,7 @@ async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disable
     db = FakeDb([record])
     orch = Orchestrator(profile=make_profile(), db=db)
     applier = StubApplier()
+    progress_messages: list[str] = []
 
     orch.run_scrape = AsyncMock(return_value=1)
     monkeypatch.setattr(orch, "_pick_applier", lambda job: applier)
@@ -143,6 +144,7 @@ async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disable
         JobSearchFilter(keywords=["ml engineer"]),
         user_id=7,
         run_id="run-123",
+        progress_callback=progress_messages.append,
         tailor_documents=False,
     )
 
@@ -163,6 +165,7 @@ async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disable
     assert db.status_updates[0]["status"] == ApplicationStatus.APPLIED
     assert db.logged_applications[0]["status"] == ApplicationStatus.APPLIED
     assert db.profile_answer_updates == []
+    assert any("[Search][Criteria]" in message and "ml engineer" in message for message in progress_messages)
 
 
 class LearningApplier:
@@ -268,15 +271,19 @@ async def test_handle_new_questions_preserves_prompt_metadata_and_normalizes_key
 
 
 class FakeScraper:
-    def __init__(self, credentials=None):
+    def __init__(self, credentials=None, authenticated=True):
         self.credentials = credentials or {}
         self.detail_calls: list[str] = []
+        self.authenticated = authenticated
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *_):
         return None
+
+    def has_authenticated_session(self):
+        return self.authenticated
 
     async def search(self, search_filter):
         for idx in range(3):
@@ -300,7 +307,7 @@ class FakeScraper:
 async def test_scrape_board_easy_apply_only_defers_filter_until_detail_fetch(monkeypatch):
     db = FakeDb([])
     orch = Orchestrator(profile=make_profile(), db=db)
-    fake_scraper = FakeScraper()
+    fake_scraper = FakeScraper(authenticated=True)
 
     monkeypatch.setitem(
         orchestrator_module.SCRAPER_REGISTRY,
@@ -328,3 +335,83 @@ async def test_scrape_board_easy_apply_only_defers_filter_until_detail_fetch(mon
     assert db.upserted_jobs[0]["job"].easy_apply is True
     assert db.upserted_jobs[0]["user_id"] == 9
     assert db.upserted_jobs[0]["scrape_run_id"] == "run-xyz"
+
+
+class FalseEasyApplyScraper(FakeScraper):
+    async def search(self, search_filter):
+        yield Job(
+            title="Platform Engineer",
+            company="Example Corp",
+            url="https://www.linkedin.com/jobs/view/10",
+            source_board="linkedin",
+            external_id="10",
+            easy_apply=False,
+        )
+
+    async def get_job_details(self, job):
+        self.detail_calls.append(job.external_id or "")
+        job.easy_apply = False
+        job.description = "Detail fetched"
+        return job
+
+
+@pytest.mark.asyncio
+async def test_scrape_board_easy_apply_only_keeps_candidate_when_linkedin_session_is_degraded(monkeypatch):
+    db = FakeDb([])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    fake_scraper = FalseEasyApplyScraper(authenticated=False)
+
+    monkeypatch.setitem(
+        orchestrator_module.SCRAPER_REGISTRY,
+        "linkedin",
+        lambda credentials=None: fake_scraper,
+    )
+    monkeypatch.setattr(settings, "request_delay_seconds", 0)
+
+    count = await orch._scrape_board(
+        "linkedin",
+        JobSearchFilter(
+            keywords=["platform engineer"],
+            easy_apply_only=True,
+            max_age_days=0,
+            max_jobs=1,
+        ),
+        user_id=9,
+        run_id="run-keep",
+    )
+
+    assert count == 1
+    assert fake_scraper.detail_calls == ["10"]
+    assert len(db.upserted_jobs) == 1
+    assert db.upserted_jobs[0]["job"].external_id == "10"
+    assert db.upserted_jobs[0]["job"].easy_apply is False
+
+
+@pytest.mark.asyncio
+async def test_scrape_board_easy_apply_only_still_skips_non_easy_apply_when_authenticated(monkeypatch):
+    db = FakeDb([])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    fake_scraper = FalseEasyApplyScraper(authenticated=True)
+
+    monkeypatch.setitem(
+        orchestrator_module.SCRAPER_REGISTRY,
+        "linkedin",
+        lambda credentials=None: fake_scraper,
+    )
+    monkeypatch.setattr(settings, "request_delay_seconds", 0)
+
+    count = await orch._scrape_board(
+        "linkedin",
+        JobSearchFilter(
+            keywords=["platform engineer"],
+            easy_apply_only=True,
+            max_age_days=0,
+            max_jobs=1,
+        ),
+        user_id=9,
+        run_id="run-skip",
+    )
+
+    assert count == 0
+    assert fake_scraper.detail_calls == ["10"]
+    assert db.upserted_jobs == []

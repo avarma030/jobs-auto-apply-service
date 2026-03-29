@@ -71,6 +71,7 @@ _COOKIE_PATH = Path("data/.linkedin_cookies.json")
 _COOKIE_MAX_AGE_SECONDS = 4 * 3600          # re-warm after 4 hours
 _SESSION_DIR = Path("data/.linkedin_scraper_session")    # Playwright persistent profile (warm + search)
 _DETAIL_SESSION_DIR = Path("data/.linkedin_detail_session")  # separate profile for detail browser
+_DETAIL_API_AUTHWALL_BACKOFF_SECONDS = 5 * 60
 
 
 def _clear_session_dir(path: Path) -> None:
@@ -162,6 +163,7 @@ class LinkedInScraper(BaseScraper):
         self._proxy_index = 0
         self._cookies: dict = {}
         self._detail_bm: BrowserManager | None = None  # persistent Playwright for detail pages
+        self._detail_api_authwall_backoff_until = 0.0
 
         # Load cached cookies — warm a fresh session if missing / stale
         cached = self._load_cookies()
@@ -252,6 +254,17 @@ class LinkedInScraper(BaseScraper):
         _COOKIE_PATH.write_text(json.dumps({"saved_at": time.time(), "cookies": cookies}))
         logger.debug("[LinkedIn] Cookies saved to disk")
 
+    @staticmethod
+    def _has_authenticated_cookie(cookies: dict) -> bool:
+        return bool(cookies.get("li_at"))
+
+    @staticmethod
+    def _is_guest_job_posting_url(url: str) -> bool:
+        return url.startswith("https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/")
+
+    def has_authenticated_session(self) -> bool:
+        return self._has_authenticated_cookie(getattr(self, "_cookies", {}))
+
     async def _warm_session(self) -> dict:
         """
         Launch a stealth Playwright browser against linkedin.com/jobs/search,
@@ -299,8 +312,20 @@ class LinkedInScraper(BaseScraper):
 
                         current_url = page.url
                         if any(s in current_url for s in ("/feed", "/jobs", "/mynetwork")):
-                            # Already authenticated via persistent profile
-                            logger.info(f"[LinkedIn] Already authenticated (at {current_url})")
+                            existing_raw = await page.context.cookies("https://www.linkedin.com")
+                            existing_cookies = {
+                                cookie["name"]: cookie["value"] for cookie in existing_raw
+                            }
+                            if self._has_authenticated_cookie(existing_cookies):
+                                # Already authenticated via persistent profile
+                                logger.info(f"[LinkedIn] Already authenticated (at {current_url})")
+                                cookies = existing_cookies
+                            else:
+                                logger.warning(
+                                    f"[LinkedIn] Reached {current_url} but no li_at cookie was present - "
+                                    "treating session as stale and retrying with a fresh profile"
+                                )
+                                login_form_found = False
                         else:
                             # Expect the standard login form — wait with a short timeout so
                             # we detect checkpoint/CAPTCHA pages quickly instead of hanging
@@ -315,6 +340,15 @@ class LinkedInScraper(BaseScraper):
                                 await bm.human_pause(0.5, 1.0)
                                 await page.click("button[type='submit']")
                                 await bm.human_pause(3, 5)
+                                for _ in range(4):
+                                    raw_after_submit = await page.context.cookies("https://www.linkedin.com")
+                                    cookies = {
+                                        cookie["name"]: cookie["value"]
+                                        for cookie in raw_after_submit
+                                    }
+                                    if self._has_authenticated_cookie(cookies):
+                                        break
+                                    await bm.human_pause(0.8, 1.4)
                                 logger.info("[LinkedIn] Login submitted — waiting for redirect …")
                             except Exception:
                                 logger.warning(
@@ -336,7 +370,7 @@ class LinkedInScraper(BaseScraper):
                     await bm.human_pause(0.5, 1.5)
                     raw = await page.context.cookies("https://www.linkedin.com")
                     cookies = {c["name"]: c["value"] for c in raw}
-                    has_auth = "li_at" in cookies
+                    has_auth = self._has_authenticated_cookie(cookies)
                     logger.info(
                         f"[LinkedIn] Session warm complete — {len(cookies)} cookies "
                         f"(authenticated={has_auth})"
@@ -346,7 +380,7 @@ class LinkedInScraper(BaseScraper):
                 logger.warning(f"[LinkedIn] Session warming attempt {attempt + 1}/2 failed: {exc}")
                 login_form_found = False  # treat crash as "form not found" to enable retry
 
-            if "li_at" in cookies:
+            if self._has_authenticated_cookie(cookies):
                 return cookies  # Authenticated — no need to retry
 
             if login_form_found or attempt == 1:
@@ -355,7 +389,7 @@ class LinkedInScraper(BaseScraper):
                 break
             # else: form was not found → outer loop will clear dir and retry
 
-        if "li_at" not in cookies:
+        if not self._has_authenticated_cookie(cookies):
             logger.warning(
                 f"[LinkedIn] Could not obtain an authenticated session after {attempt + 1} attempt(s). "
                 "Proceeding with unauthenticated cookies (scraping may be limited). "
@@ -768,6 +802,8 @@ class LinkedInScraper(BaseScraper):
             self._save_cookies(self._cookies)
         await self._client.close()
         self._client = self._make_client()
+        if self.has_authenticated_session():
+            self._detail_api_authwall_backoff_until = 0.0
         # Detail browser will be lazily re-created with fresh cookies on next use
 
     # ------------------------------------------------------------------
@@ -797,6 +833,18 @@ class LinkedInScraper(BaseScraper):
         """GET *url*.  Rotates UA per request, re-warms on block/CAPTCHA."""
         # Rotate User-Agent on every request to avoid per-UA tracking
         self._client.headers.update({"User-Agent": self._ua.random})
+        is_guest_detail_url = self._is_guest_job_posting_url(url)
+
+        if (
+            is_guest_detail_url
+            and self._detail_api_authwall_backoff_until > time.time()
+        ):
+            remaining = int(self._detail_api_authwall_backoff_until - time.time())
+            logger.debug(
+                "[LinkedIn] Guest detail API backoff active "
+                f"({remaining}s remaining) - falling back to browser verification"
+            )
+            return ""
 
         try:
             resp = await self._client.get(url)
@@ -819,11 +867,21 @@ class LinkedInScraper(BaseScraper):
             # LinkedIn uses 999 for aggressive bot detection
             if not _rewarm_attempted:
                 logger.warning(
-                    f"[LinkedIn] Blocked ({resp.status_code}) — re-warming session"
+                    f"[LinkedIn] Blocked ({resp.status_code}) - re-warming session"
                 )
                 await self._rewarm()
                 return await self._get(url, _rewarm_attempted=True)
-            logger.warning("[LinkedIn] Still blocked after re-warm — rotating proxy/UA")
+            if is_guest_detail_url:
+                self._detail_api_authwall_backoff_until = (
+                    time.time() + _DETAIL_API_AUTHWALL_BACKOFF_SECONDS
+                )
+                logger.warning(
+                    "[LinkedIn] Guest detail API remained blocked after re-warm "
+                    f"({resp.status_code}, authenticated={self.has_authenticated_session()}) - "
+                    "backing off detail API and falling back to browser verification"
+                )
+                return ""
+            logger.warning("[LinkedIn] Still blocked after re-warm - rotating proxy/UA")
             proxy = self._next_proxy()
             await self._client.close()
             self._client = self._make_client(proxy)
@@ -835,9 +893,19 @@ class LinkedInScraper(BaseScraper):
         # Detect auth-wall / CAPTCHA redirect in body
         if any(signal in html for signal in _CAPTCHA_SIGNALS):
             if not _rewarm_attempted:
-                logger.warning("[LinkedIn] CAPTCHA/auth-wall detected — re-warming session")
+                logger.warning("[LinkedIn] CAPTCHA/auth-wall detected - re-warming session")
                 await self._rewarm()
                 return await self._get(url, _rewarm_attempted=True)
+            if is_guest_detail_url:
+                self._detail_api_authwall_backoff_until = (
+                    time.time() + _DETAIL_API_AUTHWALL_BACKOFF_SECONDS
+                )
+                logger.warning(
+                    "[LinkedIn] Guest detail API still returned auth-wall after re-warm "
+                    f"(authenticated={self.has_authenticated_session()}) - "
+                    "backing off detail API and falling back to browser verification"
+                )
+                return ""
             logger.warning(
                 "[LinkedIn] Still getting auth-wall after re-warm. "
                 "Consider adding LinkedIn credentials or proxies (USE_PROXIES=true)."

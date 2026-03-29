@@ -160,6 +160,7 @@ class LinkedInApplier(BaseApplier):
         self._unknown_question_prompts: dict[str, ApplicationQuestionPrompt] = {}
         self._answered_questions: list[AnsweredQuestion] = []
         self._learned_answers: dict[str, str] = {}
+        self._answered_question_index: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -206,6 +207,7 @@ class LinkedInApplier(BaseApplier):
         self._unknown_question_prompts = {}
         self._answered_questions = []
         self._learned_answers = {}
+        self._answered_question_index = {}
         try:
             # Note: we do NOT gate on job.easy_apply here because the DB flag is often
             # wrong (Voyager API scrape sets description but not easy_apply).
@@ -227,6 +229,7 @@ class LinkedInApplier(BaseApplier):
         self._unknown_question_prompts = {}
         self._answered_questions = []
         self._learned_answers = {}
+        self._answered_question_index = {}
         return result
 
     def _report_progress(self, message: str, level: str = "info") -> None:
@@ -247,6 +250,11 @@ class LinkedInApplier(BaseApplier):
             return None
         cleaned = str(answer).strip()
         return cleaned or None
+
+    @staticmethod
+    def _summarize_exception(exc: Exception) -> str:
+        summary = " ".join(str(exc).splitlines()[:1]).strip()
+        return summary or exc.__class__.__name__
 
     @staticmethod
     def _normalize_choice(text: str) -> str:
@@ -291,18 +299,28 @@ class LinkedInApplier(BaseApplier):
 
     def _record_answer(self, question: str, answer: str, source: str, field_type: str) -> None:
         normalized_question = normalize_question_text(question)
-        if not normalized_question:
+        cleaned_answer = self._clean_answer(answer)
+        if not normalized_question or cleaned_answer is None:
             return
-        self._answered_questions.append(
-            AnsweredQuestion(
-                question=normalized_question,
-                answer=answer,
-                source=source,
-                field_type=field_type,
-            )
+
+        existing_index = self._answered_question_index.get(normalized_question)
+        updated_entry = AnsweredQuestion(
+            question=normalized_question,
+            answer=cleaned_answer,
+            source=source,
+            field_type=field_type,
         )
+        if existing_index is not None:
+            existing = self._answered_questions[existing_index]
+            if existing.answer == cleaned_answer:
+                return
+            self._answered_questions[existing_index] = updated_entry
+            return
+
+        self._answered_question_index[normalized_question] = len(self._answered_questions)
+        self._answered_questions.append(updated_entry)
         self._report_progress(
-            f"[LinkedIn][Question][{source}] {normalized_question} -> {self._preview_answer(answer)}"
+            f"[LinkedIn][Question][{source}] {normalized_question} -> {self._preview_answer(cleaned_answer)}"
         )
 
     def _record_prefilled_answer(self, question: str, answer: str, field_type: str) -> None:
@@ -355,10 +373,6 @@ class LinkedInApplier(BaseApplier):
         if resolver is None:
             return None, None
 
-        self._report_progress(
-            f"[LinkedIn][Question][ai] Requesting answer for '{question}'",
-            level="debug",
-        )
         suggested_answers = await resolver(
             [ApplicationQuestionPrompt(question=question, field_type=field_type, options=choice_options)]
         )
@@ -397,6 +411,10 @@ class LinkedInApplier(BaseApplier):
             for option in (options or [])
             if (cleaned_option := self._clean_answer(option)) is not None
         ]
+        if normalized_question in self._answered_question_index:
+            return
+        if normalized_question in self._unknown_question_prompts:
+            return
         self._unknown_question_prompts[normalized_question] = ApplicationQuestionPrompt(
             question=normalized_question,
             field_type=field_type,
@@ -1034,7 +1052,14 @@ class LinkedInApplier(BaseApplier):
             for radio, option in radio_options:
                 radio_value = (await radio.get_attribute("value") or "").strip()
                 if option == answer or radio_value == answer:
-                    await radio.check()
+                    radio_id = await radio.get_attribute("id") or ""
+                    label_el = page.locator(f"label[for='{radio_id}']") if radio_id else None
+                    await self._set_radio_state(
+                        radio,
+                        label=legend,
+                        option_label=option or radio_value,
+                        label_el=label_el,
+                    )
                     self._record_answer(legend, answer, source, "radio")
                     matched_radio = True
                     break
@@ -1105,7 +1130,10 @@ class LinkedInApplier(BaseApplier):
                 if await checkbox.is_checked() == should_check:
                     return
             except Exception as exc:
-                logger.debug(f"[LinkedIn] Checkbox '{target_name}' {description} failed: {exc}")
+                logger.debug(
+                    f"[LinkedIn] Checkbox '{target_name}' {description} failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
 
         if label_el is not None:
             try:
@@ -1113,7 +1141,10 @@ class LinkedInApplier(BaseApplier):
                 if await checkbox.is_checked() == should_check:
                     return
             except Exception as exc:
-                logger.debug(f"[LinkedIn] Checkbox '{target_name}' label click failed: {exc}")
+                logger.debug(
+                    f"[LinkedIn] Checkbox '{target_name}' label click failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
 
         try:
             await checkbox.evaluate(
@@ -1131,9 +1162,79 @@ class LinkedInApplier(BaseApplier):
                 logger.debug(f"[LinkedIn] Checkbox '{target_name}' set via DOM fallback")
                 return
         except Exception as exc:
-            logger.debug(f"[LinkedIn] Checkbox '{target_name}' DOM fallback failed: {exc}")
+            logger.debug(
+                f"[LinkedIn] Checkbox '{target_name}' DOM fallback failed: "
+                f"{self._summarize_exception(exc)}"
+            )
 
         raise RuntimeError(f"Could not {action_name} checkbox '{target_name}'")
+
+    async def _set_radio_state(
+        self,
+        radio: Locator,
+        label: str = "",
+        option_label: str = "",
+        label_el: Locator | None = None,
+    ) -> None:
+        """Select a radio option with fallbacks for overlaid/custom-styled inputs."""
+        if await radio.is_checked():
+            return
+
+        input_name = await radio.get_attribute("name") or await radio.get_attribute("id") or ""
+        target_name = label or option_label or input_name or "radio"
+
+        try:
+            await radio.check(timeout=2_000)
+            if await radio.is_checked():
+                return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] Radio '{target_name}' native toggle failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        if label_el is not None:
+            try:
+                await label_el.first.click(timeout=2_000, force=True)
+                if await radio.is_checked():
+                    return
+            except Exception as exc:
+                logger.debug(
+                    f"[LinkedIn] Radio '{target_name}' label click failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
+
+        try:
+            await radio.check(timeout=2_000, force=True)
+            if await radio.is_checked():
+                return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] Radio '{target_name}' forced toggle failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        try:
+            await radio.evaluate(
+                """(el) => {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    if (!el.checked) {
+                        el.checked = true;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }"""
+            )
+            if await radio.is_checked():
+                logger.debug(f"[LinkedIn] Radio '{target_name}' set via DOM fallback")
+                return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] Radio '{target_name}' DOM fallback failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        raise RuntimeError(f"Could not select radio '{target_name}'")
 
     async def _handle_resume_upload(self, page: Page) -> None:
         """Upload resume — prefer tailored PDF, fall back to profile resume."""

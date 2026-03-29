@@ -90,6 +90,7 @@ def make_scraper() -> LinkedInScraper:
     scraper._proxy_index = 0
     scraper._cookies = {}
     scraper._warm_attempted = False
+    scraper._detail_api_authwall_backoff_until = 0.0
     return scraper
 
 
@@ -280,6 +281,7 @@ async def test_get_job_details_enriches_job():
         status_code=200,
         raise_for_status=MagicMock(),
     ))
+    mock_client.headers = {}
     scraper._client = mock_client
 
     job = Job(
@@ -379,3 +381,30 @@ async def test_search_easy_apply_only_defers_filter_until_detail_fetch():
     assert jobs[1].external_id == "3987654322"
     assert jobs[1].easy_apply is True
     assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_guest_detail_authwall_enters_backoff_and_falls_back_to_browser():
+    scraper = make_scraper()
+    scraper._rewarm = AsyncMock()
+    scraper._client = MagicMock()
+    scraper._client.headers = {}
+    scraper._client.get = AsyncMock(side_effect=[
+        MagicMock(text="authwall", status_code=200, raise_for_status=MagicMock()),
+        MagicMock(text="authwall", status_code=200, raise_for_status=MagicMock()),
+    ])
+
+    url = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/3987654321"
+
+    with patch(
+        "src.scrapers.linkedin.time.time",
+        side_effect=[100.0, 101.0, 102.0, 150.0, 150.0],
+    ):
+        html = await scraper._get(url)
+        second_html = await scraper._get(url)
+
+    assert html == ""
+    assert second_html == ""
+    assert scraper._rewarm.await_count == 1
+    assert scraper._client.get.await_count == 2
+    assert scraper._detail_api_authwall_backoff_until == 402.0

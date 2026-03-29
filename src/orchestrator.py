@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable
 from datetime import datetime
 from pathlib import Path
@@ -64,6 +65,15 @@ class Orchestrator:
         self.profile = profile
         self.db = db
         self._ai_client: anthropic.AsyncAnthropic | None = None
+
+    @staticmethod
+    def _search_criteria_for_log(search_filter: JobSearchFilter) -> dict[str, object]:
+        raw = search_filter.model_dump(mode="json", exclude_none=True)
+        return {
+            key: value
+            for key, value in raw.items()
+            if value not in ("", [], {})
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -234,6 +244,11 @@ class Orchestrator:
             if progress_callback:
                 progress_callback(f"{_ts()} {msg}")
 
+        criteria_json = json.dumps(
+            self._search_criteria_for_log(search_filter),
+            ensure_ascii=False,
+        )
+        _emit(f"[Search][Criteria] {criteria_json}")
         _emit("🚀 Pipeline starting — scraping jobs …")
         jobs_found = await self.run_scrape(search_filter, user_id=user_id, run_id=run_id)
         _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
@@ -641,10 +656,25 @@ class Orchestrator:
                     # After detail fetch the easy_apply flag may have been updated;
                     # drop the job if it doesn't meet the easy-apply-only filter.
                     if search_filter.easy_apply_only and not job.easy_apply:
-                        logger.debug(
-                            f"[{board}] Skipping non-easy-apply job after detail fetch: {job.title}"
+                        can_strictly_verify_easy_apply = True
+                        if board == "linkedin":
+                            has_authenticated_session = getattr(
+                                scraper, "has_authenticated_session", None
+                            )
+                            if callable(has_authenticated_session):
+                                can_strictly_verify_easy_apply = bool(
+                                    has_authenticated_session()
+                                )
+                        if can_strictly_verify_easy_apply:
+                            logger.debug(
+                                f"[{board}] Skipping non-easy-apply job after detail fetch: {job.title}"
+                            )
+                            continue
+                        logger.warning(
+                            f"[{board}] Could not strictly verify Easy Apply without an "
+                            f"authenticated LinkedIn session - keeping candidate for live "
+                            f"apply verification: {job.title}"
                         )
-                        continue
                     await self.db.upsert_job(job, user_id=user_id, scrape_run_id=run_id)
                     count += 1
                     if search_filter.max_jobs is not None and count >= search_filter.max_jobs:
