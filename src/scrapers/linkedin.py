@@ -448,6 +448,11 @@ class LinkedInScraper(BaseScraper):
 
             logger.info(f"[LinkedIn] Page {page + 1}: {new_this_page} new jobs")
             if new_this_page == 0:
+                if search_filter.easy_apply_only:
+                    logger.debug(
+                        f"[LinkedIn] Page {page + 1} had no easy-apply matches - continuing pagination"
+                    )
+                    continue
                 break
 
             # Randomized delay — breaks fixed-interval bot detection pattern
