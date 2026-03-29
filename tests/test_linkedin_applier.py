@@ -146,6 +146,56 @@ class _FakeRadio:
         return None
 
 
+class _FakeButton:
+    def __init__(self):
+        self.calls: list[tuple] = []
+
+    async def scroll_into_view_if_needed(self) -> None:
+        self.calls.append(("scroll",))
+
+    async def click(self, timeout=None, force=False) -> None:
+        self.calls.append(("click", timeout, force))
+        if not force:
+            raise RuntimeError("overlay intercepted")
+
+    async def evaluate(self, _script) -> None:
+        self.calls.append(("evaluate",))
+
+
+class _FakeKeyboard:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def press(self, key: str) -> None:
+        self.calls.append(key)
+
+
+class _FakeOverlayLocator:
+    def __init__(self, visible: bool):
+        self.visible = visible
+        self.first = self
+
+    async def count(self) -> int:
+        return 1 if self.visible else 0
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+
+class _FakePageWithOverlay:
+    def __init__(self, visible: bool = True):
+        self.visible = visible
+        self.keyboard = _FakeKeyboard()
+        self.evaluations: list[str] = []
+
+    def locator(self, _selector: str):
+        return _FakeOverlayLocator(self.visible)
+
+    async def evaluate(self, script: str) -> None:
+        self.evaluations.append(script)
+        self.visible = False
+
+
 # ── Tests: can_apply ──────────────────────────────────────────────────────────
 
 class TestCanApply:
@@ -280,6 +330,63 @@ async def test_set_radio_state_falls_back_to_label_click_when_input_is_blocked()
     assert radio.checked is True
     assert ("check", 2_000, False) in radio.calls
     assert ("click", 2_000, True) in label.calls
+
+
+@pytest.mark.asyncio
+async def test_click_modal_button_falls_back_to_forced_click_after_overlay_interception():
+    applier = make_applier()
+    applier._dismiss_prompts = AsyncMock()
+    applier._dismiss_autocomplete_overlays = AsyncMock()
+    button = _FakeButton()
+    page = MagicMock()
+
+    await applier._click_modal_button(page, button, "next step")
+
+    assert ("click", 2_000, False) in button.calls
+    assert ("click", 2_000, True) in button.calls
+    applier._dismiss_prompts.assert_awaited_once()
+    applier._dismiss_autocomplete_overlays.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dismiss_autocomplete_overlays_uses_escape_and_blur():
+    applier = make_applier()
+    page = _FakePageWithOverlay(visible=True)
+
+    await applier._dismiss_autocomplete_overlays(page)
+
+    assert "Escape" in page.keyboard.calls
+    assert len(page.evaluations) == 1
+
+
+def test_prepare_text_input_value_coerces_ai_text_for_numeric_experience_question():
+    applier = make_applier()
+    job = make_job()
+
+    value = applier._prepare_text_input_value(
+        "How many years experience do you have as a Data Scientist?",
+        "6 years",
+        field_type="number",
+        input_type="number",
+        job=job,
+    )
+
+    assert value == "6"
+
+
+def test_prepare_text_input_value_uses_job_salary_for_numeric_salary_question():
+    applier = make_applier()
+    job = make_job(salary_min=80000, salary_max=100000)
+
+    value = applier._prepare_text_input_value(
+        "What is your salary expectation?",
+        "Competitive, based on role and responsibilities",
+        field_type="number",
+        input_type="number",
+        job=job,
+    )
+
+    assert value == "90000"
 
 
 @pytest.mark.asyncio

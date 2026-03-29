@@ -179,7 +179,9 @@ Rules:
 - These answers go directly into form fields or are selected from dropdowns
 - Be honest based on the profile — do not fabricate
 - For yes/no questions use "Yes" or "No" exactly
-- For numeric questions (years of experience) use a plain integer
+- For numeric questions (field type "number") use ONLY digits or digits with a decimal point
+- Never return words, currency symbols, ranges, or explanations for numeric fields
+- For salary expectation in a numeric field, return one plain annual number like 85000
 - If options are provided, choose one of the listed options exactly
 - For authorization/sponsorship questions: if country is US or not specified, answer "Yes" for authorization, "No" for sponsorship needed
 

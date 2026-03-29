@@ -751,7 +751,7 @@ class LinkedInApplier(BaseApplier):
             if submit:
                 await self._bm.screenshot(page, f"pre_submit_{job.external_id}")
                 self._report_progress("[LinkedIn][Submit] Submitting application")
-                await submit.click()
+                await self._click_modal_button(page, submit, "submit")
                 await asyncio.sleep(2)
                 await self._bm.screenshot(page, f"post_submit_{job.external_id}")
                 logger.info(f"[LinkedIn] ✓ Application submitted: {job.title} @ {job.company}")
@@ -789,7 +789,7 @@ class LinkedInApplier(BaseApplier):
             next_btn = await self._find_next_button(page)
             if next_btn and await next_btn.is_enabled():
                 self._report_progress("[LinkedIn][Step] Advancing to the next step")
-                await next_btn.click()
+                await self._click_modal_button(page, next_btn, "next step")
                 # Give the modal animation time to transition before the next fill pass
                 await asyncio.sleep(0.5)
             else:
@@ -878,6 +878,172 @@ class LinkedInApplier(BaseApplier):
             modal.locator(_NEXT_BTN),
         ])
 
+    def _prepare_text_input_value(
+        self,
+        label: str,
+        value: str,
+        *,
+        field_type: str,
+        input_type: str,
+        job: Job,
+    ) -> str | None:
+        cleaned_value = self._clean_answer(value)
+        if cleaned_value is None:
+            return None
+        if field_type != "number" and input_type not in {"number", "range"}:
+            return cleaned_value
+
+        numeric_value = self._extract_numeric_text(cleaned_value)
+        if numeric_value is None:
+            numeric_value = self._infer_numeric_value_from_label(label, job)
+        return numeric_value
+
+    @staticmethod
+    def _extract_numeric_text(value: str) -> str | None:
+        normalized = value.replace(",", "").strip()
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if not match:
+            return None
+        return match.group(0)
+
+    def _infer_numeric_value_from_label(self, label: str, job: Job) -> str | None:
+        normalized_label = normalize_question_text(label).lower()
+
+        if any(
+            phrase in normalized_label
+            for phrase in (
+                "years of experience",
+                "years experience",
+                "how many years",
+            )
+        ):
+            if self.profile.years_of_experience is not None:
+                return str(self.profile.years_of_experience)
+
+        if any(
+            phrase in normalized_label
+            for phrase in (
+                "salary expectation",
+                "salary expected",
+                "expected salary",
+                "salary requirement",
+                "compensation expectation",
+                "desired compensation",
+                "desired salary",
+                "annual pay",
+                "expected pay",
+            )
+        ):
+            numeric_candidates = [
+                float(candidate)
+                for candidate in (job.salary_min, job.salary_max)
+                if candidate is not None and float(candidate) > 0
+            ]
+            if numeric_candidates:
+                if len(numeric_candidates) == 2:
+                    return str(int(round(sum(numeric_candidates) / 2)))
+                return str(int(round(numeric_candidates[0])))
+
+        return None
+
+    async def _finalize_text_input(self, page: Page, inp: Locator) -> None:
+        try:
+            await inp.evaluate(
+                """(el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    if (typeof el.blur === 'function') {
+                        el.blur();
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+        if await self._autocomplete_overlay_visible(page):
+            try:
+                await page.keyboard.press("ArrowDown")
+                await asyncio.sleep(0.1)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+
+        await self._dismiss_autocomplete_overlays(page)
+
+    async def _autocomplete_overlay_visible(self, page: Page) -> bool:
+        selectors = (
+            "div[data-test-single-typeahead-entity-form-search-result='true']",
+            ".search-typeahead-v2__hit--autocomplete",
+            "div[role='listbox']",
+            "ul[role='listbox']",
+        )
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if await locator.count() > 0 and await locator.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _dismiss_autocomplete_overlays(self, page: Page) -> None:
+        if not await self._autocomplete_overlay_visible(page):
+            return
+        try:
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+        except Exception:
+            pass
+        try:
+            await page.evaluate(
+                """() => {
+                    const active = document.activeElement;
+                    if (active instanceof HTMLElement) {
+                        active.blur();
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+    async def _click_modal_button(self, page: Page, button: Locator, action_name: str) -> None:
+        await self._dismiss_prompts(page)
+        await self._dismiss_autocomplete_overlays(page)
+        try:
+            await button.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        for description, click in (
+            ("native click", lambda: button.click(timeout=2_000)),
+            ("forced click", lambda: button.click(timeout=2_000, force=True)),
+        ):
+            try:
+                await click()
+                return
+            except Exception as exc:
+                logger.debug(
+                    f"[LinkedIn] {action_name.title()} button {description} failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
+
+        try:
+            await button.evaluate(
+                """(el) => {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    el.click();
+                }"""
+            )
+            return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] {action_name.title()} button DOM click failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        raise RuntimeError(f"Could not click {action_name} button")
+
     @staticmethod
     def _modal_descendants(selector: str) -> str:
         modal_roots = [part.strip() for part in _MODAL.split(",")]
@@ -889,32 +1055,47 @@ class LinkedInApplier(BaseApplier):
 
     async def _fill_modal_page(self, page: Page, job: Job) -> None:
         """Fill all visible form fields on the current modal page."""
-        await self._fill_text_inputs(page)
+        await self._fill_text_inputs(page, job)
         await self._fill_textareas(page, job)
         await self._fill_selects(page)
         await self._fill_radio_buttons(page)
         await self._fill_checkboxes(page)
         await self._handle_resume_upload(page)
+        await self._dismiss_autocomplete_overlays(page)
 
-    async def _fill_text_inputs(self, page: Page) -> None:
+    async def _fill_text_inputs(self, page: Page, job: Job) -> None:
         inputs = await page.locator(self._modal_descendants(_TEXT_INPUTS)).all()
         for inp in inputs:
             if not await inp.is_visible() or not await inp.is_enabled():
                 continue
             label = await self._get_field_label(page, inp)
+            input_type = ((await inp.get_attribute("type")) or "text").strip().lower()
+            field_type = "number" if input_type in {"number", "range"} else "text"
             current_val = await inp.input_value()
             if current_val.strip():
                 if label:
-                    self._record_prefilled_answer(label, current_val, "text")
+                    self._record_prefilled_answer(label, current_val, field_type)
                 continue  # already filled
 
-            value, source = await self._resolve_answer(label, "text")
+            value, source = await self._resolve_answer(label, field_type)
             if value is not None and source is not None:
+                prepared_value = self._prepare_text_input_value(
+                    label,
+                    value,
+                    field_type=field_type,
+                    input_type=input_type,
+                    job=job,
+                )
+                if prepared_value is None:
+                    if label:
+                        self._mark_unanswered(label, field_type)
+                    continue
                 await inp.fill("")
-                await _BM.human_type(inp, value)
-                self._record_answer(label, value, source, "text")
+                await _BM.human_type(inp, prepared_value)
+                await self._finalize_text_input(page, inp)
+                self._record_answer(label, prepared_value, source, field_type)
             elif label:
-                self._mark_unanswered(label, "text")
+                self._mark_unanswered(label, field_type)
 
     async def _fill_textareas(self, page: Page, job: Job) -> None:
         areas = await page.locator(self._modal_descendants(_TEXTAREAS)).all()

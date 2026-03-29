@@ -224,7 +224,6 @@ async def test_run_apply_persists_learned_answers_from_applier(monkeypatch):
         }
     ]
     assert orch.profile.custom_answers["Are you open to relocation?"] == "Yes"
-    assert any("[AI][Questions]" in message for message in progress_messages)
     assert any("[Profile][Saved]" in message for message in progress_messages)
     save_profile_mock.assert_called_once()
 

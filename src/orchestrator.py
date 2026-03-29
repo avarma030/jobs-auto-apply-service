@@ -549,7 +549,7 @@ class Orchestrator:
             logger.warning(f"New questions found but no AI client - skipping: {questions}")
             return {}
 
-        if progress_callback:
+        if progress_callback and len(questions) > 1:
             progress_callback(
                 f"[AI][Questions] Attempting to answer {len(questions)} new application question(s)"
             )
