@@ -425,6 +425,14 @@ class LinkedInScraper(BaseScraper):
                 if any(kw.lower() in title.lower() for kw in search_filter.exclude_keywords):
                     continue
 
+                # When easy_apply_only is set, skip non-easy-apply cards without
+                # counting them toward max_jobs — so we keep scraping until we
+                # find max_jobs *easy-apply* jobs, not max_jobs total jobs.
+                card_easy_apply = card.get("easy_apply", False)
+                if search_filter.easy_apply_only and not card_easy_apply:
+                    logger.debug(f"[LinkedIn] Skipping non-easy-apply job {job_id}")
+                    continue
+
                 job = self._make_job(
                     external_id=job_id,
                     title=title,
@@ -432,7 +440,7 @@ class LinkedInScraper(BaseScraper):
                     location=card.get("location"),
                     url=card.get("url", _JOB_VIEW_URL.format(job_id=job_id)),
                     posted_at=posted_at,
-                    easy_apply=card.get("easy_apply", False),
+                    easy_apply=card_easy_apply,
                 )
                 new_this_page += 1
                 total_yielded += 1

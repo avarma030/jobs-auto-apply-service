@@ -449,6 +449,13 @@ class Orchestrator:
                         job = await scraper.get_job_details(job)
                     except Exception as exc:
                         logger.warning(f"[{board}] Detail fetch failed for {job.title}: {exc}")
+                    # After detail fetch the easy_apply flag may have been updated;
+                    # drop the job if it doesn't meet the easy-apply-only filter.
+                    if search_filter.easy_apply_only and not job.easy_apply:
+                        logger.debug(
+                            f"[{board}] Skipping non-easy-apply job after detail fetch: {job.title}"
+                        )
+                        continue
                     await self.db.upsert_job(job, user_id=user_id, scrape_run_id=run_id)
                     count += 1
                     await asyncio.sleep(settings.request_delay_seconds)
