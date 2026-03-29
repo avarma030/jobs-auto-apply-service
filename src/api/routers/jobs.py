@@ -235,6 +235,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
     from src.database.models import UserProfile as UserProfileRecord
     from src.models import ExperienceLevel, JobSearchFilter, JobType, UserProfile
     from src.orchestrator import Orchestrator
+    from src.services.profile_sanitizer import build_user_profile
 
     db = Database(settings.database_url)
     await db.init()
@@ -290,11 +291,8 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
                 )
             ).scalar_one_or_none()
         profile_data: dict = _json.loads(row.profile_json) if (row and row.profile_json) else {}
-        profile_data.setdefault("first_name", "User")
-        profile_data.setdefault("last_name", "")
-        profile_data.setdefault("email", "")
         try:
-            profile = UserProfile(**profile_data)
+            profile = build_user_profile(profile_data)
         except Exception:
             profile = UserProfile.model_construct(
                 first_name=profile_data.get("first_name", "User"),

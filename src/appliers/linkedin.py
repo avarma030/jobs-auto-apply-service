@@ -747,10 +747,17 @@ class LinkedInApplier(BaseApplier):
         await btn.click()
 
         try:
-            await page.wait_for_selector(_MODAL, timeout=10_000)
+            await page.wait_for_selector(_MODAL, timeout=25_000)
         except PWTimeoutError:
-            await self._bm.screenshot(page, f"modal_timeout_{job.external_id}")
-            return self._fail(job, "Easy Apply modal did not open (timeout)")
+            try:
+                modal = page.locator(_MODAL).first
+                if await modal.count() == 0 or not await modal.is_visible():
+                    await self._bm.screenshot(page, f"modal_timeout_{job.external_id}")
+                    return self._fail(job, "Easy Apply modal did not open (timeout)")
+                logger.debug("[LinkedIn] Easy Apply modal became visible after slow open")
+            except Exception:
+                await self._bm.screenshot(page, f"modal_timeout_{job.external_id}")
+                return self._fail(job, "Easy Apply modal did not open (timeout)")
         self._report_progress("[LinkedIn][Apply] Easy Apply modal opened")
         logger.debug("[LinkedIn] Easy Apply modal opened")
 
@@ -929,6 +936,10 @@ class LinkedInApplier(BaseApplier):
         cleaned_value = self._clean_answer(value)
         if cleaned_value is None:
             return None
+        normalized_label = normalize_question_text(label).lower()
+        if any(token in normalized_label for token in ("location", "city", "town")):
+            if cleaned_value.strip().lower() in {"not specified", "unknown", "none", "null"}:
+                return self._clean_answer(self._infer_value_from_label(label))
         if field_type != "number" and input_type not in {"number", "range"}:
             return cleaned_value
 

@@ -49,18 +49,7 @@ export default function ProfilePage() {
       const res = await profileApi.uploadResume(file);
       // If the server auto-extracted a profile, pre-fill the form fields
       if (res.extracted_profile && res.profile_updated) {
-        const ep = res.extracted_profile as Profile;
-        setProfile((prev) => {
-          const merged: Profile = { ...ep };
-          // Keep any existing non-empty values the user already set
-          for (const k of Object.keys(prev) as (keyof Profile)[]) {
-            const v = prev[k];
-            if (v && (Array.isArray(v) ? v.length > 0 : true)) {
-              (merged as any)[k] = v;
-            }
-          }
-          return merged;
-        });
+        setProfile(res.extracted_profile as Profile);
         setExtractionToast({
           type: "success",
           message: `Profile auto-filled from resume — please review and click Save.`,

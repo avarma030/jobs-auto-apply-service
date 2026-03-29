@@ -5,13 +5,15 @@ import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_user, get_session
 from src.api.schemas.profile import ProfileResponse, ProfileUpdate, ResumeUploadResponse
-from src.database.models import User, UserProfile
 from src.config import settings
+from src.database.models import User, UserProfile
+from src.services.profile_sanitizer import merge_profile_data, sanitize_profile_data
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -34,9 +36,11 @@ async def update_profile(
     current_user: User = Depends(get_current_user),
 ):
     row = await _get_or_create_profile(current_user.id, session)
-    row.profile_json = json.dumps(body.profile)
+    sanitized = sanitize_profile_data(body.profile)
+    row.profile_json = json.dumps(sanitized)
     await session.commit()
     await session.refresh(row)
+    await _write_profile_json(sanitized)
     return ProfileResponse(profile=json.loads(row.profile_json))
 
 
@@ -58,6 +62,8 @@ async def upload_resume(
     profile_updated = False
     extraction_error: str | None = None
     ai_enabled = bool(settings.anthropic_api_key)
+    row = await _get_or_create_profile(current_user.id, session)
+    existing = json.loads(row.profile_json) if row.profile_json and row.profile_json != "{}" else {}
 
     # Also copy to the global resume path so the orchestrator can find it.
     # The orchestrator tries data/uploads/{user_id}/resume.pdf first (per-user),
@@ -67,7 +73,6 @@ async def upload_resume(
         settings.resume_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(dest, settings.resume_path)
     except Exception as exc:
-        from loguru import logger
         logger.warning(f"Could not copy resume to global path: {exc}")
 
     if ai_enabled:
@@ -80,40 +85,18 @@ async def upload_resume(
             extracted = await profile_extractor.extract_profile_from_resume(
                 resume_text, client, settings.anthropic_model
             )
-
-            if extracted:
-                row = await _get_or_create_profile(current_user.id, session)
-                existing = json.loads(row.profile_json) if row.profile_json and row.profile_json != "{}" else {}
-
-                # Merge: extracted fills in empty/missing fields; existing non-empty values win
-                merged = dict(extracted)
-                for key, val in existing.items():
-                    if val:  # existing non-empty value takes priority
-                        merged[key] = val
-
-                row.profile_json = json.dumps(merged)
-                await session.commit()
-                profile_updated = True
-
-                # Also persist to user_profile.json for CLI / orchestrator fallback
-                try:
-                    from src.models import UserProfile as _UserProfileModel
-                    profile_data = dict(merged)
-                    profile_data.setdefault("first_name", "User")
-                    profile_data.setdefault("last_name", "")
-                    profile_data.setdefault("email", "")
-                    _up = _UserProfileModel(**profile_data)
-                    settings.user_profile_path.parent.mkdir(parents=True, exist_ok=True)
-                    settings.user_profile_path.write_text(_up.model_dump_json(indent=2))
-                    from loguru import logger as _logger
-                    _logger.info(f"Profile saved to {settings.user_profile_path}")
-                except Exception as exc:
-                    from loguru import logger as _logger
-                    _logger.warning(f"Could not save profile to JSON: {exc}")
         except Exception as exc:
-            from loguru import logger
             logger.warning(f"Auto-extraction failed after resume upload: {exc}")
             extraction_error = str(exc)
+
+    merged = merge_profile_data(extracted or {}, existing)
+    sanitized = sanitize_profile_data(merged, resume_path=str(dest))
+    row.profile_json = json.dumps(sanitized)
+    await session.commit()
+    profile_updated = True
+    await _write_profile_json(sanitized)
+    if extracted:
+        extracted = sanitized
 
     return ResumeUploadResponse(
         resume_path=str(dest),
@@ -135,3 +118,12 @@ async def _get_or_create_profile(user_id: int, session: AsyncSession) -> UserPro
         await session.commit()
         await session.refresh(row)
     return row
+
+
+async def _write_profile_json(profile_data: dict) -> None:
+    try:
+        settings.user_profile_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.user_profile_path.write_text(json.dumps(profile_data, indent=2))
+        logger.info(f"Profile saved to {settings.user_profile_path}")
+    except Exception as exc:
+        logger.warning(f"Could not save profile to JSON: {exc}")

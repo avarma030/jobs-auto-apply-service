@@ -552,6 +552,22 @@ def test_prepare_text_input_value_uses_job_salary_for_numeric_salary_question():
     assert value == "90000"
 
 
+def test_prepare_text_input_value_uses_profile_city_when_ai_returns_placeholder_location():
+    profile = make_profile(address=Address(city="Dublin", state="Dublin", zip_code="D02", country="IE"))
+    applier = make_applier(profile)
+    job = make_job()
+
+    value = applier._prepare_text_input_value(
+        "Location (city)",
+        "Not specified",
+        field_type="text",
+        input_type="text",
+        job=job,
+    )
+
+    assert value == "Dublin"
+
+
 def test_is_non_resume_upload_field_detects_photo_context():
     assert LinkedInApplier._is_non_resume_upload_field("", "photo profile picture") is True
 
