@@ -31,6 +31,7 @@ import asyncio
 import json
 import random
 import re
+import shutil
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -70,6 +71,23 @@ _COOKIE_PATH = Path("data/.linkedin_cookies.json")
 _COOKIE_MAX_AGE_SECONDS = 4 * 3600          # re-warm after 4 hours
 _SESSION_DIR = Path("data/.linkedin_scraper_session")    # Playwright persistent profile (warm + search)
 _DETAIL_SESSION_DIR = Path("data/.linkedin_detail_session")  # separate profile for detail browser
+
+
+def _clear_session_dir(path: Path) -> None:
+    """Delete and recreate a Playwright persistent profile dir to reset browser state.
+
+    Called when the login form is not found — indicates LinkedIn showed a
+    security checkpoint due to stale/flagged session state.  A clean dir
+    forces LinkedIn to treat the next visit as a brand-new browser.
+    """
+    try:
+        if path.exists():
+            shutil.rmtree(str(path))
+        path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"[LinkedIn] Reset browser profile dir: {path}")
+    except Exception as exc:
+        logger.warning(f"[LinkedIn] Could not reset browser profile dir {path}: {exc}")
+
 
 # Full browser header suite — mirrors a real Chrome navigation request
 _BROWSER_HEADERS = {
@@ -242,77 +260,108 @@ class LinkedInScraper(BaseScraper):
         Uses a *persistent* user-data-dir (``_SESSION_DIR``) so LinkedIn treats
         this as a returning browser with browsing history — significantly harder
         to fingerprint than a brand-new ephemeral context.
+
+        If the login form is not found (LinkedIn showing a checkpoint/CAPTCHA),
+        the stale session dir is cleared and one retry is performed with a fresh
+        browser profile.
         """
         logger.info("[LinkedIn] Warming session via Playwright (this takes ~15 s) …")
-        cookies: dict = {}
         creds = self.credentials  # set by BaseScraper from profile.job_board_accounts.linkedin
-        try:
-            async with BrowserManager(headless=True, user_data_dir=_SESSION_DIR) as bm:
-                page = await bm.new_page()
+        # Resolve credentials: profile UI → environment variables fallback
+        if not creds.get("username") and settings.linkedin_email:
+            creds = {
+                "username": settings.linkedin_email,
+                "password": settings.linkedin_password or "",
+            }
 
-                # Resolve credentials: profile UI → environment variables fallback
-                if not creds.get("username") and settings.linkedin_email:
-                    creds = {
-                        "username": settings.linkedin_email,
-                        "password": settings.linkedin_password or "",
-                    }
+        cookies: dict = {}
+        for attempt in range(2):
+            if attempt == 1:
+                logger.warning(
+                    "[LinkedIn] Login form was not visible — clearing stale scraper session "
+                    "dir and retrying with fresh browser profile …"
+                )
+                _clear_session_dir(_SESSION_DIR)
 
-                # If credentials are configured, attempt login for a trusted li_at cookie.
-                if creds.get("username") and creds.get("password"):
-                    logger.info("[LinkedIn] Logging in to get authenticated session cookies …")
+            login_form_found = True  # assume present; set False if wait_for_selector fails
+            try:
+                async with BrowserManager(headless=True, user_data_dir=_SESSION_DIR) as bm:
+                    page = await bm.new_page()
+
+                    if creds.get("username") and creds.get("password"):
+                        logger.info("[LinkedIn] Logging in to get authenticated session cookies …")
+                        await page.goto(
+                            "https://www.linkedin.com/login",
+                            wait_until="domcontentloaded",
+                            timeout=30_000,
+                        )
+                        await bm.human_pause(1.5, 2.5)
+
+                        current_url = page.url
+                        if any(s in current_url for s in ("/feed", "/jobs", "/mynetwork")):
+                            # Already authenticated via persistent profile
+                            logger.info(f"[LinkedIn] Already authenticated (at {current_url})")
+                        else:
+                            # Expect the standard login form — wait with a short timeout so
+                            # we detect checkpoint/CAPTCHA pages quickly instead of hanging
+                            try:
+                                await page.wait_for_selector(
+                                    "input#username", state="visible", timeout=8_000
+                                )
+                                # Form is present — fill credentials
+                                await page.fill("input#username", creds["username"])
+                                await bm.human_pause(0.3, 0.8)
+                                await page.fill("input#password", creds["password"])
+                                await bm.human_pause(0.5, 1.0)
+                                await page.click("button[type='submit']")
+                                await bm.human_pause(3, 5)
+                                logger.info("[LinkedIn] Login submitted — waiting for redirect …")
+                            except Exception:
+                                logger.warning(
+                                    f"[LinkedIn] Login form not visible at {current_url} "
+                                    f"(attempt {attempt + 1}/2) — checkpoint/CAPTCHA suspected"
+                                )
+                                login_form_found = False
+
+                    # Collect session cookies regardless of login outcome
                     await page.goto(
-                        "https://www.linkedin.com/login",
+                        "https://www.linkedin.com/jobs/search/?keywords=software+engineer",
                         wait_until="domcontentloaded",
                         timeout=30_000,
                     )
+                    await bm.human_pause(2, 4)
+                    await page.evaluate("window.scrollBy(0, 600)")
                     await bm.human_pause(1, 2)
+                    await page.evaluate("window.scrollBy(0, 400)")
+                    await bm.human_pause(0.5, 1.5)
+                    raw = await page.context.cookies("https://www.linkedin.com")
+                    cookies = {c["name"]: c["value"] for c in raw}
+                    has_auth = "li_at" in cookies
+                    logger.info(
+                        f"[LinkedIn] Session warm complete — {len(cookies)} cookies "
+                        f"(authenticated={has_auth})"
+                    )
 
-                    if "/login" in page.url:
-                        # On the login page — fill the form
-                        try:
-                            email_sel = "input#username, input[name='session_key']:not([type='hidden'])"
-                            pass_sel  = "input#password, input[name='session_password']:not([type='hidden'])"
-                            await page.locator(email_sel).first.fill(
-                                creds["username"], timeout=10_000
-                            )
-                            await bm.human_pause(0.3, 0.8)
-                            await page.locator(pass_sel).first.fill(
-                                creds["password"], timeout=10_000
-                            )
-                            await bm.human_pause(0.5, 1.0)
-                            await page.click("button[type=submit]")
-                            await bm.human_pause(3, 5)
-                            logger.info("[LinkedIn] Login submitted — waiting for redirect …")
-                        except Exception as login_exc:
-                            logger.warning(f"[LinkedIn] Login form fill failed: {login_exc}")
-                    else:
-                        # Redirected away from /login — already authenticated
-                        logger.info(
-                            f"[LinkedIn] Already authenticated (at {page.url}) — skipping login form"
-                        )
+            except Exception as exc:
+                logger.warning(f"[LinkedIn] Session warming attempt {attempt + 1}/2 failed: {exc}")
 
-                # Navigate to jobs search to generate/refresh session cookies
-                await page.goto(
-                    "https://www.linkedin.com/jobs/search/?keywords=software+engineer",
-                    wait_until="domcontentloaded",
-                    timeout=30_000,
-                )
-                await bm.human_pause(2, 4)
-                # Scroll to trigger lazy-load and session cookie generation
-                await page.evaluate("window.scrollBy(0, 600)")
-                await bm.human_pause(1, 2)
-                await page.evaluate("window.scrollBy(0, 400)")
-                await bm.human_pause(0.5, 1.5)
-                # Extract cookies for linkedin.com
-                raw = await page.context.cookies("https://www.linkedin.com")
-                cookies = {c["name"]: c["value"] for c in raw}
-                has_auth = "li_at" in cookies
-                logger.info(
-                    f"[LinkedIn] Session warm complete — {len(cookies)} cookies "
-                    f"(authenticated={has_auth})"
-                )
-        except Exception as exc:
-            logger.warning(f"[LinkedIn] Session warming failed: {exc}")
+            if "li_at" in cookies:
+                return cookies  # Authenticated — no need to retry
+
+            if login_form_found or attempt == 1:
+                # Either form was found (credentials wrong / checkpoint after submit),
+                # or this was already the retry — don't loop again
+                break
+            # else: form was not found → outer loop will clear dir and retry
+
+        if "li_at" not in cookies:
+            logger.warning(
+                "[LinkedIn] Could not obtain an authenticated session after %d attempt(s). "
+                "Proceeding with unauthenticated cookies (scraping may be limited). "
+                "To fix: set HEADLESS_BROWSER=false in .env, run once, and solve any "
+                "LinkedIn security challenge manually — the session will persist.",
+                attempt + 1,
+            )
         return cookies
 
     # ------------------------------------------------------------------

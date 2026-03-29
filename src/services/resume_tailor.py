@@ -82,6 +82,10 @@ async def score_ats(
     model: str = "claude-sonnet-4-6",
 ) -> float:
     """Ask Claude to rate ATS compatibility of resume vs job description (0-100)."""
+    if not (job_description or "").strip():
+        logger.warning("ATS scoring skipped — job description is empty")
+        return 0.0
+
     prompt = f"""You are an ATS (Applicant Tracking System) simulator. Score this resume
 against the job description for ATS pass-through likelihood.
 
@@ -99,7 +103,7 @@ Scoring criteria:
 {resume_text[:3000]}
 </resume>
 
-Respond with ONLY valid JSON:
+Respond with ONLY valid JSON (no markdown, no code blocks, no commentary):
 {{
   "ats_score": <integer 0-100>,
   "keyword_matches": ["kw1", "kw2"],
@@ -110,15 +114,17 @@ Respond with ONLY valid JSON:
     try:
         response = await client.messages.create(
             model=model,
-            max_tokens=512,
+            max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not json_match:
+            logger.warning(f"ATS scoring: no JSON found in Claude response — raw: {raw[:300]!r}")
             return 0.0
         data = json.loads(json_match.group())
-        return min(max(float(data.get("ats_score", 0)), 0.0), 100.0)
+        score = min(max(float(data.get("ats_score", 0)), 0.0), 100.0)
+        return score
     except Exception as exc:
         logger.error(f"ATS scoring error: {exc}")
         return 0.0

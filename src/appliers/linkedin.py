@@ -314,36 +314,56 @@ class LinkedInApplier(BaseApplier):
         except Exception as exc:
             logger.error(f"[LinkedIn] Could not load login page: {exc}")
             return
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        await asyncio.sleep(random.uniform(1.5, 2.5))
 
-        # Only fill the form if we actually landed on the login page
+        # If already redirected away from /login, check whether we're authenticated
         if "/login" not in page.url and "/checkpoint" not in page.url:
-            # Redirect means we may already be authenticated via persistent profile
             if await self._is_logged_in(page):
                 logger.info("[LinkedIn] Persistent profile session detected — already logged in ✓")
                 self._logged_in = True
                 return
 
-        # Fill email
-        email_field = page.locator(_EMAIL_SEL).first
+        # Wait for the standard email input with a short timeout so we detect
+        # checkpoint/CAPTCHA pages quickly instead of hanging for 15 s.
+        form_visible = False
         try:
-            await email_field.wait_for(state="visible", timeout=15_000)
+            await page.wait_for_selector("input#username", state="visible", timeout=8_000)
+            form_visible = True
         except PWTimeoutError:
-            await self._bm.screenshot(page, "linkedin_login_no_email_field")
-            logger.error(
-                "[LinkedIn] Email input not found on login page. "
-                "LinkedIn may be showing a CAPTCHA or challenge. "
-                "Screenshot saved to data/screenshots/."
+            # LinkedIn is showing a checkpoint/security challenge instead of the form.
+            # Clear all cookies from the current context and retry login once — a clean
+            # cookie jar removes the stale session signals that triggered the challenge.
+            logger.warning(
+                f"[LinkedIn] Login form not visible at {page.url} — clearing cookies and retrying …"
             )
+            await page.context.clear_cookies()
+            await asyncio.sleep(1.5)
+            try:
+                await page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+                await asyncio.sleep(2.0)
+                await page.wait_for_selector("input#username", state="visible", timeout=10_000)
+                form_visible = True
+            except Exception:
+                await self._bm.screenshot(page, "linkedin_login_no_email_field")
+                logger.error(
+                    "[LinkedIn] LinkedIn is blocking automated login (CAPTCHA / security checkpoint). "
+                    "Fix: set HEADLESS_BROWSER=false in your .env, run the pipeline once, solve the "
+                    "challenge manually, then restart — the session cookie persists for future runs."
+                )
+                return
+
+        if not form_visible:
             return
 
+        # Fill email
+        email_field = page.locator("input#username").first
         await email_field.click()
         await asyncio.sleep(random.uniform(0.3, 0.6))
         await _BM.human_type(email_field, username)
         await asyncio.sleep(random.uniform(0.4, 0.9))
 
         # Fill password
-        pass_field = page.locator(_PASS_SEL).first
+        pass_field = page.locator("input#password").first
         await pass_field.click()
         await asyncio.sleep(random.uniform(0.2, 0.5))
         await _BM.human_type(pass_field, password)
