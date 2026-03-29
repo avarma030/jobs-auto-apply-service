@@ -4,10 +4,14 @@ Browser interactions are fully mocked — no real Playwright needed.
 """
 from __future__ import annotations
 
+import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import src.appliers.linkedin as linkedin_mod
+from src.appliers.base import ApplicationResult
 from src.appliers.linkedin import LinkedInApplier
 from src.models import ApplicationStatus, Job, UserProfile
 from src.models.user_profile import (
@@ -99,13 +103,18 @@ async def test_apply_skips_non_linkedin_job():
 
 
 @pytest.mark.asyncio
-async def test_apply_skips_non_easy_apply_job():
+async def test_apply_ignores_stale_easy_apply_flag_and_checks_live_page():
     applier = make_applier()
-    applier._page = MagicMock()  # not None so setup check passes
+    applier._page = MagicMock()
+    applier._page.url = "https://www.linkedin.com/jobs/"
+    applier._logged_in = True
+    applier._is_logged_in = AsyncMock(return_value=True)
     job = make_job(easy_apply=False)
+    expected = ApplicationResult(job, ApplicationStatus.SKIPPED, "checked live page")
+    applier._easy_apply = AsyncMock(return_value=expected)
     result = await applier.apply(job)
-    assert result.status == ApplicationStatus.SKIPPED
-    assert "Easy Apply" in result.message
+    assert result is expected
+    applier._easy_apply.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -116,6 +125,60 @@ async def test_apply_fails_if_browser_not_initialised():
     result = await applier.apply(job)
     assert result.status == ApplicationStatus.FAILED
     assert "Browser not initialised" in result.message
+
+
+@pytest.mark.asyncio
+async def test_inject_scraper_cookies_keeps_jsessionid_js_readable(tmp_path):
+    cookie_path = tmp_path / "linkedin_cookies.json"
+    cookie_path.write_text(
+        json.dumps(
+            {
+                "saved_at": time.time(),
+                "cookies": {
+                    "li_at": "li-at-token",
+                    "JSESSIONID": '"ajax:123"',
+                    "lang": "v=2&lang=en-us",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    applier = make_applier()
+    applier._bm = MagicMock()
+    applier._bm._context = MagicMock()
+    applier._bm._context.add_cookies = AsyncMock()
+
+    with patch.object(linkedin_mod, "_COOKIE_PATH", cookie_path):
+        injected = await applier._inject_scraper_cookies()
+
+    assert injected is True
+    applier._bm._context.add_cookies.assert_awaited_once()
+    cookies = applier._bm._context.add_cookies.await_args.args[0]
+    by_name = {cookie["name"]: cookie for cookie in cookies}
+    assert by_name["li_at"]["httpOnly"] is True
+    assert by_name["JSESSIONID"]["httpOnly"] is False
+
+
+@pytest.mark.asyncio
+async def test_is_logged_in_rejects_authwall_job_pages():
+    applier = make_applier()
+    page = MagicMock()
+    page.url = "https://www.linkedin.com/authwall?sessionRedirect=https%3A%2F%2Fwww.linkedin.com%2Fjobs%2Fview%2F123"
+    empty_locator = MagicMock()
+    empty_locator.count = AsyncMock(return_value=0)
+    page.locator.return_value = empty_locator
+
+    assert await applier._is_logged_in(page) is False
+
+
+def test_modal_descendants_scopes_each_modal_root():
+    scoped = LinkedInApplier._modal_descendants("input[type='text']")
+    assert scoped == (
+        "div.jobs-easy-apply-modal input[type='text'], "
+        "div.jobs-apply-modal input[type='text'], "
+        "div[role='dialog'] input[type='text']"
+    )
 
 
 # ── Tests: _infer_value_from_label ────────────────────────────────────────────

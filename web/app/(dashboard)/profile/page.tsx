@@ -11,11 +11,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Save, Upload, Plus, Trash2 } from "lucide-react";
 
+type ExtractionToast = { type: "success" | "error"; message: string } | null;
+
 export default function ProfilePage() {
   const [profile, setProfile] = useState<Profile>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [extractionToast, setExtractionToast] = useState<ExtractionToast>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -41,9 +44,40 @@ export default function ProfilePage() {
     const file = e.target.files?.[0];
     if (!file) return;
     setUploading(true);
+    setExtractionToast(null);
     try {
-      await profileApi.uploadResume(file);
-      set("resume_path" as any, `data/uploads/${file.name}`);
+      const res = await profileApi.uploadResume(file);
+      // If the server auto-extracted a profile, pre-fill the form fields
+      if (res.extracted_profile && res.profile_updated) {
+        const ep = res.extracted_profile as Profile;
+        setProfile((prev) => {
+          const merged: Profile = { ...ep };
+          // Keep any existing non-empty values the user already set
+          for (const k of Object.keys(prev) as (keyof Profile)[]) {
+            const v = prev[k];
+            if (v && (Array.isArray(v) ? v.length > 0 : true)) {
+              (merged as any)[k] = v;
+            }
+          }
+          return merged;
+        });
+        setExtractionToast({
+          type: "success",
+          message: `Profile auto-filled from resume — please review and click Save.`,
+        });
+      } else {
+        set("resume_path" as any, `data/uploads/${file.name}`);
+        if (res.extracted_profile === null || res.extracted_profile === undefined) {
+          const msg = res.ai_extraction_enabled
+            ? res.extraction_error
+              ? `Resume uploaded. Profile auto-extraction failed: ${res.extraction_error} — please fill in your profile manually.`
+              : "Resume uploaded. Profile auto-extraction returned no data — please fill in your profile manually."
+            : "Resume uploaded, but auto-extraction is disabled (set ANTHROPIC_API_KEY to enable).";
+          setExtractionToast({ type: "error", message: msg });
+        }
+      }
+    } catch {
+      setExtractionToast({ type: "error", message: "Upload failed — please try again." });
     } finally {
       setUploading(false);
     }
@@ -65,6 +99,18 @@ export default function ProfilePage() {
           </Button>
         }
       />
+      {/* Extraction Toast */}
+      {extractionToast && (
+        <div className={`mx-6 mt-4 px-4 py-3 rounded-lg flex items-center justify-between text-sm ${
+          extractionToast.type === "success"
+            ? "bg-green-50 text-green-800 border border-green-200"
+            : "bg-yellow-50 text-yellow-800 border border-yellow-200"
+        }`}>
+          <span>{extractionToast.type === "success" ? "✓ " : "⚠ "}{extractionToast.message}</span>
+          <button onClick={() => setExtractionToast(null)} className="ml-4 opacity-60 hover:opacity-100">×</button>
+        </div>
+      )}
+
       <div className="p-6 space-y-6 max-w-4xl">
 
         {/* Personal Info */}
@@ -169,6 +215,45 @@ export default function ProfilePage() {
                   ✓ Resume uploaded
                 </span>
               )}
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Job Board Credentials */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Job Board Credentials</CardTitle>
+            <p className="text-xs text-muted-foreground mt-1">
+              Used to log in and apply to jobs on your behalf. Stored securely in your profile.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div>
+              <p className="text-sm font-medium text-gray-700 mb-2">LinkedIn</p>
+              <div className="grid grid-cols-2 gap-3">
+                <Field
+                  label="Email / Username"
+                  value={(profile.job_board_accounts as any)?.linkedin?.username ?? ""}
+                  onChange={(v) => set("job_board_accounts", {
+                    ...(profile.job_board_accounts ?? {}),
+                    linkedin: { ...(((profile.job_board_accounts ?? {}) as any).linkedin ?? {}), username: v },
+                  } as any)}
+                  placeholder="you@example.com"
+                />
+                <Field
+                  label="Password"
+                  type="password"
+                  value={(profile.job_board_accounts as any)?.linkedin?.password ?? ""}
+                  onChange={(v) => set("job_board_accounts", {
+                    ...(profile.job_board_accounts ?? {}),
+                    linkedin: { ...(((profile.job_board_accounts ?? {}) as any).linkedin ?? {}), password: v },
+                  } as any)}
+                  placeholder="••••••••"
+                />
+              </div>
+              <p className="text-xs text-muted-foreground mt-1">
+                Enables authenticated scraping (bypasses CAPTCHA) and Easy Apply.
+              </p>
             </div>
           </CardContent>
         </Card>

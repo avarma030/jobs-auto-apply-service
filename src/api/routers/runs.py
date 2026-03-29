@@ -15,6 +15,18 @@ from src.database.models import ScrapeRun, User
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
+# ---------------------------------------------------------------------------
+# In-process progress queue for AI pipeline events
+# Keyed by run_id → list of pending progress message strings.
+# jobs.py appends to this; _sse_generator drains it.
+# ---------------------------------------------------------------------------
+_run_progress: dict[str, list[str]] = {}
+
+
+def append_run_progress(run_id: str, message: str) -> None:
+    """Called by the background task to push a progress message into the SSE stream."""
+    _run_progress.setdefault(run_id, []).append(message)
+
 
 @router.get("", response_model=list[RunResponse])
 async def list_runs(
@@ -78,7 +90,12 @@ async def _get_run_or_404(run_id: str, user_id: int, session: AsyncSession) -> S
 
 
 async def _sse_generator(run_id: str, user_id: int) -> AsyncGenerator[str, None]:
-    """Poll the DB every 2 seconds and stream SSE events until the run finishes."""
+    """Poll the DB every 2 seconds and stream SSE events until the run finishes.
+
+    Two event channels:
+      • DB poll  — emits jobs_found / jobs_applied counters when they change
+      • Progress queue — emits per-step AI pipeline messages immediately
+    """
     from src.config import settings
     from src.database.db import Database
 
@@ -89,7 +106,13 @@ async def _sse_generator(run_id: str, user_id: int) -> AsyncGenerator[str, None]
         last_jobs_found = 0
         last_jobs_applied = 0
 
-        for _ in range(300):  # max 10 minutes (300 * 2s)
+        for _ in range(600):  # max 20 minutes (600 * 2s) — AI pipeline takes longer
+            # 1. Drain progress queue first (low-latency messages)
+            messages = _run_progress.pop(run_id, [])
+            for msg in messages:
+                yield f"data: {json.dumps({'event': 'progress', 'message': msg})}\n\n"
+
+            # 2. Poll DB for counter updates
             async with db.session_factory() as session:
                 row = (
                     await session.execute(
@@ -103,23 +126,17 @@ async def _sse_generator(run_id: str, user_id: int) -> AsyncGenerator[str, None]
             if row.jobs_found != last_jobs_found or row.jobs_applied != last_jobs_applied:
                 last_jobs_found = row.jobs_found
                 last_jobs_applied = row.jobs_applied
-                payload = json.dumps({
-                    "status": row.status,
-                    "jobs_found": row.jobs_found,
-                    "jobs_applied": row.jobs_applied,
-                })
-                yield f"data: {payload}\n\n"
+                yield f"data: {json.dumps({'event': 'progress', 'status': row.status, 'jobs_found': row.jobs_found, 'jobs_applied': row.jobs_applied})}\n\n"
 
             if row.status in ("done", "failed", "stopped"):
-                final_payload = json.dumps({
-                    "event": row.status,
-                    "jobs_found": row.jobs_found,
-                    "jobs_applied": row.jobs_applied,
-                    "error_message": row.error_message,
-                })
-                yield f"data: {final_payload}\n\n"
+                # Drain any final messages before closing
+                final_messages = _run_progress.pop(run_id, [])
+                for msg in final_messages:
+                    yield f"data: {json.dumps({'event': 'progress', 'message': msg})}\n\n"
+                yield f"data: {json.dumps({'event': row.status, 'jobs_found': row.jobs_found, 'jobs_applied': row.jobs_applied, 'error_message': row.error_message})}\n\n"
                 break
 
             await asyncio.sleep(2)
     finally:
+        _run_progress.pop(run_id, None)
         await db.close()

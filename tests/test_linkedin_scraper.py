@@ -73,6 +73,8 @@ def make_scraper() -> LinkedInScraper:
     scraper._ua = UserAgent()
     scraper._proxies = []
     scraper._proxy_index = 0
+    scraper._cookies = {}
+    scraper._warm_attempted = False
     return scraper
 
 

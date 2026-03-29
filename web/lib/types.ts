@@ -13,6 +13,7 @@ export interface Job {
   title: string;
   company: string;
   location?: string;
+  description?: string | null;
   source_board: string;
   url: string;
   job_type?: string;
@@ -27,6 +28,12 @@ export interface Job {
   application_status: string;
   applied_at?: string;
   skills: string[];
+  // AI pipeline
+  match_score?: number | null;
+  ats_score?: number | null;
+  ats_type?: string | null;
+  tailored_resume_path?: string | null;
+  cover_letter_path?: string | null;
 }
 
 export interface JobsPage {
@@ -131,4 +138,6 @@ export interface Profile {
     twitter?: string;
   };
   custom_answers?: Record<string, string>;
+  resume_path?: string;
+  job_board_accounts?: Record<string, { username?: string; password?: string }>;
 }

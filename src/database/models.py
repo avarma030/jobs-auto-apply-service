@@ -112,6 +112,13 @@ class JobRecord(Base):
     posted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     scraped_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # AI pipeline
+    match_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ats_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ats_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    tailored_resume_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    cover_letter_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
     application_status: Mapped[str] = mapped_column(String(64), default="pending", index=True)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)

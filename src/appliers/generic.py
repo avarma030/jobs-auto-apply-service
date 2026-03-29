@@ -17,7 +17,12 @@ class GenericApplier(BaseApplier):
     def can_apply(self, job: Job) -> bool:
         return True  # fallback — handles anything
 
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(
+        self,
+        job: Job,
+        tailored_resume_path: str | None = None,
+        cover_letter: str | None = None,
+    ) -> ApplicationResult:
         try:
             # TODO:
             # 1. Navigate to job.url

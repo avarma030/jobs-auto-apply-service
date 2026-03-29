@@ -43,6 +43,7 @@ async def update_profile(
 @router.post("/resume", response_model=ResumeUploadResponse)
 async def upload_resume(
     file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
@@ -52,7 +53,76 @@ async def upload_resume(
     dest = user_dir / "resume.pdf"
     with dest.open("wb") as f:
         shutil.copyfileobj(file.file, f)
-    return ResumeUploadResponse(resume_path=str(dest), filename=file.filename)
+
+    extracted: dict | None = None
+    profile_updated = False
+    extraction_error: str | None = None
+    ai_enabled = bool(settings.anthropic_api_key)
+
+    # Also copy to the global resume path so the orchestrator can find it.
+    # The orchestrator tries data/uploads/{user_id}/resume.pdf first (per-user),
+    # then falls back to settings.resume_path. Copying here keeps CLI / single-user
+    # mode working without any code changes in the orchestrator.
+    try:
+        settings.resume_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dest, settings.resume_path)
+    except Exception as exc:
+        from loguru import logger
+        logger.warning(f"Could not copy resume to global path: {exc}")
+
+    if ai_enabled:
+        try:
+            import anthropic as _anthropic
+            from src.services import profile_extractor, resume_parser
+
+            resume_text = resume_parser.parse_resume(dest)
+            client = _anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+            extracted = await profile_extractor.extract_profile_from_resume(
+                resume_text, client, settings.anthropic_model
+            )
+
+            if extracted:
+                row = await _get_or_create_profile(current_user.id, session)
+                existing = json.loads(row.profile_json) if row.profile_json and row.profile_json != "{}" else {}
+
+                # Merge: extracted fills in empty/missing fields; existing non-empty values win
+                merged = dict(extracted)
+                for key, val in existing.items():
+                    if val:  # existing non-empty value takes priority
+                        merged[key] = val
+
+                row.profile_json = json.dumps(merged)
+                await session.commit()
+                profile_updated = True
+
+                # Also persist to user_profile.json for CLI / orchestrator fallback
+                try:
+                    from src.models import UserProfile as _UserProfileModel
+                    profile_data = dict(merged)
+                    profile_data.setdefault("first_name", "User")
+                    profile_data.setdefault("last_name", "")
+                    profile_data.setdefault("email", "")
+                    _up = _UserProfileModel(**profile_data)
+                    settings.user_profile_path.parent.mkdir(parents=True, exist_ok=True)
+                    settings.user_profile_path.write_text(_up.model_dump_json(indent=2))
+                    from loguru import logger as _logger
+                    _logger.info(f"Profile saved to {settings.user_profile_path}")
+                except Exception as exc:
+                    from loguru import logger as _logger
+                    _logger.warning(f"Could not save profile to JSON: {exc}")
+        except Exception as exc:
+            from loguru import logger
+            logger.warning(f"Auto-extraction failed after resume upload: {exc}")
+            extraction_error = str(exc)
+
+    return ResumeUploadResponse(
+        resume_path=str(dest),
+        filename=file.filename,
+        extracted_profile=extracted,
+        profile_updated=profile_updated,
+        ai_extraction_enabled=ai_enabled,
+        extraction_error=extraction_error,
+    )
 
 
 async def _get_or_create_profile(user_id: int, session: AsyncSession) -> UserProfile:

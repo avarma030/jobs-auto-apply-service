@@ -58,8 +58,35 @@ export const jobs = {
   get: (id: number) => request<Job>(`/jobs/${id}`),
   updateStatus: (id: number, status: string) =>
     request<Job>(`/jobs/${id}/status`, { method: "PUT", body: JSON.stringify({ status }) }),
-  scrape: (body: { keywords: string[]; location?: string; remote_only?: boolean; boards: string[]; max_age_days?: number }) =>
+  scrape: (body: {
+    keywords: string[];
+    location?: string;
+    work_modes?: string[];
+    job_types?: string[];
+    experience_levels?: string[];
+    easy_apply_only?: boolean;
+    remote_only?: boolean;
+    boards: string[];
+    max_age_days?: number;
+    max_jobs?: number;
+    min_match_score?: number;
+  }) =>
     request<{ run_id: string }>("/jobs/scrape", { method: "POST", body: JSON.stringify(body) }),
+  /** Returns a download URL for Excel export. Open or assign to window.location.href. */
+  exportUrl: (params?: { status?: string; board?: string }): string => {
+    const q = new URLSearchParams();
+    if (params?.status) q.set("status", params.status);
+    if (params?.board) q.set("board", params.board);
+    const token = getToken();
+    if (token) q.set("token", token);
+    return `${BASE}/jobs/export?${q}`;
+  },
+  artifactUrl: (jobId: number, artifact: "resume" | "cover-letter"): string => {
+    const q = new URLSearchParams();
+    const token = getToken();
+    if (token) q.set("token", token);
+    return `${BASE}/jobs/${jobId}/artifacts/${artifact}?${q}`;
+  },
 };
 
 // Applications
@@ -83,7 +110,14 @@ export const profile = {
   get: () => request<{ profile: Profile }>("/profile"),
   update: (data: Profile) =>
     request<{ profile: Profile }>("/profile", { method: "PUT", body: JSON.stringify({ profile: data }) }),
-  uploadResume: (file: File) => {
+  uploadResume: (file: File): Promise<{
+    resume_path: string;
+    filename: string;
+    extracted_profile?: Record<string, unknown> | null;
+    profile_updated?: boolean;
+    ai_extraction_enabled?: boolean;
+    extraction_error?: string | null;
+  }> => {
     const form = new FormData();
     form.append("file", file);
     const token = getToken();

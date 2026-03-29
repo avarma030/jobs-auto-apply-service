@@ -67,6 +67,21 @@ class Settings(BaseSettings):
     use_task_queue: bool = False
 
     # ------------------------------------------------------------------
+    # Job board credentials (env-var fallback — profile UI takes priority)
+    # ------------------------------------------------------------------
+    linkedin_email: str | None = None      # LINKEDIN_EMAIL env var
+    linkedin_password: str | None = None   # LINKEDIN_PASSWORD env var
+
+    # ------------------------------------------------------------------
+    # AI / Claude (for match scoring, resume tailoring, cover letters)
+    # ------------------------------------------------------------------
+    anthropic_api_key: str | None = None  # ANTHROPIC_API_KEY env var
+    anthropic_model: str = "claude-sonnet-4-6"
+    min_match_score: float = 75.0    # jobs below this % are skipped automatically
+    min_ats_score: float = 90.0      # tailored resume must reach this ATS score
+    max_tailor_attempts: int = 3     # max re-tailor iterations per job
+
+    # ------------------------------------------------------------------
     # Notifications (optional)
     # ------------------------------------------------------------------
     notify_email: str | None = None

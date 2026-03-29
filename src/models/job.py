@@ -67,6 +67,13 @@ class Job(BaseModel):
     easy_apply: bool = False  # supports one-click / easy apply
     requires_cover_letter: bool = False
 
+    # AI pipeline fields
+    match_score: Optional[float] = None   # 0-100 resume-job compatibility
+    ats_score: Optional[float] = None     # 0-100 ATS score of tailored resume
+    tailored_resume_path: Optional[str] = None
+    cover_letter_path: Optional[str] = None
+    ats_type: Optional[str] = None        # greenhouse, workday, lever, generic …
+
     application_status: ApplicationStatus = ApplicationStatus.PENDING
     applied_at: Optional[datetime] = None
     notes: Optional[str] = None
@@ -78,8 +85,12 @@ class JobSearchFilter(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     location: Optional[str] = None
     remote_only: bool = False
+    work_modes: list[str] = Field(default_factory=list)   # ["remote","hybrid","onsite"]
     job_types: list[JobType] = Field(default_factory=list)
     experience_levels: list[ExperienceLevel] = Field(default_factory=list)
+    easy_apply_only: bool = False
     salary_min: Optional[float] = None
     exclude_keywords: list[str] = Field(default_factory=list)
     max_age_days: int = 7  # only scrape jobs posted within N days
+    max_jobs: Optional[int] = None  # max jobs to scrape per board (None = no limit)
+    min_match_score: Optional[int] = None  # per-run override; None = use global settings.min_match_score
