@@ -53,6 +53,7 @@ from src.services.application_questions import (
     semantic_yes_no,
 )
 from src.services.linkedin_state import (
+    legacy_linkedin_cookie_path,
     linkedin_cookie_path,
     linkedin_session_dir,
     mask_linkedin_username,
@@ -491,52 +492,62 @@ class LinkedInApplier(BaseApplier):
         full login form flow. Returns True if li_at was successfully injected.
         """
         self._ensure_linkedin_state()
-        if not self._cookie_path.exists():
-            logger.debug("[LinkedIn] No scraper cookie file found — will log in fresh")
-            return False
-        try:
-            data = json.loads(self._cookie_path.read_text())
-            age = time.time() - data.get("saved_at", 0)
-            cookies = data.get("cookies", {})
-            cookie_owner = str(data.get("username") or "").strip().lower()
-            expected_owner = self._linkedin_identity.strip().lower()
-            if cookie_owner and expected_owner and cookie_owner != expected_owner:
-                logger.info(
-                    "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
-                    f"{mask_linkedin_username(cookie_owner)}"
-                )
-                return False
-            if not cookies.get("li_at"):
-                logger.debug("[LinkedIn] Scraper cookies present but no li_at — skipping injection")
-                return False
-            if age > _COOKIE_MAX_AGE:
+        candidates: list[tuple[Path, str, str | None]] = [
+            (self._cookie_path, "scoped", self._linkedin_identity),
+            (legacy_linkedin_cookie_path(), "legacy", None),
+        ]
+        for path, source, expected_owner in candidates:
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text())
+                age = time.time() - data.get("saved_at", 0)
+                cookies = data.get("cookies", {})
+                cookie_owner = str(data.get("username") or "").strip().lower()
+                if expected_owner:
+                    expected = expected_owner.strip().lower()
+                    if cookie_owner and cookie_owner != expected:
+                        logger.info(
+                            "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
+                            f"{mask_linkedin_username(cookie_owner)}"
+                        )
+                        continue
+                if not cookies.get("li_at"):
+                    logger.debug("[LinkedIn] Scraper cookies present but no li_at — skipping injection")
+                    continue
+                if age > _COOKIE_MAX_AGE:
+                    self._report_progress(
+                        f"[LinkedIn][Auth] Scraper cookies are {age / 3600:.1f}h old - attempting reuse"
+                    )
+                if source == "legacy":
+                    self._report_progress(
+                        "[LinkedIn][Auth] Falling back to legacy shared LinkedIn cookies"
+                    )
+                # Convert flat dict → Playwright cookie objects
+                pw_cookies = [
+                    {
+                        "name": k,
+                        "value": v,
+                        "domain": ".linkedin.com",
+                        "path": "/",
+                        # LinkedIn's frontend reads JSESSIONID to derive the CSRF token
+                        # used by voyager/graphql requests. Marking it HttpOnly breaks
+                        # Easy Apply because the modal/detail APIs start returning 403.
+                        "httpOnly": k == "li_at",
+                        "secure": True,
+                        "sameSite": "None",
+                    }
+                    for k, v in cookies.items()
+                ]
+                await self._bm._context.add_cookies(pw_cookies)
                 self._report_progress(
-                    f"[LinkedIn][Auth] Scraper cookies are {age / 3600:.1f}h old - attempting reuse"
+                    f"[LinkedIn][Auth] Injected {len(pw_cookies)} warm scraper cookies ({age / 60:.0f} min old)"
                 )
-            # Convert flat dict → Playwright cookie objects
-            pw_cookies = [
-                {
-                    "name": k,
-                    "value": v,
-                    "domain": ".linkedin.com",
-                    "path": "/",
-                    # LinkedIn's frontend reads JSESSIONID to derive the CSRF token
-                    # used by voyager/graphql requests. Marking it HttpOnly breaks
-                    # Easy Apply because the modal/detail APIs start returning 403.
-                    "httpOnly": k == "li_at",
-                    "secure": True,
-                    "sameSite": "None",
-                }
-                for k, v in cookies.items()
-            ]
-            await self._bm._context.add_cookies(pw_cookies)
-            self._report_progress(
-                f"[LinkedIn][Auth] Injected {len(pw_cookies)} warm scraper cookies ({age / 60:.0f} min old)"
-            )
-            return True
-        except Exception as exc:
-            logger.warning(f"[LinkedIn] Cookie injection failed: {exc}")
-            return False
+                return True
+            except Exception as exc:
+                logger.warning(f"[LinkedIn] Cookie injection failed from {path}: {exc}")
+        logger.debug("[LinkedIn] No authenticated scraper cookie file found — will log in fresh")
+        return False
 
     async def _is_logged_in(self, page: Page) -> bool:
         """Return True if the current page shows an active authenticated session."""
@@ -695,16 +706,17 @@ class LinkedInApplier(BaseApplier):
             try:
                 raw = await page.context.cookies("https://www.linkedin.com")
                 fresh = {c["name"]: c["value"] for c in raw}
+                payload = {
+                    "saved_at": time.time(),
+                    "username": self._linkedin_identity,
+                    "cookies": fresh,
+                }
                 self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
-                self._cookie_path.write_text(
-                    json.dumps(
-                        {
-                            "saved_at": time.time(),
-                            "username": self._linkedin_identity,
-                            "cookies": fresh,
-                        }
-                    )
-                )
+                self._cookie_path.write_text(json.dumps(payload))
+                if fresh.get("li_at"):
+                    legacy_path = legacy_linkedin_cookie_path()
+                    legacy_path.parent.mkdir(parents=True, exist_ok=True)
+                    legacy_path.write_text(json.dumps(payload))
                 logger.info("[LinkedIn] Fresh session cookies saved to disk")
             except Exception as exc:
                 logger.warning(f"[LinkedIn] Could not save cookies: {exc}")

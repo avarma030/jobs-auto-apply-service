@@ -134,7 +134,47 @@ def test_load_cookies_ignores_different_account_owner(tmp_path):
         encoding="utf-8",
     )
 
-    assert scraper._load_cookies() is None
+    with patch(
+        "src.scrapers.linkedin.legacy_linkedin_cookie_path",
+        return_value=tmp_path / "missing_legacy.json",
+    ):
+        assert scraper._load_cookies() is None
+
+
+def test_load_cookies_falls_back_to_legacy_authenticated_cookie_file(tmp_path):
+    scraper = make_scraper()
+    scraper.credentials = {
+        "username": "rucha@example.com",
+        "password": "secret",
+    }
+    scraper._ensure_linkedin_state()
+    scraper._cookie_path = tmp_path / "scoped_cookies.json"
+    scraper._cookie_path.write_text(
+        json.dumps(
+            {
+                "saved_at": time.time(),
+                "username": "rucha@example.com",
+                "cookies": {"lang": "en-us"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_cookie_path = tmp_path / "legacy_cookies.json"
+    legacy_cookie_path.write_text(
+        json.dumps(
+            {
+                "saved_at": time.time(),
+                "cookies": {"li_at": "legacy-li-at", "JSESSIONID": '"ajax:123"'},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with patch("src.scrapers.linkedin.legacy_linkedin_cookie_path", return_value=legacy_cookie_path):
+        cookies = scraper._load_cookies()
+
+    assert cookies is not None
+    assert cookies["li_at"] == "legacy-li-at"
 
 
 # ── Tests: _parse_job_cards ───────────────────────────────────────────────────

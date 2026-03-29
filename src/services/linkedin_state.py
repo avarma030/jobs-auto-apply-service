@@ -6,6 +6,12 @@ from pathlib import Path
 
 
 _LINKEDIN_STATE_ROOT = Path("data/linkedin")
+_LEGACY_COOKIE_PATH = Path("data/.linkedin_cookies.json")
+_LEGACY_SESSION_DIRS = {
+    "applier": Path("data/.linkedin_session"),
+    "scraper": Path("data/.linkedin_scraper_session"),
+    "detail": Path("data/.linkedin_detail_session"),
+}
 
 
 def linkedin_account_key(username: str | None) -> str:
@@ -23,6 +29,14 @@ def linkedin_cookie_path(username: str | None) -> Path:
 
 def linkedin_session_dir(username: str | None, kind: str) -> Path:
     return _LINKEDIN_STATE_ROOT / linkedin_account_key(username) / f"{kind}_session"
+
+
+def legacy_linkedin_cookie_path() -> Path:
+    return _LEGACY_COOKIE_PATH
+
+
+def legacy_linkedin_session_dir(kind: str) -> Path:
+    return _LEGACY_SESSION_DIRS[kind]
 
 
 def mask_linkedin_username(username: str | None) -> str:

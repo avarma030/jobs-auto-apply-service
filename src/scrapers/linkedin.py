@@ -48,6 +48,7 @@ from src.config import settings
 from src.models import ExperienceLevel, Job, JobSearchFilter, JobType, WorkMode
 from src.scrapers.base import BaseScraper
 from src.services.linkedin_state import (
+    legacy_linkedin_cookie_path,
     linkedin_cookie_path,
     linkedin_session_dir,
     mask_linkedin_username,
@@ -260,40 +261,57 @@ class LinkedInScraper(BaseScraper):
     def _load_cookies(self) -> dict | None:
         """Load cookies from disk.  Returns None if missing or older than 4 h."""
         self._ensure_linkedin_state()
-        if not self._cookie_path.exists():
-            return None
-        try:
-            data = json.loads(self._cookie_path.read_text())
-            age = time.time() - data.get("saved_at", 0)
-            cookie_owner = str(data.get("username") or "").strip().lower()
-            expected_owner = self._linkedin_identity.strip().lower()
-            if cookie_owner and expected_owner and cookie_owner != expected_owner:
-                logger.info(
-                    "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
-                    f"{mask_linkedin_username(cookie_owner)}"
-                )
-                return None
-            if age > _COOKIE_MAX_AGE_SECONDS:
-                logger.info(f"[LinkedIn] Cached cookies are {age / 3600:.1f}h old — re-warming")
-                return None
-            return data["cookies"]
-        except Exception as exc:
-            logger.warning(f"[LinkedIn] Failed to load cookies: {exc}")
-            return None
+        candidates: list[tuple[Path, str, str | None]] = [
+            (self._cookie_path, "scoped", self._linkedin_identity),
+            (legacy_linkedin_cookie_path(), "legacy", None),
+        ]
+        guest_cookies: dict | None = None
+        for path, source, expected_owner in candidates:
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text())
+                age = time.time() - data.get("saved_at", 0)
+                if age > _COOKIE_MAX_AGE_SECONDS:
+                    logger.info(f"[LinkedIn] Cached cookies are {age / 3600:.1f}h old — re-warming")
+                    continue
+                cookie_owner = str(data.get("username") or "").strip().lower()
+                if expected_owner:
+                    expected = expected_owner.strip().lower()
+                    if cookie_owner and cookie_owner != expected:
+                        logger.info(
+                            "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
+                            f"{mask_linkedin_username(cookie_owner)}"
+                        )
+                        continue
+                cookies = data.get("cookies", {})
+                if self._has_authenticated_cookie(cookies):
+                    if source == "legacy":
+                        logger.warning(
+                            "[LinkedIn] Falling back to legacy shared LinkedIn cookies "
+                            "to preserve authenticated scraping"
+                        )
+                    return cookies
+                if guest_cookies is None:
+                    guest_cookies = cookies
+            except Exception as exc:
+                logger.warning(f"[LinkedIn] Failed to load cookies from {path}: {exc}")
+        return guest_cookies
 
     def _save_cookies(self, cookies: dict) -> None:
         """Persist cookies with a timestamp."""
         self._ensure_linkedin_state()
+        payload = {
+            "saved_at": time.time(),
+            "username": self._linkedin_identity,
+            "cookies": cookies,
+        }
         self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
-        self._cookie_path.write_text(
-            json.dumps(
-                {
-                    "saved_at": time.time(),
-                    "username": self._linkedin_identity,
-                    "cookies": cookies,
-                }
-            )
-        )
+        self._cookie_path.write_text(json.dumps(payload))
+        if self._has_authenticated_cookie(cookies):
+            legacy_path = legacy_linkedin_cookie_path()
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_text(json.dumps(payload))
         logger.debug("[LinkedIn] Cookies saved to disk")
 
     @staticmethod
