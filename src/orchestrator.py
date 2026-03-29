@@ -100,6 +100,14 @@ class Orchestrator:
         counts: dict[str, int] = {}
         for record in pending:
             job = self._record_to_job(record)
+            cover_letter_text: str | None = None
+            if getattr(record, "cover_letter_path", None):
+                cl_path = Path(record.cover_letter_path)
+                if cl_path.exists():
+                    try:
+                        cover_letter_text = cl_path.read_text(encoding="utf-8")
+                    except Exception as exc:
+                        logger.warning(f"Could not read cover letter for job {record.id}: {exc}")
 
             if settings.dry_run:
                 logger.info(f"[DRY RUN] Would apply to {job.title} @ {job.company}")
@@ -111,7 +119,7 @@ class Orchestrator:
                 result = await a.apply(
                     job,
                     tailored_resume_path=record.tailored_resume_path,
-                    cover_letter=None,  # cover letter text not stored in DB — re-read file if needed
+                    cover_letter=cover_letter_text,
                 )
 
             status = result.status
@@ -127,6 +135,7 @@ class Orchestrator:
                 status,
                 confirmation_id=result.confirmation_id,
                 message=result.message,
+                user_id=user_id,
             )
             if result.new_questions:
                 await self._handle_new_questions(result.new_questions)
@@ -354,6 +363,7 @@ class Orchestrator:
                 status,
                 confirmation_id=result.confirmation_id,
                 message=result.message,
+                user_id=user_id,
             )
             if result.new_questions:
                 _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")

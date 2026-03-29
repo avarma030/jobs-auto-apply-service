@@ -20,6 +20,17 @@ from src.config import settings
 # Patches multiple navigator/window properties that headless Chrome exposes.
 _STEALTH_JS = """
 () => {
+    const uaDataBrands = [
+        { brand: 'Not A(Brand', version: '99' },
+        { brand: 'Chromium', version: '145' },
+        { brand: 'Google Chrome', version: '145' },
+    ];
+    const fullVersionList = [
+        { brand: 'Not A(Brand', version: '99.0.0.0' },
+        { brand: 'Chromium', version: '145.0.0.0' },
+        { brand: 'Google Chrome', version: '145.0.0.0' },
+    ];
+
     // Remove webdriver flag
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 
@@ -33,10 +44,49 @@ _STEALTH_JS = """
         get: () => ['en-US', 'en'],
     });
 
+    Object.defineProperty(navigator, 'platform', {
+        get: () => 'Win32',
+    });
+
+    Object.defineProperty(navigator, 'vendor', {
+        get: () => 'Google Inc.',
+    });
+
     // Mask headless Chrome in userAgent string
     const originalUA = navigator.userAgent;
     Object.defineProperty(navigator, 'userAgent', {
         get: () => originalUA.replace('HeadlessChrome', 'Chrome'),
+    });
+
+    const uaData = {
+        brands: uaDataBrands,
+        mobile: false,
+        platform: 'Windows',
+        getHighEntropyValues: async (hints) => {
+            const values = {
+                architecture: 'x86',
+                bitness: '64',
+                brands: uaDataBrands,
+                fullVersionList,
+                mobile: false,
+                model: '',
+                platform: 'Windows',
+                platformVersion: '10.0.0',
+                uaFullVersion: '145.0.0.0',
+                wow64: false,
+            };
+            return Object.fromEntries(hints.map((hint) => [hint, values[hint]]));
+        },
+        toJSON() {
+            return {
+                brands: uaDataBrands,
+                mobile: false,
+                platform: 'Windows',
+            };
+        },
+    };
+    Object.defineProperty(navigator, 'userAgentData', {
+        get: () => uaData,
     });
 
     // Prevent detection via chrome.runtime
@@ -55,8 +105,14 @@ _STEALTH_JS = """
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+    "Chrome/145.0.0.0 Safari/537.36"
 )
+
+_EXTRA_HEADERS = {
+    "sec-ch-ua": '"Not A(Brand";v="99", "Chromium";v="145", "Google Chrome";v="145"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 
 # Realistic viewport sizes to randomise across
 _VIEWPORTS = [
@@ -141,6 +197,7 @@ class BrowserManager:
             # Apply stealth at context level so it covers every document,
             # including iframes and popups (belt-and-suspenders with new_page() below).
             await self._context.add_init_script(_STEALTH_JS)
+            await self._context.set_extra_http_headers(_EXTRA_HEADERS)
         else:
             self._browser = await self._playwright.chromium.launch(
                 headless=self.headless,
@@ -153,6 +210,7 @@ class BrowserManager:
                 user_agent=_UA,
                 ignore_https_errors=True,
                 accept_downloads=True,
+                extra_http_headers=_EXTRA_HEADERS,
             )
 
         self._context.set_default_timeout(self.timeout_ms)

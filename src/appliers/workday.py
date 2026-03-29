@@ -20,7 +20,12 @@ class WorkdayApplier(BaseApplier):
     def can_apply(self, job: Job) -> bool:
         return "myworkdayjobs.com" in (job.url or "") or job.source_board == self.board_slug
 
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(
+        self,
+        job: Job,
+        tailored_resume_path: str | None = None,
+        cover_letter: str | None = None,
+    ) -> ApplicationResult:
         try:
             # TODO:
             # 1. Navigate to Workday job page

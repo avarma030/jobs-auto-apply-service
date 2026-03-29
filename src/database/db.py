@@ -76,9 +76,12 @@ class Database:
             record.easy_apply = job.easy_apply
             record.posted_at = _strip_tz(job.posted_at)
             record.scraped_at = _strip_tz(job.scraped_at)
-            record.application_status = job.application_status
-            record.applied_at = _strip_tz(job.applied_at)
-            record.notes = job.notes
+            if is_new or job.application_status != ApplicationStatus.PENDING:
+                record.application_status = job.application_status
+            if job.applied_at is not None:
+                record.applied_at = _strip_tz(job.applied_at)
+            if job.notes is not None:
+                record.notes = job.notes
 
             await session.commit()
             return record
@@ -182,9 +185,11 @@ class Database:
         status: ApplicationStatus,
         confirmation_id: Optional[str] = None,
         message: Optional[str] = None,
+        user_id: int | None = None,
     ) -> ApplicationRecord:
         async with self.session_factory() as session:
             record = ApplicationRecord(
+                user_id=user_id,
                 job_id=job_id,
                 status=status,
                 confirmation_id=confirmation_id,

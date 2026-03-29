@@ -13,7 +13,12 @@ class LeverApplier(BaseApplier):
     def can_apply(self, job: Job) -> bool:
         return "lever.co" in (job.url or "") or job.source_board == self.board_slug
 
-    async def apply(self, job: Job) -> ApplicationResult:
+    async def apply(
+        self,
+        job: Job,
+        tailored_resume_path: str | None = None,
+        cover_letter: str | None = None,
+    ) -> ApplicationResult:
         try:
             # TODO:
             # 1. Navigate to job.url (jobs.lever.co/...)
