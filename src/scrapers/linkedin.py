@@ -47,6 +47,11 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from src.config import settings
 from src.models import ExperienceLevel, Job, JobSearchFilter, JobType, WorkMode
 from src.scrapers.base import BaseScraper
+from src.services.linkedin_state import (
+    linkedin_cookie_path,
+    linkedin_session_dir,
+    mask_linkedin_username,
+)
 from src.utils.browser import BrowserManager
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -67,10 +72,7 @@ _VOYAGER_JOB_URL = (
 )
 
 # Cookie / session persistence
-_COOKIE_PATH = Path("data/.linkedin_cookies.json")
 _COOKIE_MAX_AGE_SECONDS = 4 * 3600          # re-warm after 4 hours
-_SESSION_DIR = Path("data/.linkedin_scraper_session")    # Playwright persistent profile (warm + search)
-_DETAIL_SESSION_DIR = Path("data/.linkedin_detail_session")  # separate profile for detail browser
 _DETAIL_API_AUTHWALL_BACKOFF_SECONDS = 5 * 60
 
 
@@ -164,6 +166,7 @@ class LinkedInScraper(BaseScraper):
         self._cookies: dict = {}
         self._detail_bm: BrowserManager | None = None  # persistent Playwright for detail pages
         self._detail_api_authwall_backoff_until = 0.0
+        self._ensure_linkedin_state()
 
         # Load cached cookies — warm a fresh session if missing / stale
         cached = self._load_cookies()
@@ -200,6 +203,27 @@ class LinkedInScraper(BaseScraper):
             proxies={"https": proxy, "http": proxy} if proxy else None,
         )
 
+    def _resolve_linkedin_credentials(self) -> tuple[str, str, str]:
+        username = str(self.credentials.get("username") or "").strip()
+        password = str(self.credentials.get("password") or "").strip()
+        source = "profile"
+        if (not username or not password) and settings.linkedin_email:
+            username = settings.linkedin_email.strip()
+            password = (settings.linkedin_password or "").strip()
+            source = "environment"
+        return username, password, source
+
+    def _ensure_linkedin_state(self) -> None:
+        username, password, source = self._resolve_linkedin_credentials()
+        identity = username or "default"
+        self._linkedin_username = username
+        self._linkedin_password = password
+        self._linkedin_identity = identity
+        self._linkedin_credential_source = source
+        self._cookie_path = linkedin_cookie_path(identity)
+        self._session_dir = linkedin_session_dir(identity, "scraper")
+        self._detail_session_dir = linkedin_session_dir(identity, "detail")
+
     def _load_proxies(self) -> list[str]:
         if not settings.use_proxies or not settings.proxy_list_path:
             return []
@@ -235,11 +259,20 @@ class LinkedInScraper(BaseScraper):
 
     def _load_cookies(self) -> dict | None:
         """Load cookies from disk.  Returns None if missing or older than 4 h."""
-        if not _COOKIE_PATH.exists():
+        self._ensure_linkedin_state()
+        if not self._cookie_path.exists():
             return None
         try:
-            data = json.loads(_COOKIE_PATH.read_text())
+            data = json.loads(self._cookie_path.read_text())
             age = time.time() - data.get("saved_at", 0)
+            cookie_owner = str(data.get("username") or "").strip().lower()
+            expected_owner = self._linkedin_identity.strip().lower()
+            if cookie_owner and expected_owner and cookie_owner != expected_owner:
+                logger.info(
+                    "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
+                    f"{mask_linkedin_username(cookie_owner)}"
+                )
+                return None
             if age > _COOKIE_MAX_AGE_SECONDS:
                 logger.info(f"[LinkedIn] Cached cookies are {age / 3600:.1f}h old — re-warming")
                 return None
@@ -250,8 +283,17 @@ class LinkedInScraper(BaseScraper):
 
     def _save_cookies(self, cookies: dict) -> None:
         """Persist cookies with a timestamp."""
-        _COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _COOKIE_PATH.write_text(json.dumps({"saved_at": time.time(), "cookies": cookies}))
+        self._ensure_linkedin_state()
+        self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        self._cookie_path.write_text(
+            json.dumps(
+                {
+                    "saved_at": time.time(),
+                    "username": self._linkedin_identity,
+                    "cookies": cookies,
+                }
+            )
+        )
         logger.debug("[LinkedIn] Cookies saved to disk")
 
     @staticmethod
@@ -279,13 +321,17 @@ class LinkedInScraper(BaseScraper):
         browser profile.
         """
         logger.info("[LinkedIn] Warming session via Playwright (this takes ~15 s) …")
-        creds = self.credentials  # set by BaseScraper from profile.job_board_accounts.linkedin
-        # Resolve credentials: profile UI → environment variables fallback
-        if (not creds.get("username") or not creds.get("password")) and settings.linkedin_email:
-            creds = {
-                "username": settings.linkedin_email,
-                "password": settings.linkedin_password or "",
-            }
+        self._ensure_linkedin_state()
+        creds = {
+            "username": self._linkedin_username,
+            "password": self._linkedin_password,
+        }
+        if creds.get("username"):
+            logger.info(
+                "[LinkedIn] Using "
+                f"{self._linkedin_credential_source} credentials for "
+                f"{mask_linkedin_username(creds['username'])}"
+            )
 
         cookies: dict = {}
         for attempt in range(2):
@@ -294,11 +340,11 @@ class LinkedInScraper(BaseScraper):
                     "[LinkedIn] Login form was not visible — clearing stale scraper session "
                     "dir and retrying with fresh browser profile …"
                 )
-                _clear_session_dir(_SESSION_DIR)
+                _clear_session_dir(self._session_dir)
 
             login_form_found = True  # assume present; set False if wait_for_selector fails
             try:
-                async with BrowserManager(headless=True, user_data_dir=_SESSION_DIR) as bm:
+                async with BrowserManager(headless=True, user_data_dir=self._session_dir) as bm:
                     page = await bm.new_page()
 
                     if creds.get("username") and creds.get("password"):
@@ -621,7 +667,7 @@ class LinkedInScraper(BaseScraper):
         """
         if self._detail_bm is None:
             self._detail_bm = BrowserManager(
-                headless=True, user_data_dir=_DETAIL_SESSION_DIR
+                headless=True, user_data_dir=self._detail_session_dir
             )
             await self._detail_bm.start()
             await self._inject_detail_cookies()
@@ -945,7 +991,7 @@ class LinkedInScraper(BaseScraper):
         logger.info(f"[LinkedIn] Playwright fallback — loading: {search_url}")
         html = ""
         try:
-            async with BrowserManager(headless=True, user_data_dir=_SESSION_DIR) as bm:
+            async with BrowserManager(headless=True, user_data_dir=self._session_dir) as bm:
                 page = await bm.new_page()
                 await page.goto(search_url, wait_until="networkidle", timeout=30_000)
                 await bm.human_pause(2, 3)

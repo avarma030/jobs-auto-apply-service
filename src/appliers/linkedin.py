@@ -52,14 +52,16 @@ from src.services.application_questions import (
     normalize_question_text,
     semantic_yes_no,
 )
+from src.services.linkedin_state import (
+    linkedin_cookie_path,
+    linkedin_session_dir,
+    mask_linkedin_username,
+)
 from src.utils.browser import BrowserManager, BrowserManager as _BM
 
 # ── Cookie / session paths ─────────────────────────────────────────────────────
 
-# Scraper writes warm authenticated cookies here; we reuse them to skip login.
-_COOKIE_PATH = Path("data/.linkedin_cookies.json")
 _COOKIE_MAX_AGE = 4 * 3600          # reuse cookies up to 4 hours old
-_SESSION_DIR   = Path("data/.linkedin_session")  # persistent Playwright profile
 
 # ── URLs ───────────────────────────────────────────────────────────────────────
 
@@ -183,6 +185,35 @@ class LinkedInApplier(BaseApplier):
         self._answered_questions: list[AnsweredQuestion] = []
         self._learned_answers: dict[str, str] = {}
         self._answered_question_index: dict[str, int] = {}
+        self._cookie_path = linkedin_cookie_path(None)
+        self._session_dir = linkedin_session_dir(None, "applier")
+        self._linkedin_username = ""
+        self._linkedin_password = ""
+        self._linkedin_identity = ""
+        self._linkedin_credential_source = "unknown"
+
+    def _resolve_linkedin_credentials(self) -> tuple[str, str, str]:
+        creds = self.profile.job_board_accounts.linkedin
+        username = (creds.username or "").strip() if creds else ""
+        password = (creds.password or "").strip() if creds else ""
+        source = "profile"
+        if (not username or not password) and settings.linkedin_email:
+            username = settings.linkedin_email.strip()
+            password = (settings.linkedin_password or "").strip()
+            source = "environment"
+        return username, password, source
+
+    def _ensure_linkedin_state(self) -> None:
+        username, password, source = self._resolve_linkedin_credentials()
+        identity = username or (self.profile.email or "").strip()
+        if not identity:
+            identity = "default"
+        self._linkedin_username = username
+        self._linkedin_password = password
+        self._linkedin_identity = identity
+        self._linkedin_credential_source = source
+        self._cookie_path = linkedin_cookie_path(identity)
+        self._session_dir = linkedin_session_dir(identity, "applier")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -190,9 +221,10 @@ class LinkedInApplier(BaseApplier):
 
     async def setup(self) -> None:
         await super().setup()
+        self._ensure_linkedin_state()
         # 60 s timeout — LinkedIn pages can be slow; 30 s caused spurious failures.
         self._bm = BrowserManager(
-            user_data_dir=_SESSION_DIR,
+            user_data_dir=self._session_dir,
             timeout_ms=60,          # passed to BrowserManager as seconds → *1000 inside
         )
         await self._bm.start()
@@ -458,13 +490,22 @@ class LinkedInApplier(BaseApplier):
         and inject them into the applier's browser context so we can skip the
         full login form flow. Returns True if li_at was successfully injected.
         """
-        if not _COOKIE_PATH.exists():
+        self._ensure_linkedin_state()
+        if not self._cookie_path.exists():
             logger.debug("[LinkedIn] No scraper cookie file found — will log in fresh")
             return False
         try:
-            data = json.loads(_COOKIE_PATH.read_text())
+            data = json.loads(self._cookie_path.read_text())
             age = time.time() - data.get("saved_at", 0)
             cookies = data.get("cookies", {})
+            cookie_owner = str(data.get("username") or "").strip().lower()
+            expected_owner = self._linkedin_identity.strip().lower()
+            if cookie_owner and expected_owner and cookie_owner != expected_owner:
+                logger.info(
+                    "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
+                    f"{mask_linkedin_username(cookie_owner)}"
+                )
+                return False
             if not cookies.get("li_at"):
                 logger.debug("[LinkedIn] Scraper cookies present but no li_at — skipping injection")
                 return False
@@ -523,15 +564,15 @@ class LinkedInApplier(BaseApplier):
         3. Save fresh cookies back to disk for the next run.
         """
         page = self._page
-
-        # ── 1. Resolve credentials ──────────────────────────────────────────
-        # Priority: profile job_board_accounts → LINKEDIN_EMAIL/PASSWORD env vars
-        creds = self.profile.job_board_accounts.linkedin
-        username = (creds.username or "").strip() if creds else ""
-        password = (creds.password or "").strip() if creds else ""
-        if (not username or not password) and settings.linkedin_email:
-            username = settings.linkedin_email.strip()
-            password = (settings.linkedin_password or "").strip()
+        self._ensure_linkedin_state()
+        username = self._linkedin_username
+        password = self._linkedin_password
+        credential_source = self._linkedin_credential_source
+        if username:
+            masked_username = mask_linkedin_username(username)
+            self._report_progress(
+                f"[LinkedIn][Auth] Using {credential_source} credentials for {masked_username}"
+            )
 
         # ── 2. Inject warm scraper cookies ──────────────────────────────────
         await self._inject_scraper_cookies()
@@ -559,7 +600,9 @@ class LinkedInApplier(BaseApplier):
             return
 
         logger.info(f"[LinkedIn] Logging in as {username} …")
-        self._report_progress(f"[LinkedIn][Auth] Logging in as {username}")
+        self._report_progress(
+            f"[LinkedIn][Auth] Logging in as {mask_linkedin_username(username)}"
+        )
         try:
             await page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
@@ -652,9 +695,15 @@ class LinkedInApplier(BaseApplier):
             try:
                 raw = await page.context.cookies("https://www.linkedin.com")
                 fresh = {c["name"]: c["value"] for c in raw}
-                _COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                _COOKIE_PATH.write_text(
-                    json.dumps({"saved_at": time.time(), "cookies": fresh})
+                self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
+                self._cookie_path.write_text(
+                    json.dumps(
+                        {
+                            "saved_at": time.time(),
+                            "username": self._linkedin_identity,
+                            "cookies": fresh,
+                        }
+                    )
                 )
                 logger.info("[LinkedIn] Fresh session cookies saved to disk")
             except Exception as exc:
@@ -1152,6 +1201,26 @@ class LinkedInApplier(BaseApplier):
             field_type = "number" if input_type in {"number", "range"} else "text"
             current_val = await inp.input_value()
             if current_val.strip():
+                override_value = self._get_prefill_override_value(
+                    label,
+                    current_val,
+                    field_type=field_type,
+                )
+                if override_value is not None:
+                    prepared_override = self._prepare_text_input_value(
+                        label,
+                        override_value,
+                        field_type=field_type,
+                        input_type=input_type,
+                        job=job,
+                    )
+                    if prepared_override is not None:
+                        await inp.fill("")
+                        await _BM.human_type(inp, prepared_override)
+                        await self._finalize_text_input(page, inp)
+                        self._remember_answer(label, prepared_override)
+                        self._record_answer(label, prepared_override, "profile", field_type)
+                        continue
                 if label:
                     self._record_prefilled_answer(label, current_val, field_type)
                 continue  # already filled
@@ -1217,6 +1286,15 @@ class LinkedInApplier(BaseApplier):
             if not await sel.is_visible() or not await sel.is_enabled():
                 continue
             label = await self._get_field_label(page, sel)
+            options = []
+            option_elements = await sel.locator("option").all()
+            for option in option_elements:
+                option_label = (await option.inner_text()).strip()
+                option_value = (await option.get_attribute("value") or "").strip()
+                candidate = option_label or option_value
+                if candidate and candidate.lower() != "select an option":
+                    options.append(candidate)
+
             current_val = await sel.input_value()
             if current_val and current_val not in ("", "Select an option"):
                 selected_label = current_val
@@ -1228,18 +1306,33 @@ class LinkedInApplier(BaseApplier):
                             selected_label = candidate
                 except Exception:
                     pass
+                override_value = self._get_prefill_override_value(
+                    label,
+                    selected_label,
+                    field_type="select",
+                    options=options,
+                )
+                if override_value is not None:
+                    try:
+                        await sel.select_option(value=str(override_value))
+                    except Exception:
+                        try:
+                            await sel.select_option(label=str(override_value))
+                        except Exception:
+                            logger.debug(
+                                f"[LinkedIn] Could not override '{label}' to '{override_value}'"
+                            )
+                        else:
+                            self._remember_answer(label, override_value)
+                            self._record_answer(label, override_value, "profile", "select")
+                            continue
+                    else:
+                        self._remember_answer(label, override_value)
+                        self._record_answer(label, override_value, "profile", "select")
+                        continue
                 if label:
                     self._record_prefilled_answer(label, selected_label, "select")
                 continue
-
-            options = []
-            option_elements = await sel.locator("option").all()
-            for option in option_elements:
-                option_label = (await option.inner_text()).strip()
-                option_value = (await option.get_attribute("value") or "").strip()
-                candidate = option_label or option_value
-                if candidate and candidate.lower() != "select an option":
-                    options.append(candidate)
 
             value, source = await self._resolve_answer(label, "select", options=options)
             if value is not None and source is not None:
@@ -1255,6 +1348,55 @@ class LinkedInApplier(BaseApplier):
                 self._record_answer(label, value, source, "select")
             elif label:
                 self._mark_unanswered(label, "select", options=options)
+
+    def _get_prefill_override_value(
+        self,
+        label: str,
+        current_value: str,
+        *,
+        field_type: str,
+        options: list[str] | None = None,
+    ) -> str | None:
+        normalized_label = normalize_question_text(label).lower()
+        if not normalized_label:
+            return None
+        if not any(
+            token in normalized_label
+            for token in (
+                "first name",
+                "given name",
+                "last name",
+                "surname",
+                "family name",
+                "email",
+                "phone",
+                "mobile",
+                "location",
+                "city",
+                "state",
+                "province",
+                "zip",
+                "postal",
+                "country code",
+                "country",
+            )
+        ):
+            return None
+
+        expected = self._clean_answer(self._infer_value_from_label(label))
+        current = self._clean_answer(current_value)
+        if expected is None or current is None:
+            return None
+
+        override_value = expected
+        if field_type == "select":
+            override_value = self._match_answer_to_options(expected, options or [])
+            if override_value is None:
+                return None
+
+        if self._normalize_choice(current) == self._normalize_choice(override_value):
+            return None
+        return override_value
 
     async def _fill_radio_buttons(self, page: Page) -> None:
         fieldsets = await page.locator(self._modal_descendants(_RADIO_GROUPS)).all()
@@ -1696,6 +1838,8 @@ class LinkedInApplier(BaseApplier):
             return p.last_name
         if "email" in label_lower:
             return p.email
+        if "country code" in label_lower and "phone" in label_lower:
+            return p.address.country if p.address else ""
         if "phone" in label_lower or "mobile" in label_lower:
             return p.phone or ""
         if "linkedin" in label_lower:

@@ -4,6 +4,8 @@ Tests focus on HTML parsing logic and parameter building — no real HTTP calls.
 """
 from __future__ import annotations
 
+import json
+import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -92,6 +94,47 @@ def make_scraper() -> LinkedInScraper:
     scraper._warm_attempted = False
     scraper._detail_api_authwall_backoff_until = 0.0
     return scraper
+
+
+def test_ensure_linkedin_state_scopes_paths_to_credentials():
+    scraper = make_scraper()
+    scraper.credentials = {
+        "username": "rucha@example.com",
+        "password": "secret",
+    }
+
+    scraper._ensure_linkedin_state()
+
+    cookie_path = str(scraper._cookie_path).replace("\\", "/")
+    session_dir = str(scraper._session_dir).replace("\\", "/")
+    detail_dir = str(scraper._detail_session_dir).replace("\\", "/")
+    assert "data/linkedin/" in cookie_path
+    assert "rucha-example-com" in cookie_path
+    assert cookie_path.endswith("/cookies.json")
+    assert session_dir.endswith("/scraper_session")
+    assert detail_dir.endswith("/detail_session")
+
+
+def test_load_cookies_ignores_different_account_owner(tmp_path):
+    scraper = make_scraper()
+    scraper.credentials = {
+        "username": "rucha@example.com",
+        "password": "secret",
+    }
+    scraper._ensure_linkedin_state()
+    scraper._cookie_path = tmp_path / "cookies.json"
+    scraper._cookie_path.write_text(
+        json.dumps(
+            {
+                "saved_at": time.time(),
+                "username": "akshay@example.com",
+                "cookies": {"li_at": "old-cookie"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert scraper._load_cookies() is None
 
 
 # ── Tests: _parse_job_cards ───────────────────────────────────────────────────

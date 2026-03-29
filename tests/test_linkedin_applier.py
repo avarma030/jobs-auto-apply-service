@@ -405,9 +405,11 @@ async def test_inject_scraper_cookies_keeps_jsessionid_js_readable(tmp_path):
     applier._bm = MagicMock()
     applier._bm._context = MagicMock()
     applier._bm._context.add_cookies = AsyncMock()
+    applier._ensure_linkedin_state = MagicMock()
+    applier._cookie_path = cookie_path
+    applier._linkedin_identity = "jane@example.com"
 
-    with patch.object(linkedin_mod, "_COOKIE_PATH", cookie_path):
-        injected = await applier._inject_scraper_cookies()
+    injected = await applier._inject_scraper_cookies()
 
     assert injected is True
     applier._bm._context.add_cookies.assert_awaited_once()
@@ -415,6 +417,27 @@ async def test_inject_scraper_cookies_keeps_jsessionid_js_readable(tmp_path):
     by_name = {cookie["name"]: cookie for cookie in cookies}
     assert by_name["li_at"]["httpOnly"] is True
     assert by_name["JSESSIONID"]["httpOnly"] is False
+
+
+def test_ensure_linkedin_state_scopes_paths_to_profile_credentials():
+    profile = make_profile(
+        job_board_accounts=JobBoardAccounts(
+            linkedin=JobBoardCredentials(
+                username="rucha@example.com",
+                password="secret",
+            )
+        )
+    )
+    applier = make_applier(profile)
+
+    applier._ensure_linkedin_state()
+
+    cookie_path = str(applier._cookie_path).replace("\\", "/")
+    session_dir = str(applier._session_dir).replace("\\", "/")
+    assert "data/linkedin/" in cookie_path
+    assert "rucha-example-com" in cookie_path
+    assert cookie_path.endswith("/cookies.json")
+    assert session_dir.endswith("/applier_session")
 
 
 @pytest.mark.asyncio
@@ -761,6 +784,49 @@ def test_record_answer_logs_each_question_only_once_per_application():
     ) == 1
 
 
+def test_get_prefill_override_value_replaces_stale_prefilled_email():
+    profile = make_profile(
+        first_name="Rucha",
+        last_name="Varma",
+        email="rucha@example.com",
+    )
+    applier = make_applier(profile)
+
+    assert (
+        applier._get_prefill_override_value(
+            "Email address",
+            "akshay@example.com",
+            field_type="text",
+        )
+        == "rucha@example.com"
+    )
+    assert (
+        applier._get_prefill_override_value(
+            "First name",
+            "Akshay",
+            field_type="text",
+        )
+        == "Rucha"
+    )
+
+
+def test_get_prefill_override_value_maps_phone_country_code_select_to_profile_country():
+    profile = make_profile(
+        address=Address(city="Frankfurt am Main", country="Germany"),
+        phone="+49 17669099987",
+    )
+    applier = make_applier(profile)
+
+    override = applier._get_prefill_override_value(
+        "Phone country code",
+        "Ireland (+353)",
+        field_type="select",
+        options=["Ireland (+353)", "Germany (+49)"],
+    )
+
+    assert override == "Germany (+49)"
+
+
 @pytest.mark.asyncio
 async def test_resolve_answer_does_not_emit_duplicate_request_progress_logs():
     applier = make_applier()
@@ -797,6 +863,11 @@ class TestInferValueFromLabel:
     def test_phone(self):
         applier = make_applier()
         assert applier._infer_value_from_label("Phone number") == "+1-555-123-4567"
+
+    def test_phone_country_code(self):
+        profile = make_profile(address=Address(city="Frankfurt am Main", country="Germany"))
+        applier = make_applier(profile)
+        assert applier._infer_value_from_label("Phone country code") == "Germany"
 
     def test_linkedin_url(self):
         applier = make_applier()
