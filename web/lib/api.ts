@@ -60,7 +60,7 @@ export const jobs = {
     request<Job>(`/jobs/${id}/status`, { method: "PUT", body: JSON.stringify({ status }) }),
   scrape: (body: {
     keywords: string[];
-    location?: string;
+    location: string;
     work_modes?: string[];
     job_types?: string[];
     experience_levels?: string[];
@@ -69,6 +69,7 @@ export const jobs = {
     boards: string[];
     max_age_days?: number;
     max_jobs?: number;
+    tailor_documents?: boolean;
     min_match_score?: number;
   }) =>
     request<{ run_id: string }>("/jobs/scrape", { method: "POST", body: JSON.stringify(body) }),

@@ -313,6 +313,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             user_id=user_id,
             run_id=run_id,
             progress_callback=_progress,
+            tailor_documents=req.tailor_documents,
         )
         total_found = counts.get("scraped", (
             counts.get("applied", 0)

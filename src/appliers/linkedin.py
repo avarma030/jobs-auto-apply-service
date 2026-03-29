@@ -39,9 +39,19 @@ from typing import Optional
 from loguru import logger
 from playwright.async_api import Locator, Page, TimeoutError as PWTimeoutError
 
-from src.appliers.base import ApplicationResult, BaseApplier
+from src.appliers.base import (
+    AnsweredQuestion,
+    ApplicationQuestionPrompt,
+    ApplicationResult,
+    BaseApplier,
+)
 from src.config import settings
 from src.models import Job, UserProfile
+from src.services.application_questions import (
+    normalize_question_key,
+    normalize_question_text,
+    semantic_yes_no,
+)
 from src.utils.browser import BrowserManager, BrowserManager as _BM
 
 # ── Cookie / session paths ─────────────────────────────────────────────────────
@@ -79,6 +89,10 @@ _FOLLOW_PROMPT_DISMISS = (
     "button[aria-label='Dismiss'], "
     "button[aria-label='Got it'], "
     "button.artdeco-modal__dismiss"
+)
+_AUTOCOMPLETE_RESULTS = (
+    "div[data-test-single-typeahead-entity-form-search-result='true'], "
+    ".search-typeahead-v2__hit--autocomplete"
 )
 
 # Job page — aria-label based selectors survive LinkedIn UI/class renames
@@ -134,6 +148,24 @@ _RESUME_CARD = (
     "label.jobs-document-upload-redesign-card, "
     "li.jobs-resume-picker__resume"
 )
+_DOCUMENT_UPLOAD_HINTS = (
+    "resume",
+    "cv",
+    "curriculum vitae",
+    "cover letter",
+    "document",
+    "attachment",
+    "portfolio",
+)
+_IMAGE_UPLOAD_HINTS = (
+    "photo",
+    "picture",
+    "image",
+    "avatar",
+    "headshot",
+    "profile picture",
+    "profile photo",
+)
 
 
 class LinkedInApplier(BaseApplier):
@@ -147,7 +179,10 @@ class LinkedInApplier(BaseApplier):
         self._bm: BrowserManager | None = None
         self._page: Page | None = None
         self._logged_in = False
-        self._unknown_questions: list[str] = []
+        self._unknown_question_prompts: dict[str, ApplicationQuestionPrompt] = {}
+        self._answered_questions: list[AnsweredQuestion] = []
+        self._learned_answers: dict[str, str] = {}
+        self._answered_question_index: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -191,7 +226,10 @@ class LinkedInApplier(BaseApplier):
             self._logged_in = False
             await self._ensure_logged_in()
 
-        self._unknown_questions = []
+        self._unknown_question_prompts = {}
+        self._answered_questions = []
+        self._learned_answers = {}
+        self._answered_question_index = {}
         try:
             # Note: we do NOT gate on job.easy_apply here because the DB flag is often
             # wrong (Voyager API scrape sets description but not easy_apply).
@@ -206,9 +244,209 @@ class LinkedInApplier(BaseApplier):
             await self._bm.screenshot(self._page, f"error_{job.external_id}")
             result = self._fail(job, str(exc))
 
-        result.new_questions = list(dict.fromkeys(self._unknown_questions))
-        self._unknown_questions = []
+        result.new_question_prompts = list(self._unknown_question_prompts.values())
+        result.new_questions = [prompt.question for prompt in result.new_question_prompts]
+        result.answered_questions = list(self._answered_questions)
+        result.learned_answers = dict(self._learned_answers)
+        self._unknown_question_prompts = {}
+        self._answered_questions = []
+        self._learned_answers = {}
+        self._answered_question_index = {}
         return result
+
+    def _report_progress(self, message: str, level: str = "info") -> None:
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(message)
+        self._emit_progress(message)
+
+    @staticmethod
+    def _preview_answer(answer: str, max_len: int = 100) -> str:
+        compact = " ".join(str(answer).split())
+        if len(compact) <= max_len:
+            return compact
+        return f"{compact[: max_len - 3]}..."
+
+    @staticmethod
+    def _clean_answer(answer: str | None) -> str | None:
+        if answer is None:
+            return None
+        cleaned = str(answer).strip()
+        return cleaned or None
+
+    @staticmethod
+    def _summarize_exception(exc: Exception) -> str:
+        summary = " ".join(str(exc).splitlines()[:1]).strip()
+        return summary or exc.__class__.__name__
+
+    @staticmethod
+    def _normalize_choice(text: str) -> str:
+        return normalize_question_key(text)
+
+    def _match_answer_to_options(self, answer: str, options: list[str]) -> str | None:
+        if not options:
+            return answer
+
+        cleaned_answer = self._clean_answer(answer)
+        if cleaned_answer is None:
+            return None
+
+        normalized_answer = self._normalize_choice(cleaned_answer)
+        for option in options:
+            normalized_option = self._normalize_choice(option)
+            if normalized_answer == normalized_option:
+                return option
+        for option in options:
+            normalized_option = self._normalize_choice(option)
+            if normalized_answer and (
+                normalized_answer in normalized_option or normalized_option in normalized_answer
+            ):
+                return option
+
+        semantic_answer = semantic_yes_no(cleaned_answer)
+        if semantic_answer is not None:
+            for option in options:
+                if semantic_yes_no(option) == semantic_answer:
+                    return option
+        return None
+
+    def _remember_answer(self, question: str, answer: str) -> None:
+        normalized_question = normalize_question_text(question)
+        if not normalized_question:
+            return
+        existing = self.profile.custom_answers.get(normalized_question)
+        if existing == answer:
+            return
+        self.profile.custom_answers[normalized_question] = answer
+        self._learned_answers[normalized_question] = answer
+
+    def _record_answer(self, question: str, answer: str, source: str, field_type: str) -> None:
+        normalized_question = normalize_question_text(question)
+        cleaned_answer = self._clean_answer(answer)
+        if not normalized_question or cleaned_answer is None:
+            return
+
+        existing_index = self._answered_question_index.get(normalized_question)
+        updated_entry = AnsweredQuestion(
+            question=normalized_question,
+            answer=cleaned_answer,
+            source=source,
+            field_type=field_type,
+        )
+        if existing_index is not None:
+            existing = self._answered_questions[existing_index]
+            if existing.answer == cleaned_answer:
+                return
+            self._answered_questions[existing_index] = updated_entry
+            return
+
+        self._answered_question_index[normalized_question] = len(self._answered_questions)
+        self._answered_questions.append(updated_entry)
+        self._report_progress(
+            f"[LinkedIn][Question][{source}] {normalized_question} -> {self._preview_answer(cleaned_answer)}"
+        )
+
+    def _record_prefilled_answer(self, question: str, answer: str, field_type: str) -> None:
+        cleaned_answer = self._clean_answer(answer)
+        if cleaned_answer is None:
+            return
+        self._record_answer(question, cleaned_answer, "prefilled", field_type)
+
+    async def _resolve_answer(
+        self,
+        label: str,
+        field_type: str,
+        options: list[str] | None = None,
+    ) -> tuple[str | None, str | None]:
+        question = normalize_question_text(label)
+        if not question:
+            return None, None
+
+        choice_options = [
+            cleaned_option
+            for option in (options or [])
+            if (cleaned_option := self._clean_answer(option)) is not None
+        ]
+
+        saved_answer = self._clean_answer(self._answer_for_label(question))
+        if saved_answer is not None:
+            matched = self._match_answer_to_options(saved_answer, choice_options)
+            if choice_options and matched is None:
+                logger.debug(
+                    f"[LinkedIn] Saved answer for '{question}' did not match options: {choice_options}"
+                )
+            else:
+                answer = matched or saved_answer
+                self._remember_answer(question, answer)
+                return answer, "saved"
+
+        inferred_answer = self._clean_answer(self._infer_value_from_label(question))
+        if inferred_answer is not None:
+            matched = self._match_answer_to_options(inferred_answer, choice_options)
+            if choice_options and matched is None:
+                logger.debug(
+                    f"[LinkedIn] Inferred answer for '{question}' did not match options: {choice_options}"
+                )
+            else:
+                answer = matched or inferred_answer
+                self._remember_answer(question, answer)
+                return answer, "inferred"
+
+        resolver = getattr(self, "answer_resolver", None)
+        if resolver is None:
+            return None, None
+
+        suggested_answers = await resolver(
+            [ApplicationQuestionPrompt(question=question, field_type=field_type, options=choice_options)]
+        )
+        normalized_suggestions = {
+            normalize_question_key(raw_question): self._clean_answer(raw_answer)
+            for raw_question, raw_answer in suggested_answers.items()
+        }
+        suggested_answer = self._clean_answer(suggested_answers.get(question))
+        if suggested_answer is None:
+            suggested_answer = normalized_suggestions.get(normalize_question_key(question))
+        if suggested_answer is None:
+            return None, None
+
+        matched = self._match_answer_to_options(suggested_answer, choice_options)
+        if choice_options and matched is None:
+            logger.debug(
+                f"[LinkedIn] AI answer for '{question}' did not match options: {choice_options}"
+            )
+            return None, None
+
+        answer = matched or suggested_answer
+        self._remember_answer(question, answer)
+        return answer, "ai"
+
+    def _mark_unanswered(
+        self,
+        question: str,
+        field_type: str,
+        options: list[str] | None = None,
+    ) -> None:
+        normalized_question = normalize_question_text(question)
+        if not normalized_question:
+            return
+        normalized_options = [
+            cleaned_option
+            for option in (options or [])
+            if (cleaned_option := self._clean_answer(option)) is not None
+        ]
+        if normalized_question in self._answered_question_index:
+            return
+        if normalized_question in self._unknown_question_prompts:
+            return
+        self._unknown_question_prompts[normalized_question] = ApplicationQuestionPrompt(
+            question=normalized_question,
+            field_type=field_type,
+            options=normalized_options,
+        )
+        self._report_progress(
+            f"[LinkedIn][Question][unanswered] Could not determine an answer for "
+            f"'{normalized_question}' ({field_type})",
+            level="warning",
+        )
 
     # ------------------------------------------------------------------
     # Session / login helpers
@@ -231,9 +469,8 @@ class LinkedInApplier(BaseApplier):
                 logger.debug("[LinkedIn] Scraper cookies present but no li_at — skipping injection")
                 return False
             if age > _COOKIE_MAX_AGE:
-                logger.info(
-                    f"[LinkedIn] Scraper cookies are {age / 3600:.1f}h old - older than preferred, "
-                    "but still attempting reuse"
+                self._report_progress(
+                    f"[LinkedIn][Auth] Scraper cookies are {age / 3600:.1f}h old - attempting reuse"
                 )
             # Convert flat dict → Playwright cookie objects
             pw_cookies = [
@@ -252,9 +489,8 @@ class LinkedInApplier(BaseApplier):
                 for k, v in cookies.items()
             ]
             await self._bm._context.add_cookies(pw_cookies)
-            logger.info(
-                f"[LinkedIn] Injected {len(pw_cookies)} warm scraper cookies "
-                f"({age / 60:.0f} min old, li_at present)"
+            self._report_progress(
+                f"[LinkedIn][Auth] Injected {len(pw_cookies)} warm scraper cookies ({age / 60:.0f} min old)"
             )
             return True
         except Exception as exc:
@@ -308,6 +544,7 @@ class LinkedInApplier(BaseApplier):
             logger.warning(f"[LinkedIn] Feed navigation failed: {exc}")
 
         if await self._is_logged_in(page):
+            self._report_progress("[LinkedIn][Auth] Session active")
             logger.info("[LinkedIn] Session active — already logged in ✓")
             self._logged_in = True
             return
@@ -322,6 +559,7 @@ class LinkedInApplier(BaseApplier):
             return
 
         logger.info(f"[LinkedIn] Logging in as {username} …")
+        self._report_progress(f"[LinkedIn][Auth] Logging in as {username}")
         try:
             await page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
@@ -332,6 +570,7 @@ class LinkedInApplier(BaseApplier):
         # If already redirected away from /login, check whether we're authenticated
         if "/login" not in page.url and "/checkpoint" not in page.url:
             if await self._is_logged_in(page):
+                self._report_progress("[LinkedIn][Auth] Persistent profile session detected")
                 logger.info("[LinkedIn] Persistent profile session detected — already logged in ✓")
                 self._logged_in = True
                 return
@@ -440,11 +679,13 @@ class LinkedInApplier(BaseApplier):
         page = self._page
         self._tailored_resume_path = tailored_resume_path
         self._cover_letter_text = cover_letter
+        self._report_progress(f"[LinkedIn][Apply] Starting Easy Apply for {job.title} @ {job.company}")
         logger.info(f"[LinkedIn] Easy Apply → {job.title} @ {job.company}")
 
         # Navigate to job page — normalize locale subdomains first (safety net for
         # URLs stored in DB before the scraper fix, e.g. de.linkedin.com → www.linkedin.com)
         job_url = re.sub(r"https://[a-z]{2}\.linkedin\.com/", "https://www.linkedin.com/", job.url)
+        self._report_progress(f"[LinkedIn][Apply] Opening job page: {job_url}")
         try:
             await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
@@ -453,6 +694,7 @@ class LinkedInApplier(BaseApplier):
 
         # Detect mid-run session expiry
         if "/login" in page.url or "/authwall" in page.url:
+            self._report_progress("[LinkedIn][Auth] Redirected to login mid-run")
             logger.info("[LinkedIn] Redirected to login mid-run — re-authenticating …")
             await self._ensure_logged_in()
             await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
@@ -509,6 +751,7 @@ class LinkedInApplier(BaseApplier):
         except PWTimeoutError:
             await self._bm.screenshot(page, f"modal_timeout_{job.external_id}")
             return self._fail(job, "Easy Apply modal did not open (timeout)")
+        self._report_progress("[LinkedIn][Apply] Easy Apply modal opened")
         logger.debug("[LinkedIn] Easy Apply modal opened")
 
         # Step through the multi-page modal
@@ -520,16 +763,23 @@ class LinkedInApplier(BaseApplier):
             await asyncio.sleep(random.uniform(0.6, 1.0))
 
             step_label = await self._get_step_label(page)
+            self._report_progress(
+                f"[LinkedIn][Step] {step + 1}{': ' + step_label if step_label else ''}"
+            )
             logger.info(f"[LinkedIn] Modal step {step + 1}{': ' + step_label if step_label else ''}")
 
             # Final step: submit button is now visible
             submit = await self._find_submit_button(page)
             if submit:
                 await self._bm.screenshot(page, f"pre_submit_{job.external_id}")
-                await submit.click()
+                self._report_progress("[LinkedIn][Submit] Submitting application")
+                await self._click_modal_button(page, submit, "submit")
                 await asyncio.sleep(2)
                 await self._bm.screenshot(page, f"post_submit_{job.external_id}")
                 logger.info(f"[LinkedIn] ✓ Application submitted: {job.title} @ {job.company}")
+                self._report_progress(
+                    f"[LinkedIn][Submit] Application submitted for {job.title} @ {job.company}"
+                )
                 return self._ok(job)
 
             # Fill all visible fields on this modal page
@@ -539,6 +789,10 @@ class LinkedInApplier(BaseApplier):
             error_el = page.locator(_ERROR_MSG).first
             if await error_el.count() > 0:
                 error_text = await error_el.inner_text()
+                self._report_progress(
+                    f"[LinkedIn][Validation] Step {step + 1} error: {error_text}",
+                    level="warning",
+                )
                 logger.warning(f"[LinkedIn] Validation error at step {step + 1}: {error_text}")
                 await self._bm.screenshot(page, f"form_error_{job.external_id}_{step}")
                 return self._fail(job, f"Form validation error: {error_text}")
@@ -556,10 +810,15 @@ class LinkedInApplier(BaseApplier):
             # Advance to next step
             next_btn = await self._find_next_button(page)
             if next_btn and await next_btn.is_enabled():
-                await next_btn.click()
+                self._report_progress("[LinkedIn][Step] Advancing to the next step")
+                await self._click_modal_button(page, next_btn, "next step")
                 # Give the modal animation time to transition before the next fill pass
                 await asyncio.sleep(0.5)
             else:
+                self._report_progress(
+                    f"[LinkedIn][Step] Could not advance past step {step + 1}",
+                    level="warning",
+                )
                 logger.warning(f"[LinkedIn] No Next/Submit button at step {step + 1}")
                 await self._bm.screenshot(page, f"no_next_{job.external_id}_{step}")
                 return self._fail(job, f"Stuck at modal step {step + 1} — no Next button")
@@ -572,7 +831,24 @@ class LinkedInApplier(BaseApplier):
             try:
                 el = page.locator(selector.strip()).first
                 if await el.count() > 0 and await el.is_visible():
-                    await el.click()
+                    is_apply_modal_close = await el.evaluate(
+                        """(node) => {
+                            const applyModal = node.closest(
+                                'div.jobs-easy-apply-modal, div.jobs-apply-modal'
+                            );
+                            if (applyModal) {
+                                return true;
+                            }
+                            const dialog = node.closest('div[role="dialog"]');
+                            if (!dialog) {
+                                return false;
+                            }
+                            return /save this application/i.test(dialog.innerText || '');
+                        }"""
+                    )
+                    if is_apply_modal_close:
+                        continue
+                    await el.click(timeout=2_000, force=True)
                     await asyncio.sleep(0.3)
             except Exception:
                 pass
@@ -641,6 +917,201 @@ class LinkedInApplier(BaseApplier):
             modal.locator(_NEXT_BTN),
         ])
 
+    def _prepare_text_input_value(
+        self,
+        label: str,
+        value: str,
+        *,
+        field_type: str,
+        input_type: str,
+        job: Job,
+    ) -> str | None:
+        cleaned_value = self._clean_answer(value)
+        if cleaned_value is None:
+            return None
+        if field_type != "number" and input_type not in {"number", "range"}:
+            return cleaned_value
+
+        numeric_value = self._extract_numeric_text(cleaned_value)
+        if numeric_value is None:
+            numeric_value = self._infer_numeric_value_from_label(label, job)
+        return numeric_value
+
+    @staticmethod
+    def _extract_numeric_text(value: str) -> str | None:
+        normalized = value.replace(",", "").strip()
+        match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+        if not match:
+            return None
+        return match.group(0)
+
+    def _infer_numeric_value_from_label(self, label: str, job: Job) -> str | None:
+        normalized_label = normalize_question_text(label).lower()
+
+        if any(
+            phrase in normalized_label
+            for phrase in (
+                "years of experience",
+                "years experience",
+                "how many years",
+            )
+        ):
+            if self.profile.years_of_experience is not None:
+                return str(self.profile.years_of_experience)
+
+        if any(
+            phrase in normalized_label
+            for phrase in (
+                "salary expectation",
+                "salary expected",
+                "expected salary",
+                "salary requirement",
+                "compensation expectation",
+                "desired compensation",
+                "desired salary",
+                "annual pay",
+                "expected pay",
+            )
+        ):
+            numeric_candidates = [
+                float(candidate)
+                for candidate in (job.salary_min, job.salary_max)
+                if candidate is not None and float(candidate) > 0
+            ]
+            if numeric_candidates:
+                if len(numeric_candidates) == 2:
+                    return str(int(round(sum(numeric_candidates) / 2)))
+                return str(int(round(numeric_candidates[0])))
+
+        return None
+
+    async def _finalize_text_input(self, page: Page, inp: Locator) -> None:
+        try:
+            await inp.evaluate(
+                """(el) => {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    if (typeof el.blur === 'function') {
+                        el.blur();
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+        if await self._autocomplete_overlay_visible(page):
+            try:
+                await self._select_autocomplete_suggestion(page)
+            except Exception:
+                pass
+
+        await self._dismiss_autocomplete_overlays(page)
+
+    async def _autocomplete_overlay_visible(self, page: Page) -> bool:
+        for selector in _AUTOCOMPLETE_RESULTS.split(", "):
+            try:
+                locator = page.locator(selector)
+                if await locator.count() > 0 and await locator.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _select_autocomplete_suggestion(self, page: Page) -> bool:
+        for selector in _AUTOCOMPLETE_RESULTS.split(", "):
+            try:
+                options = page.locator(selector)
+                if await options.count() == 0 or not await options.first.is_visible():
+                    continue
+                await options.first.click(timeout=2_000, force=True)
+                await asyncio.sleep(0.2)
+                return True
+            except Exception:
+                continue
+        return False
+
+    async def _dismiss_autocomplete_overlays(self, page: Page) -> None:
+        if not await self._autocomplete_overlay_visible(page):
+            return
+        if await self._select_autocomplete_suggestion(page):
+            return
+        try:
+            await page.evaluate(
+                """() => {
+                    const active = document.activeElement;
+                    if (active instanceof HTMLElement) {
+                        active.blur();
+                    }
+                }"""
+            )
+        except Exception:
+            pass
+
+    async def _dismiss_save_application_prompt(self, page: Page) -> bool:
+        try:
+            dialog = page.locator("div[role='dialog']").filter(
+                has_text=re.compile(r"save this application", re.IGNORECASE)
+            ).first
+            if await dialog.count() == 0 or not await dialog.is_visible():
+                return False
+
+            candidates = [
+                dialog.locator("button[aria-label='Dismiss']").first,
+                dialog.locator("button[aria-label='Close']").first,
+                dialog.locator("button.artdeco-modal__dismiss").first,
+            ]
+            close_button = await self._first_visible(candidates)
+            if close_button is None:
+                return False
+
+            await close_button.click(timeout=2_000, force=True)
+            await asyncio.sleep(0.3)
+            still_visible = await dialog.count() > 0 and await dialog.is_visible()
+            if not still_visible:
+                logger.debug("[LinkedIn] Closed save-application confirmation dialog")
+                return True
+        except Exception as exc:
+            logger.debug(
+                "[LinkedIn] Save-application confirmation dismissal failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+        return False
+
+    async def _click_modal_button(self, page: Page, button: Locator, action_name: str) -> None:
+        await self._dismiss_prompts(page)
+        await self._dismiss_save_application_prompt(page)
+        await self._dismiss_autocomplete_overlays(page)
+        try:
+            await button.scroll_into_view_if_needed()
+        except Exception:
+            pass
+
+        for description, click in (
+            ("native click", lambda: button.click(timeout=2_000)),
+            ("forced click", lambda: button.click(timeout=2_000, force=True)),
+        ):
+            try:
+                await click()
+                return
+            except Exception as exc:
+                logger.debug(
+                    f"[LinkedIn] {action_name.title()} button {description} failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
+                await self._dismiss_save_application_prompt(page)
+                await self._dismiss_autocomplete_overlays(page)
+
+        try:
+            await button.dispatch_event("click", timeout=2_000)
+            return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] {action_name.title()} button event dispatch failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        raise RuntimeError(f"Could not click {action_name} button")
+
     @staticmethod
     def _modal_descendants(selector: str) -> str:
         modal_roots = [part.strip() for part in _MODAL.split(",")]
@@ -652,80 +1123,115 @@ class LinkedInApplier(BaseApplier):
 
     async def _fill_modal_page(self, page: Page, job: Job) -> None:
         """Fill all visible form fields on the current modal page."""
-        await self._fill_text_inputs(page)
+        await self._fill_text_inputs(page, job)
         await self._fill_textareas(page, job)
         await self._fill_selects(page)
         await self._fill_radio_buttons(page)
         await self._fill_checkboxes(page)
         await self._handle_resume_upload(page)
+        await self._dismiss_autocomplete_overlays(page)
 
-    async def _fill_text_inputs(self, page: Page) -> None:
+    async def _fill_text_inputs(self, page: Page, job: Job) -> None:
         inputs = await page.locator(self._modal_descendants(_TEXT_INPUTS)).all()
         for inp in inputs:
             if not await inp.is_visible() or not await inp.is_enabled():
                 continue
+            label = await self._get_field_label(page, inp)
+            input_type = ((await inp.get_attribute("type")) or "text").strip().lower()
+            field_type = "number" if input_type in {"number", "range"} else "text"
             current_val = await inp.input_value()
             if current_val.strip():
+                if label:
+                    self._record_prefilled_answer(label, current_val, field_type)
                 continue  # already filled
 
-            label = await self._get_field_label(page, inp)
-            value = self._answer_for_label(label)
-            if value is None:
-                value = self._infer_value_from_label(label)
-
-            if value is not None:
+            value, source = await self._resolve_answer(label, field_type)
+            if value is not None and source is not None:
+                prepared_value = self._prepare_text_input_value(
+                    label,
+                    value,
+                    field_type=field_type,
+                    input_type=input_type,
+                    job=job,
+                )
+                if prepared_value is None:
+                    if label:
+                        self._mark_unanswered(label, field_type)
+                    continue
                 await inp.fill("")
-                await _BM.human_type(inp, str(value))
-                logger.debug(f"[LinkedIn] Filled '{label}' = '{value}'")
+                await _BM.human_type(inp, prepared_value)
+                await self._finalize_text_input(page, inp)
+                self._record_answer(label, prepared_value, source, field_type)
             elif label:
-                self._unknown_questions.append(label)
-                logger.debug(f"[LinkedIn] No answer for text input: '{label}'")
+                self._mark_unanswered(label, field_type)
 
     async def _fill_textareas(self, page: Page, job: Job) -> None:
         areas = await page.locator(self._modal_descendants(_TEXTAREAS)).all()
         for area in areas:
             if not await area.is_visible() or not await area.is_enabled():
                 continue
+            label = await self._get_field_label(page, area)
             current_val = await area.input_value()
             if current_val.strip():
+                if label:
+                    self._record_prefilled_answer(label, current_val, "textarea")
                 continue
 
-            label = await self._get_field_label(page, area)
             label_lower = label.lower()
 
             if "cover letter" in label_lower or "cover_letter" in label_lower:
                 cl_text = getattr(self, "_cover_letter_text", None)
                 cl = cl_text if cl_text else self._build_cover_letter(job)
                 await area.fill(cl)
+                self._record_answer(label or "Cover letter", cl, "generated", "textarea")
                 continue
 
             if "additional" in label_lower or "summary" in label_lower or "about" in label_lower:
                 if self.profile.summary:
                     await area.fill(self.profile.summary)
+                    self._remember_answer(label, self.profile.summary)
+                    self._record_answer(label, self.profile.summary, "inferred", "textarea")
                     continue
 
-            value = self._answer_for_label(label)
-            if value:
-                await area.fill(str(value))
+            value, source = await self._resolve_answer(label, "textarea")
+            if value is not None and source is not None:
+                await area.fill(value)
+                self._record_answer(label, value, source, "textarea")
             elif label:
-                self._unknown_questions.append(label)
-                logger.debug(f"[LinkedIn] No answer for textarea: '{label}'")
+                self._mark_unanswered(label, "textarea")
 
     async def _fill_selects(self, page: Page) -> None:
         selects = await page.locator(self._modal_descendants(_SELECTS)).all()
         for sel in selects:
             if not await sel.is_visible() or not await sel.is_enabled():
                 continue
+            label = await self._get_field_label(page, sel)
             current_val = await sel.input_value()
             if current_val and current_val not in ("", "Select an option"):
+                selected_label = current_val
+                try:
+                    selected_option = sel.locator("option:checked").first
+                    if await selected_option.count() > 0:
+                        candidate = self._clean_answer(await selected_option.inner_text())
+                        if candidate is not None:
+                            selected_label = candidate
+                except Exception:
+                    pass
+                if label:
+                    self._record_prefilled_answer(label, selected_label, "select")
                 continue
 
-            label = await self._get_field_label(page, sel)
-            value = self._answer_for_label(label)
-            if value is None:
-                value = self._infer_value_from_label(label)
+            options = []
+            option_elements = await sel.locator("option").all()
+            for option in option_elements:
+                option_label = (await option.inner_text()).strip()
+                option_value = (await option.get_attribute("value") or "").strip()
+                candidate = option_label or option_value
+                if candidate and candidate.lower() != "select an option":
+                    options.append(candidate)
 
-            if value is not None:
+            value, source = await self._resolve_answer(label, "select", options=options)
+            if value is not None and source is not None:
                 try:
                     await sel.select_option(value=str(value))
                 except Exception:
@@ -733,9 +1239,11 @@ class LinkedInApplier(BaseApplier):
                         await sel.select_option(label=str(value))
                     except Exception:
                         logger.debug(f"[LinkedIn] Could not select '{value}' for '{label}'")
+                        self._mark_unanswered(label, "select", options=options)
+                        continue
+                self._record_answer(label, value, source, "select")
             elif label:
-                self._unknown_questions.append(label)
-                logger.debug(f"[LinkedIn] No answer for select: '{label}'")
+                self._mark_unanswered(label, "select", options=options)
 
     async def _fill_radio_buttons(self, page: Page) -> None:
         fieldsets = await page.locator(self._modal_descendants(_RADIO_GROUPS)).all()
@@ -745,31 +1253,71 @@ class LinkedInApplier(BaseApplier):
 
             legend = ""
             if await fieldset.locator("legend").count() > 0:
-                legend = (await fieldset.locator("legend").first.inner_text()).strip()
-
-            answer = self._answer_for_label(legend)
-            if answer is None:
-                answer = self._infer_value_from_label(legend)
-            if answer is None:
-                if legend:
-                    self._unknown_questions.append(legend)
-                    logger.debug(f"[LinkedIn] No answer for radio: '{legend}'")
-                continue
+                legend = normalize_question_text(
+                    (await fieldset.locator("legend").first.inner_text()).strip()
+                )
 
             radios = await fieldset.locator("input[type='radio']").all()
+            radio_options: list[tuple[Locator, str]] = []
             for radio in radios:
                 radio_id = await radio.get_attribute("id") or ""
                 radio_label_el = page.locator(f"label[for='{radio_id}']")
                 radio_label = ""
                 if await radio_label_el.count() > 0:
-                    radio_label = (await radio_label_el.inner_text()).strip()
-                if (
-                    radio_label.lower() == str(answer).lower()
-                    or await radio.get_attribute("value") == str(answer)
-                ):
-                    await radio.check()
-                    logger.debug(f"[LinkedIn] Radio '{legend}' = '{radio_label}'")
+                    radio_label = normalize_question_text(
+                        (await radio_label_el.inner_text()).strip()
+                    )
+                radio_value = (await radio.get_attribute("value") or "").strip()
+                radio_options.append((radio, radio_label or radio_value))
+
+            prefilled_option = None
+            for radio, option in radio_options:
+                try:
+                    if await radio.is_checked():
+                        prefilled_option = option or (await radio.get_attribute("value") or "").strip()
+                        break
+                except Exception:
+                    continue
+            if prefilled_option:
+                if legend:
+                    self._record_prefilled_answer(legend, prefilled_option, "radio")
+                continue
+
+            answer, source = await self._resolve_answer(
+                legend,
+                "radio",
+                options=[option for _, option in radio_options if option],
+            )
+            if answer is None or source is None:
+                if legend:
+                    self._mark_unanswered(
+                        legend,
+                        "radio",
+                        options=[option for _, option in radio_options if option],
+                    )
+                continue
+
+            matched_radio = False
+            for radio, option in radio_options:
+                radio_value = (await radio.get_attribute("value") or "").strip()
+                if option == answer or radio_value == answer:
+                    radio_id = await radio.get_attribute("id") or ""
+                    label_el = page.locator(f"label[for='{radio_id}']") if radio_id else None
+                    await self._set_radio_state(
+                        radio,
+                        label=legend,
+                        option_label=option or radio_value,
+                        label_el=label_el,
+                    )
+                    self._record_answer(legend, answer, source, "radio")
+                    matched_radio = True
                     break
+            if not matched_radio and legend:
+                self._mark_unanswered(
+                    legend,
+                    "radio",
+                    options=[option for _, option in radio_options if option],
+                )
 
     async def _fill_checkboxes(self, page: Page) -> None:
         checkboxes = await page.locator(self._modal_descendants(_CHECKBOXES)).all()
@@ -777,27 +1325,172 @@ class LinkedInApplier(BaseApplier):
             if not await cb.is_visible():
                 continue
             cb_id = await cb.get_attribute("id") or ""
-            label_el = page.locator(f"label[for='{cb_id}']")
-            label = (await label_el.inner_text()).strip() if await label_el.count() > 0 else ""
+            label_el = page.locator(f"label[for='{cb_id}']") if cb_id else None
+            label = ""
+            if label_el is not None and await label_el.count() > 0:
+                label = (await label_el.inner_text()).strip()
 
-            answer = self._answer_for_label(label)
-            if answer is None:
+            try:
+                if await cb.is_checked():
+                    if label:
+                        self._record_prefilled_answer(label, "Yes", "checkbox")
+                    continue
+            except Exception:
+                pass
+
+            answer, source = await self._resolve_answer(label, "checkbox", options=["Yes", "No"])
+            if answer is None or source is None:
                 if label:
-                    self._unknown_questions.append(label)
-                    logger.debug(f"[LinkedIn] No answer for checkbox: '{label}'")
+                    self._mark_unanswered(label, "checkbox")
                 continue
 
             should_check = str(answer).lower() in ("yes", "true", "1", "checked")
-            if should_check and not await cb.is_checked():
-                await cb.check()
-            elif not should_check and await cb.is_checked():
-                await cb.uncheck()
+            await self._set_checkbox_state(cb, should_check, label=label, label_el=label_el)
+            self._record_answer(label, "Yes" if should_check else "No", source, "checkbox")
+
+    async def _set_checkbox_state(
+        self,
+        checkbox: Locator,
+        should_check: bool,
+        label: str = "",
+        label_el: Locator | None = None,
+    ) -> None:
+        """Set checkbox state with fallbacks for covered/custom-styled inputs."""
+        current = await checkbox.is_checked()
+        if current == should_check:
+            return
+
+        action_name = "check" if should_check else "uncheck"
+        input_name = await checkbox.get_attribute("name") or await checkbox.get_attribute("id") or ""
+        target_name = label or input_name or "checkbox"
+
+        async def _native_toggle(*, force: bool = False) -> None:
+            if should_check:
+                await checkbox.check(timeout=2_000, force=force)
+            else:
+                await checkbox.uncheck(timeout=2_000, force=force)
+
+        for description, action in (
+            ("native toggle", lambda: _native_toggle(force=False)),
+            ("forced toggle", lambda: _native_toggle(force=True)),
+        ):
+            try:
+                await action()
+                if await checkbox.is_checked() == should_check:
+                    return
+            except Exception as exc:
+                logger.debug(
+                    f"[LinkedIn] Checkbox '{target_name}' {description} failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
+
+        if label_el is not None:
+            try:
+                await label_el.first.click(timeout=2_000, force=True)
+                if await checkbox.is_checked() == should_check:
+                    return
+            except Exception as exc:
+                logger.debug(
+                    f"[LinkedIn] Checkbox '{target_name}' label click failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
+
+        try:
+            await checkbox.evaluate(
+                """(el, checked) => {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    if (el.checked !== checked) {
+                        el.checked = checked;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""",
+                should_check,
+            )
+            if await checkbox.is_checked() == should_check:
+                logger.debug(f"[LinkedIn] Checkbox '{target_name}' set via DOM fallback")
+                return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] Checkbox '{target_name}' DOM fallback failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        raise RuntimeError(f"Could not {action_name} checkbox '{target_name}'")
+
+    async def _set_radio_state(
+        self,
+        radio: Locator,
+        label: str = "",
+        option_label: str = "",
+        label_el: Locator | None = None,
+    ) -> None:
+        """Select a radio option with fallbacks for overlaid/custom-styled inputs."""
+        if await radio.is_checked():
+            return
+
+        input_name = await radio.get_attribute("name") or await radio.get_attribute("id") or ""
+        target_name = label or option_label or input_name or "radio"
+
+        try:
+            await radio.check(timeout=2_000)
+            if await radio.is_checked():
+                return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] Radio '{target_name}' native toggle failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        if label_el is not None:
+            try:
+                await label_el.first.click(timeout=2_000, force=True)
+                if await radio.is_checked():
+                    return
+            except Exception as exc:
+                logger.debug(
+                    f"[LinkedIn] Radio '{target_name}' label click failed: "
+                    f"{self._summarize_exception(exc)}"
+                )
+
+        try:
+            await radio.check(timeout=2_000, force=True)
+            if await radio.is_checked():
+                return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] Radio '{target_name}' forced toggle failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        try:
+            await radio.evaluate(
+                """(el) => {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    if (!el.checked) {
+                        el.checked = true;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }"""
+            )
+            if await radio.is_checked():
+                logger.debug(f"[LinkedIn] Radio '{target_name}' set via DOM fallback")
+                return
+        except Exception as exc:
+            logger.debug(
+                f"[LinkedIn] Radio '{target_name}' DOM fallback failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+
+        raise RuntimeError(f"Could not select radio '{target_name}'")
 
     async def _handle_resume_upload(self, page: Page) -> None:
         """Upload resume — prefer tailored PDF, fall back to profile resume."""
         tailored = getattr(self, "_tailored_resume_path", None)
         if tailored and Path(tailored).exists():
             resume_path = Path(tailored)
+            self._report_progress(f"[LinkedIn][Resume] Using tailored resume: {resume_path.name}")
             logger.info(f"[LinkedIn] Using tailored resume: {resume_path.name}")
         else:
             resume_path = None
@@ -806,21 +1499,126 @@ class LinkedInApplier(BaseApplier):
             elif settings.resume_path:
                 resume_path = Path(settings.resume_path)
 
-        file_input = page.locator(self._modal_descendants(_FILE_INPUT)).first
-        if await file_input.count() == 0:
-            return
-
         if not resume_path or not resume_path.exists():
             logger.debug("[LinkedIn] No resume file found, skipping upload")
             return
 
+        file_input = await self._find_resume_upload_input(page)
+        if file_input is None:
+            return
+
         await file_input.set_input_files(str(resume_path))
+        self._report_progress(f"[LinkedIn][Resume] Uploaded resume: {resume_path.name}")
         logger.info(f"[LinkedIn] Uploaded resume: {resume_path.name}")
         try:
             await page.wait_for_selector(self._modal_descendants(_RESUME_CARD), timeout=8_000)
         except PWTimeoutError:
             logger.debug("[LinkedIn] Resume upload progress indicator not detected (may be fine)")
         await asyncio.sleep(0.5)
+
+    async def _find_resume_upload_input(self, page: Page) -> Locator | None:
+        inputs = await page.locator(self._modal_descendants(_FILE_INPUT)).all()
+        if not inputs:
+            return None
+
+        ambiguous_candidates: list[Locator] = []
+        for file_input in inputs:
+            try:
+                if not await file_input.is_visible() or not await file_input.is_enabled():
+                    continue
+            except Exception:
+                continue
+
+            label, accept, context = await self._describe_upload_field(page, file_input)
+            target_name = label or "file upload"
+            if self._is_non_resume_upload_field(accept, context):
+                self._report_progress(
+                    f"[LinkedIn][Resume] Skipping non-resume upload field: {target_name}"
+                )
+                continue
+            if self._is_resume_upload_field(accept, context):
+                return file_input
+            ambiguous_candidates.append(file_input)
+
+        if len(ambiguous_candidates) == 1:
+            logger.debug("[LinkedIn] Using fallback resume upload input with no explicit label")
+            return ambiguous_candidates[0]
+
+        if len(ambiguous_candidates) > 1:
+            logger.debug("[LinkedIn] Multiple ambiguous file inputs detected, skipping upload")
+        return None
+
+    async def _describe_upload_field(self, page: Page, file_input: Locator) -> tuple[str, str, str]:
+        label = normalize_question_text(await self._get_field_label(page, file_input))
+        accept = ((await file_input.get_attribute("accept")) or "").strip().lower()
+        name = ((await file_input.get_attribute("name")) or "").strip().lower()
+        aria_label = normalize_question_text((await file_input.get_attribute("aria-label")) or "")
+        nearby_text = ""
+        try:
+            nearby_text = await file_input.evaluate(
+                """(el) => {
+                    let node = el.parentElement;
+                    for (let depth = 0; depth < 4 && node; depth += 1, node = node.parentElement) {
+                        const text = (node.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (text) {
+                            return text.slice(0, 240);
+                        }
+                    }
+                    return '';
+                }"""
+            )
+        except Exception:
+            nearby_text = ""
+
+        context = " ".join(
+            part
+            for part in (
+                label.lower(),
+                accept,
+                name,
+                aria_label.lower(),
+                normalize_question_text(nearby_text).lower(),
+            )
+            if part
+        )
+        return label, accept, context
+
+    @staticmethod
+    def _is_resume_upload_field(accept: str, context: str) -> bool:
+        accepts_documents = any(
+            token in accept
+            for token in (
+                "application/pdf",
+                ".pdf",
+                "msword",
+                "officedocument",
+                ".doc",
+                ".docx",
+                "wordprocessingml",
+            )
+        )
+        return accepts_documents or any(hint in context for hint in _DOCUMENT_UPLOAD_HINTS)
+
+    @staticmethod
+    def _is_non_resume_upload_field(accept: str, context: str) -> bool:
+        accepts_documents = LinkedInApplier._is_resume_upload_field(accept, context)
+        accepts_images = any(
+            token in accept
+            for token in (
+                "image/",
+                ".jpg",
+                ".jpeg",
+                ".png",
+                ".gif",
+                "jpg",
+                "jpeg",
+                "png",
+                "gif",
+            )
+        )
+        if any(hint in context for hint in _IMAGE_UPLOAD_HINTS) and not accepts_documents:
+            return True
+        return accepts_images and not accepts_documents
 
     # ------------------------------------------------------------------
     # Label / answer helpers
@@ -860,16 +1658,26 @@ class LinkedInApplier(BaseApplier):
 
     def _answer_for_label(self, label: str) -> str | None:
         """Look up the label against user profile custom_answers (case-insensitive)."""
-        label_lower = label.lower().strip()
+        label_lower = normalize_question_key(normalize_question_text(label))
+        if not label_lower:
+            return None
         for key, val in self.profile.custom_answers.items():
-            if key.lower().strip() in label_lower or label_lower in key.lower().strip():
+            normalized_key = normalize_question_key(normalize_question_text(key))
+            if normalized_key and (
+                normalized_key in label_lower or label_lower in normalized_key
+            ):
                 return val
         return None
 
     def _infer_value_from_label(self, label: str) -> str | None:
         """Infer an answer from user profile fields based on label text."""
-        label_lower = label.lower()
+        label_lower = normalize_question_text(label).lower()
         p = self.profile
+        preferred_work_modes = {
+            mode.lower()
+            for mode in getattr(p.preferences, "preferred_work_modes", [])
+            if isinstance(mode, str)
+        }
 
         if any(w in label_lower for w in ("first name", "given name")):
             return p.first_name
@@ -897,6 +1705,28 @@ class LinkedInApplier(BaseApplier):
             return str(p.years_of_experience) if p.years_of_experience else ""
         if "summary" in label_lower or "headline" in label_lower:
             return p.headline or ""
+        if any(
+            phrase in label_lower
+            for phrase in (
+                "comfortable commuting",
+                "comfortable to commute",
+                "able to commute",
+                "commuting to this job",
+                "commute to this job",
+                "commute to the job",
+            )
+        ):
+            return "Yes" if preferred_work_modes & {"hybrid", "onsite"} else "No"
+        if any(
+            phrase in label_lower
+            for phrase in (
+                "comfortable working in a hybrid setting",
+                "comfortable working in hybrid",
+                "hybrid setting",
+                "hybrid environment",
+            )
+        ):
+            return "Yes" if "hybrid" in preferred_work_modes else "No"
 
         return None
 

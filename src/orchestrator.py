@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections.abc import Awaitable
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Type
@@ -8,7 +10,7 @@ from typing import Callable, Type
 import anthropic
 from loguru import logger
 
-from src.appliers.base import BaseApplier
+from src.appliers.base import ApplicationQuestionPrompt, BaseApplier
 from src.appliers.generic import GenericApplier
 from src.appliers.greenhouse import GreenhouseApplier
 from src.appliers.lever import LeverApplier
@@ -28,6 +30,7 @@ from src.scrapers.monster import MonsterScraper
 from src.scrapers.workday import WorkdayScraper
 from src.scrapers.ziprecruiter import ZipRecruiterScraper
 from src.services import ai_matcher, cover_letter as cover_letter_svc, pdf_builder, profile_extractor, resume_parser, resume_tailor
+from src.services.application_questions import normalize_question_text
 from src.services.job_classifier import detect_ats
 from src.utils.profile_loader import save_profile
 
@@ -63,6 +66,15 @@ class Orchestrator:
         self.db = db
         self._ai_client: anthropic.AsyncAnthropic | None = None
 
+    @staticmethod
+    def _search_criteria_for_log(search_filter: JobSearchFilter) -> dict[str, object]:
+        raw = search_filter.model_dump(mode="json", exclude_none=True)
+        return {
+            key: value
+            for key, value in raw.items()
+            if value not in ("", [], {})
+        }
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -92,12 +104,32 @@ class Orchestrator:
         logger.info(f"Scraping complete — {total} new jobs found")
         return total
 
-    async def run_apply(self, user_id: int | None = None) -> dict:
-        """Apply to all pending jobs. Returns status counts."""
-        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run, user_id=user_id)
-        logger.info(f"Applying to {len(pending)} pending jobs")
+    async def run_apply(
+        self,
+        user_id: int | None = None,
+        scrape_run_id: str | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict:
+        """Apply to pending jobs. Returns status counts."""
+        def _emit(msg: str) -> None:
+            if progress_callback:
+                progress_callback(msg)
+            else:
+                logger.info(msg)
 
-        counts: dict[str, int] = {}
+        pending = await self.db.get_pending_jobs(
+            limit=settings.max_applications_per_run,
+            user_id=user_id,
+            scrape_run_id=scrape_run_id,
+        )
+        _emit(f"Applying to {len(pending)} pending jobs")
+
+        counts: dict[str, int] = {
+            "applied": 0,
+            "failed": 0,
+            "skipped": 0,
+            "dry_run": 0,
+        }
         for record in pending:
             job = self._record_to_job(record)
             cover_letter_text: str | None = None
@@ -110,20 +142,33 @@ class Orchestrator:
                         logger.warning(f"Could not read cover letter for job {record.id}: {exc}")
 
             if settings.dry_run:
-                logger.info(f"[DRY RUN] Would apply to {job.title} @ {job.company}")
-                counts["dry_run"] = counts.get("dry_run", 0) + 1
+                _emit(f"🧪 [DRY RUN] Would apply to '{job.title}' @ {job.company}")
+                counts["dry_run"] += 1
                 continue
 
             applier = self._pick_applier(job)
-            async with applier as a:
-                result = await a.apply(
-                    job,
-                    tailored_resume_path=record.tailored_resume_path,
-                    cover_letter=cover_letter_text,
-                )
+            self._configure_applier(applier, user_id=user_id, progress_callback=_emit)
+            _emit(f"📤 Applying to '{job.title}' @ {job.company} …")
+            try:
+                async with applier as a:
+                    result = await a.apply(
+                        job,
+                        tailored_resume_path=record.tailored_resume_path,
+                        cover_letter=cover_letter_text,
+                    )
+            except Exception as exc:
+                logger.error(f"Applier error for job {record.id}: {exc}")
+                counts["failed"] += 1
+                await self.db.update_job_status(record.id, ApplicationStatus.FAILED, notes=str(exc))
+                continue
 
             status = result.status
-            counts[status] = counts.get(status, 0) + 1
+            status_key = status.value if isinstance(status, ApplicationStatus) else str(status)
+            counts[status_key] = counts.get(status_key, 0) + 1
+            if status == ApplicationStatus.APPLIED:
+                _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
+            else:
+                _emit(f"  ⚠️  Application result for '{job.title}': {status_key} — {result.message or ''}")
             await self.db.update_job_status(
                 record.id,
                 status,
@@ -137,10 +182,39 @@ class Orchestrator:
                 message=result.message,
                 user_id=user_id,
             )
-            if result.new_questions:
-                await self._handle_new_questions(result.new_questions)
+            if result.learned_answers:
+                saved_count = await self._persist_custom_answers(
+                    result.learned_answers,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
+                if saved_count:
+                    _emit(
+                        f"[Profile][Saved] Stored {saved_count} new question-answer pair(s) for future applications"
+                    )
+            new_question_prompts = list(getattr(result, "new_question_prompts", []) or [])
+            if not new_question_prompts and result.new_questions:
+                new_question_prompts = [
+                    ApplicationQuestionPrompt(question=question, field_type="text")
+                    for question in result.new_questions
+                    if question.strip()
+                ]
+            if new_question_prompts:
+                _emit(
+                    f"  💡 Learned {len(new_question_prompts)} new Q&A pair(s) from this application"
+                )
+                await self._handle_new_questions(
+                    new_question_prompts,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
 
-        logger.info(f"Apply run complete: {counts}")
+        _emit(
+            f"🏁 Apply run complete — applied: {counts['applied']}, "
+            f"dry_run: {counts.get('dry_run', 0)}, "
+            f"failed: {counts['failed']}, "
+            f"skipped: {counts['skipped']}"
+        )
         return counts
 
     async def run_full_pipeline(
@@ -149,6 +223,7 @@ class Orchestrator:
         user_id: int | None = None,
         run_id: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        tailor_documents: bool = True,
     ) -> dict:
         """
         End-to-end pipeline:
@@ -169,9 +244,26 @@ class Orchestrator:
             if progress_callback:
                 progress_callback(f"{_ts()} {msg}")
 
+        criteria_json = json.dumps(
+            self._search_criteria_for_log(search_filter),
+            ensure_ascii=False,
+        )
+        _emit(f"[Search][Criteria] {criteria_json}")
         _emit("🚀 Pipeline starting — scraping jobs …")
         jobs_found = await self.run_scrape(search_filter, user_id=user_id, run_id=run_id)
         _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
+
+        # If tailoring is disabled, apply the jobs from this run with the
+        # uploaded resume as-is.
+        if not tailor_documents:
+            _emit("📎 Tailoring disabled for this run — applying scraped jobs with the uploaded resume.")
+            counts = await self.run_apply(
+                user_id=user_id,
+                scrape_run_id=run_id,
+                progress_callback=_emit,
+            )
+            counts["scraped"] = jobs_found
+            return counts
 
         # Parse resume once — try per-user path first, then global fallback
         resume_text = ""
@@ -333,6 +425,7 @@ class Orchestrator:
 
             _emit(f"📤 Applying to '{job.title}' @ {job.company} (ATS: {ats_type}) …")
             applier = self._pick_applier(job)
+            self._configure_applier(applier, user_id=user_id, progress_callback=_emit)
             try:
                 async with applier as a:
                     result = await a.apply(
@@ -347,11 +440,12 @@ class Orchestrator:
                 continue
 
             status = result.status
-            counts[status] = counts.get(status, 0) + 1
+            status_key = status.value if isinstance(status, ApplicationStatus) else str(status)
+            counts[status_key] = counts.get(status_key, 0) + 1
             if status == ApplicationStatus.APPLIED:
                 _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
             else:
-                _emit(f"  ⚠️  Application result for '{job.title}': {status} — {result.message or ''}")
+                _emit(f"  ⚠️  Application result for '{job.title}': {status_key} — {result.message or ''}")
             await self.db.update_job_status(
                 record.id,
                 status,
@@ -365,9 +459,32 @@ class Orchestrator:
                 message=result.message,
                 user_id=user_id,
             )
-            if result.new_questions:
-                _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")
-                await self._handle_new_questions(result.new_questions, user_id)
+            if result.learned_answers:
+                saved_count = await self._persist_custom_answers(
+                    result.learned_answers,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
+                if saved_count:
+                    _emit(
+                        f"[Profile][Saved] Stored {saved_count} new question-answer pair(s) for future applications"
+                    )
+            new_question_prompts = list(getattr(result, "new_question_prompts", []) or [])
+            if not new_question_prompts and result.new_questions:
+                new_question_prompts = [
+                    ApplicationQuestionPrompt(question=question, field_type="text")
+                    for question in result.new_questions
+                    if question.strip()
+                ]
+            if new_question_prompts:
+                _emit(
+                    f"  💡 Learned {len(new_question_prompts)} new Q&A pair(s) from this application"
+                )
+                await self._handle_new_questions(
+                    new_question_prompts,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
 
         _emit(
             f"🏁 Pipeline complete — applied: {counts['applied']}, "
@@ -389,46 +506,133 @@ class Orchestrator:
             self._ai_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         return self._ai_client
 
-    async def _handle_new_questions(
+    def _configure_applier(
         self,
-        questions: list[str],
+        applier: BaseApplier,
         user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> None:
-        """Use Claude to generate answers for unknown screening questions,
-        then persist Q&A pairs to profile (file + DB) for future runs."""
+        applier.progress_callback = progress_callback
+        applier.answer_resolver = self._build_answer_resolver(
+            user_id=user_id,
+            progress_callback=progress_callback,
+        )
+
+    def _build_answer_resolver(
+        self,
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> Callable[[list[ApplicationQuestionPrompt]], Awaitable[dict[str, str]]]:
+        async def _resolve(prompts: list[ApplicationQuestionPrompt]) -> dict[str, str]:
+            return await self._suggest_question_answers(
+                prompts,
+                user_id=user_id,
+                progress_callback=progress_callback,
+            )
+
+        return _resolve
+
+    async def _suggest_question_answers(
+        self,
+        prompts: list[ApplicationQuestionPrompt],
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, str]:
+        del user_id
+
+        questions = [prompt.question.strip() for prompt in prompts if prompt.question.strip()]
+        if not questions:
+            return {}
+
         ai = self._get_ai_client()
         if not ai:
-            logger.warning(f"New questions found but no AI client — skipping: {questions}")
-            return
+            logger.warning(f"New questions found but no AI client - skipping: {questions}")
+            return {}
+
+        if progress_callback and len(questions) > 1:
+            progress_callback(
+                f"[AI][Questions] Attempting to answer {len(questions)} new application question(s)"
+            )
 
         try:
-            new_answers = await profile_extractor.suggest_answers(
-                questions, self.profile, ai, settings.anthropic_model
+            return await profile_extractor.suggest_answers(
+                prompts,
+                self.profile,
+                ai,
+                settings.anthropic_model,
             )
         except Exception as exc:
             logger.error(f"suggest_answers error: {exc}")
-            return
+            return {}
 
-        if not new_answers:
-            return
+    async def _persist_custom_answers(
+        self,
+        answers: dict[str, str],
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> int:
+        cleaned_answers = {
+            normalize_question_text(str(question)): str(answer).strip()
+            for question, answer in answers.items()
+            if normalize_question_text(str(question)) and str(answer).strip()
+        }
+        if not cleaned_answers:
+            return 0
 
-        self.profile.custom_answers.update(new_answers)
+        changed_answers = {
+            question: answer
+            for question, answer in cleaned_answers.items()
+            if self.profile.custom_answers.get(question) != answer
+        }
+        if not changed_answers:
+            return 0
+
+        self.profile.custom_answers.update(changed_answers)
         logger.info(
-            f"Learned {len(new_answers)} new Q&A pairs: {list(new_answers.keys())}"
+            f"Learned {len(changed_answers)} new Q&A pairs: {list(changed_answers.keys())}"
         )
 
-        # Persist to filesystem (always — keeps CLI and API in sync)
         try:
             save_profile(self.profile, settings.user_profile_path)
         except Exception as exc:
             logger.warning(f"Could not save profile to file: {exc}")
 
-        # Persist to DB (API / multi-user mode)
         if user_id is not None:
             try:
-                await self.db.update_profile_custom_answers(user_id, self.profile.custom_answers)
+                await self.db.update_profile_custom_answers(user_id, changed_answers)
             except Exception as exc:
                 logger.warning(f"Could not save custom_answers to DB: {exc}")
+
+        return len(changed_answers)
+
+    async def _handle_new_questions(
+        self,
+        prompts: list[ApplicationQuestionPrompt],
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        prompts = [
+            ApplicationQuestionPrompt(
+                question=normalize_question_text(prompt.question),
+                field_type=prompt.field_type,
+                options=[str(option).strip() for option in prompt.options if str(option).strip()],
+            )
+            for prompt in prompts
+            if normalize_question_text(prompt.question)
+        ]
+        new_answers = await self._suggest_question_answers(
+            prompts,
+            user_id=user_id,
+            progress_callback=progress_callback,
+        )
+        if not new_answers:
+            return
+
+        await self._persist_custom_answers(
+            new_answers,
+            user_id=user_id,
+            progress_callback=progress_callback,
+        )
 
     async def _scrape_board(
         self,
@@ -449,8 +653,36 @@ class Orchestrator:
                         job = await scraper.get_job_details(job)
                     except Exception as exc:
                         logger.warning(f"[{board}] Detail fetch failed for {job.title}: {exc}")
+                    # After detail fetch the easy_apply flag may have been updated;
+                    # drop the job if it doesn't meet the easy-apply-only filter.
+                    if search_filter.easy_apply_only and not job.easy_apply:
+                        can_strictly_verify_easy_apply = True
+                        if board == "linkedin":
+                            has_authenticated_session = getattr(
+                                scraper, "has_authenticated_session", None
+                            )
+                            if callable(has_authenticated_session):
+                                can_strictly_verify_easy_apply = bool(
+                                    has_authenticated_session()
+                                )
+                        if can_strictly_verify_easy_apply:
+                            logger.debug(
+                                f"[{board}] Skipping non-easy-apply job after detail fetch: {job.title}"
+                            )
+                            continue
+                        logger.warning(
+                            f"[{board}] Could not strictly verify Easy Apply without an "
+                            f"authenticated LinkedIn session - keeping candidate for live "
+                            f"apply verification: {job.title}"
+                        )
                     await self.db.upsert_job(job, user_id=user_id, scrape_run_id=run_id)
                     count += 1
+                    if search_filter.max_jobs is not None and count >= search_filter.max_jobs:
+                        logger.info(
+                            f"[{board}] Reached max_jobs limit ({search_filter.max_jobs}) "
+                            "after detail verification"
+                        )
+                        break
                     await asyncio.sleep(settings.request_delay_seconds)
         except NotImplementedError:
             logger.warning(f"[{board}] Scraper not yet implemented — skipping")

@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import abc
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
 from loguru import logger
 
 from src.models import ApplicationStatus, Job, UserProfile
+
+
+@dataclass
+class ApplicationQuestionPrompt:
+    question: str
+    field_type: str
+    options: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AnsweredQuestion:
+    question: str
+    answer: str
+    source: str
+    field_type: str
 
 
 class ApplicationResult:
@@ -15,6 +32,9 @@ class ApplicationResult:
         message: str = "",
         confirmation_id: str | None = None,
         new_questions: list[str] | None = None,
+        new_question_prompts: list[ApplicationQuestionPrompt] | None = None,
+        answered_questions: list[AnsweredQuestion] | None = None,
+        learned_answers: dict[str, str] | None = None,
     ):
         self.job = job
         self.status = status
@@ -24,6 +44,9 @@ class ApplicationResult:
         # The orchestrator will use Claude to generate answers and save them back
         # to the profile so future applications answer them automatically.
         self.new_questions: list[str] = new_questions or []
+        self.new_question_prompts: list[ApplicationQuestionPrompt] = new_question_prompts or []
+        self.answered_questions: list[AnsweredQuestion] = answered_questions or []
+        self.learned_answers: dict[str, str] = learned_answers or {}
 
     def __repr__(self) -> str:
         return (
@@ -44,6 +67,11 @@ class BaseApplier(abc.ABC):
 
     def __init__(self, profile: UserProfile):
         self.profile = profile
+        self.progress_callback: Callable[[str], None] | None = None
+        self.answer_resolver: Callable[
+            [list[ApplicationQuestionPrompt]],
+            Awaitable[dict[str, str]],
+        ] | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -109,3 +137,8 @@ class BaseApplier(abc.ABC):
     def _skip(self, job: Job, reason: str) -> ApplicationResult:
         logger.info(f"[{self.board_name}] Skipped {job.title} @ {job.company}: {reason}")
         return ApplicationResult(job, ApplicationStatus.SKIPPED, message=reason)
+
+    def _emit_progress(self, message: str) -> None:
+        callback = getattr(self, "progress_callback", None)
+        if callback:
+            callback(message)

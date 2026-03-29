@@ -8,6 +8,7 @@ import anthropic
 from loguru import logger
 
 if TYPE_CHECKING:
+    from src.appliers.base import ApplicationQuestionPrompt
     from src.models.user_profile import UserProfile
 
 
@@ -110,7 +111,7 @@ Rules:
 
 
 async def suggest_answers(
-    questions: list[str],
+    questions: list[str] | list["ApplicationQuestionPrompt"],
     profile: "UserProfile",
     client: anthropic.AsyncAnthropic,
     model: str = "claude-sonnet-4-6",
@@ -134,7 +135,32 @@ async def suggest_answers(
         country = profile.address.country or ""
     yoe = profile.years_of_experience or "unknown"
 
-    questions_block = "\n".join(f"{i+1}. {q}" for i, q in enumerate(questions))
+    question_entries: list[tuple[str, str, list[str]]] = []
+    for item in questions:
+        if hasattr(item, "question"):
+            question_entries.append(
+                (
+                    str(getattr(item, "question", "")).strip(),
+                    str(getattr(item, "field_type", "text")).strip() or "text",
+                    [str(option).strip() for option in getattr(item, "options", []) if str(option).strip()],
+                )
+            )
+        else:
+            question_entries.append((str(item).strip(), "text", []))
+
+    question_entries = [entry for entry in question_entries if entry[0]]
+    if not question_entries:
+        return {}
+
+    rendered_questions: list[str] = []
+    for i, (question_text, field_type, options) in enumerate(question_entries, 1):
+        option_text = ", ".join(options) if options else "n/a"
+        rendered_questions.append(
+            f"{i}. Question: {question_text}\n"
+            f"   Field type: {field_type}\n"
+            f"   Options: {option_text}"
+        )
+    questions_block = "\n".join(rendered_questions)
 
     prompt = f"""You are helping a job applicant fill out screening questions on a job application form.
 Based on the candidate's profile, provide short, honest answers to each question.
@@ -153,7 +179,10 @@ Rules:
 - These answers go directly into form fields or are selected from dropdowns
 - Be honest based on the profile — do not fabricate
 - For yes/no questions use "Yes" or "No" exactly
-- For numeric questions (years of experience) use a plain integer
+- For numeric questions (field type "number") use ONLY digits or digits with a decimal point
+- Never return words, currency symbols, ranges, or explanations for numeric fields
+- For salary expectation in a numeric field, return one plain annual number like 85000
+- If options are provided, choose one of the listed options exactly
 - For authorization/sponsorship questions: if country is US or not specified, answer "Yes" for authorization, "No" for sponsorship needed
 
 Return ONLY valid JSON:

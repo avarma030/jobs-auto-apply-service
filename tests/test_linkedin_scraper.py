@@ -15,16 +15,22 @@ from src.scrapers.linkedin import LinkedInScraper
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
-SAMPLE_CARD_HTML = """
+def make_card_html(job_id: str, title: str, *, easy_apply: bool = False) -> str:
+    easy_apply_markup = (
+        '<span class="result-benefits__text">Easy Apply</span>'
+        if easy_apply
+        else ""
+    )
+    return f"""
 <ul>
   <li>
     <div class="base-card"
-         data-entity-urn="urn:li:jobPosting:3987654321">
+         data-entity-urn="urn:li:jobPosting:{job_id}">
       <a class="base-card__full-link"
-         href="https://www.linkedin.com/jobs/view/3987654321/?refId=abc">
+         href="https://www.linkedin.com/jobs/view/{job_id}/?refId=abc">
       </a>
       <div class="base-search-card__info">
-        <h3 class="base-search-card__title">Senior Python Engineer</h3>
+        <h3 class="base-search-card__title">{title}</h3>
         <h4 class="base-search-card__subtitle">
           <a class="hidden-nested-link" href="/company/acme">Acme Corp</a>
         </h4>
@@ -32,11 +38,20 @@ SAMPLE_CARD_HTML = """
           <span class="job-search-card__location">San Francisco, CA (Remote)</span>
           <time datetime="2024-06-01T00:00:00.000Z">3 days ago</time>
         </div>
+        {easy_apply_markup}
       </div>
     </div>
   </li>
 </ul>
 """
+
+
+SAMPLE_CARD_HTML = make_card_html("3987654321", "Senior Python Engineer")
+SAMPLE_EASY_APPLY_CARD_HTML = make_card_html(
+    "3987654322",
+    "Senior Python Engineer II",
+    easy_apply=True,
+)
 
 SAMPLE_DETAIL_HTML = """
 <html>
@@ -75,6 +90,7 @@ def make_scraper() -> LinkedInScraper:
     scraper._proxy_index = 0
     scraper._cookies = {}
     scraper._warm_attempted = False
+    scraper._detail_api_authwall_backoff_until = 0.0
     return scraper
 
 
@@ -123,6 +139,33 @@ class TestParseJobCards:
         scraper = make_scraper()
         assert scraper._parse_job_cards("") == []
         assert scraper._parse_job_cards("<ul></ul>") == []
+
+    def test_detects_easy_apply_from_footer_text(self):
+        scraper = make_scraper()
+        footer_html = """
+<ul>
+  <li>
+    <div class="base-card" data-entity-urn="urn:li:jobPosting:3987654333">
+      <a class="base-card__full-link"
+         href="https://www.linkedin.com/jobs/view/3987654333/?refId=abc">
+      </a>
+      <div class="base-search-card__info">
+        <h3 class="base-search-card__title">Platform Engineer</h3>
+        <h4 class="base-search-card__subtitle">
+          <a class="hidden-nested-link" href="/company/acme">Acme Corp</a>
+        </h4>
+        <div class="base-search-card__metadata">
+          <span class="job-search-card__location">Remote</span>
+          <span class="job-search-card__footer-item">Easy Apply</span>
+          <time datetime="2024-06-01T00:00:00.000Z">3 days ago</time>
+        </div>
+      </div>
+    </div>
+  </li>
+</ul>
+"""
+        cards = scraper._parse_job_cards(footer_html)
+        assert cards[0]["easy_apply"] is True
 
 
 # ── Tests: _build_search_params ───────────────────────────────────────────────
@@ -238,6 +281,7 @@ async def test_get_job_details_enriches_job():
         status_code=200,
         raise_for_status=MagicMock(),
     ))
+    mock_client.headers = {}
     scraper._client = mock_client
 
     job = Job(
@@ -308,3 +352,59 @@ async def test_search_deduplicates_same_job_id():
 
     # Even though the card appeared twice, only one job should be yielded
     assert len(jobs) == 1
+
+
+@pytest.mark.asyncio
+async def test_search_easy_apply_only_defers_filter_until_detail_fetch():
+    scraper = make_scraper()
+    call_count = 0
+
+    async def fake_fetch(params):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return SAMPLE_CARD_HTML
+        if call_count == 2:
+            return SAMPLE_EASY_APPLY_CARD_HTML
+        return ""
+
+    scraper._fetch_search_page = fake_fetch
+
+    f = JobSearchFilter(keywords=["python"], max_age_days=0, easy_apply_only=True)
+    jobs = []
+    async for job in scraper.search(f):
+        jobs.append(job)
+
+    assert len(jobs) == 2
+    assert jobs[0].external_id == "3987654321"
+    assert jobs[0].easy_apply is False
+    assert jobs[1].external_id == "3987654322"
+    assert jobs[1].easy_apply is True
+    assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_guest_detail_authwall_enters_backoff_and_falls_back_to_browser():
+    scraper = make_scraper()
+    scraper._rewarm = AsyncMock()
+    scraper._client = MagicMock()
+    scraper._client.headers = {}
+    scraper._client.get = AsyncMock(side_effect=[
+        MagicMock(text="authwall", status_code=200, raise_for_status=MagicMock()),
+        MagicMock(text="authwall", status_code=200, raise_for_status=MagicMock()),
+    ])
+
+    url = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/3987654321"
+
+    with patch(
+        "src.scrapers.linkedin.time.time",
+        side_effect=[100.0, 101.0, 102.0, 150.0, 150.0],
+    ):
+        html = await scraper._get(url)
+        second_html = await scraper._get(url)
+
+    assert html == ""
+    assert second_html == ""
+    assert scraper._rewarm.await_count == 1
+    assert scraper._client.get.await_count == 2
+    assert scraper._detail_api_authwall_backoff_until == 402.0
