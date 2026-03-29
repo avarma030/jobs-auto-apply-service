@@ -81,13 +81,10 @@ _FOLLOW_PROMPT_DISMISS = (
     "button.artdeco-modal__dismiss"
 )
 
-# Job page — multiple selector variants to survive LinkedIn UI changes
-_EASY_APPLY_BTN = (
-    "button.jobs-apply-button[aria-label*='Easy Apply'], "
-    "button.jobs-apply-button--top-card[aria-label*='Easy Apply'], "
-    "button[data-control-name='jobdetails_topcard_inapply']"
-)
-_APPLY_BTN = "button.jobs-apply-button"
+# Job page — aria-label based selectors survive LinkedIn UI/class renames
+# Broad aria-label match is the most stable across all LinkedIn UI variants.
+_EASY_APPLY_BTN = "button[aria-label*='Easy Apply']"
+_APPLY_BTN = "button.jobs-apply-button, button[data-control-name='jobdetails_topcard_inapply']"
 
 # Already-applied state indicators
 _ALREADY_APPLIED = (
@@ -330,27 +327,31 @@ class LinkedInApplier(BaseApplier):
             await page.wait_for_selector("input#username", state="visible", timeout=8_000)
             form_visible = True
         except PWTimeoutError:
-            # LinkedIn is showing a checkpoint/security challenge instead of the form.
-            # Clear all cookies from the current context and retry login once — a clean
-            # cookie jar removes the stale session signals that triggered the challenge.
-            logger.warning(
-                f"[LinkedIn] Login form not visible at {page.url} — clearing cookies and retrying …"
-            )
-            await page.context.clear_cookies()
-            await asyncio.sleep(1.5)
-            try:
-                await page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
-                await asyncio.sleep(2.0)
-                await page.wait_for_selector("input#username", state="visible", timeout=10_000)
-                form_visible = True
-            except Exception:
-                await self._bm.screenshot(page, "linkedin_login_no_email_field")
+            # Login form not visible — three possible cases:
+            # 1. Persistent profile cookie already authenticated → redirected to /feed (success!)
+            # 2. LinkedIn showing checkpoint/CAPTCHA → cannot proceed automatically
+            # 3. Network issue or unexpected page state
+            # IMPORTANT: never clear_cookies() here — that destroys the valid li_at token
+            # that was just injected from the scraper warm cookies.
+            if await self._is_logged_in(page):
+                logger.info("[LinkedIn] Already logged in (persistent profile active) ✓")
+                self._logged_in = True
+                return
+            if any(s in page.url for s in ("checkpoint", "challenge", "captcha")):
+                await self._bm.screenshot(page, "linkedin_login_checkpoint")
                 logger.error(
-                    "[LinkedIn] LinkedIn is blocking automated login (CAPTCHA / security checkpoint). "
-                    "Fix: set HEADLESS_BROWSER=false in your .env, run the pipeline once, solve the "
-                    "challenge manually, then restart — the session cookie persists for future runs."
+                    "[LinkedIn] LinkedIn is showing a security checkpoint at "
+                    f"{page.url}. "
+                    "Fix: set HEADLESS_BROWSER=false in your .env, run the pipeline once, "
+                    "solve the challenge manually — the session cookie persists for future runs."
                 )
                 return
+            await self._bm.screenshot(page, "linkedin_login_no_form")
+            logger.error(
+                f"[LinkedIn] Login form not visible at {page.url} — cannot authenticate. "
+                "Try running with HEADLESS_BROWSER=false to diagnose."
+            )
+            return
 
         if not form_visible:
             return
@@ -448,17 +449,35 @@ class LinkedInApplier(BaseApplier):
         # Dismiss overlay prompts before looking for the apply button
         await self._dismiss_prompts(page)
 
-        # Find and click the Easy Apply button
-        btn = page.locator(_EASY_APPLY_BTN).first
-        if await btn.count() == 0:
-            # Fallback: check if there's a generic apply button
+        # Wait for the Easy Apply button — LinkedIn renders the apply section
+        # asynchronously after the page shell loads, so we must wait, not poll.
+        easy_apply_found = False
+        try:
+            await page.wait_for_selector(_EASY_APPLY_BTN, state="visible", timeout=8_000)
+            easy_apply_found = True
+        except PWTimeoutError:
+            pass
+
+        if not easy_apply_found:
+            # Auth check — if session was lost the page redirects to authwall
+            if "/authwall" in page.url or "/login" in page.url:
+                return self._fail(
+                    job,
+                    "Not authenticated — redirected to authwall. "
+                    "Check LINKEDIN_EMAIL / LINKEDIN_PASSWORD env vars.",
+                )
+            # Check for a generic (external) apply button to distinguish skip vs fail
             generic_btn = page.locator(_APPLY_BTN).first
             if await generic_btn.count() > 0:
                 label = (await generic_btn.get_attribute("aria-label") or "").lower()
                 if "easy apply" not in label:
                     return self._skip(job, "No Easy Apply button — external apply only")
-            return self._fail(job, "No apply button found on page")
+            await self._bm.screenshot(page, f"no_apply_btn_{job.external_id}")
+            return self._fail(
+                job, "No apply button found — job may have expired or been filled"
+            )
 
+        btn = page.locator(_EASY_APPLY_BTN).first
         try:
             await btn.scroll_into_view_if_needed()
             await asyncio.sleep(0.5)
