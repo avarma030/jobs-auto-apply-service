@@ -86,14 +86,20 @@ Respond with ONLY valid JSON (no markdown fences):
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        # Strip markdown fences if present
-        raw = re.sub(r"^```(?:json)?\s*", "", raw)
-        raw = re.sub(r"\s*```$", "", raw)
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            logger.warning(f"No JSON in match response for '{job_title}': {raw[:200]}")
-            return 0.0
-        data = json.loads(json_match.group())
+        # Strip markdown code fences, then try direct parse first (cleanest path)
+        raw_clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+        try:
+            data = json.loads(raw_clean)
+        except (json.JSONDecodeError, ValueError):
+            json_match = re.search(r"\{.*?\}", raw_clean, re.DOTALL)
+            if not json_match:
+                logger.warning(f"No JSON in match response for '{job_title}': {raw[:200]}")
+                return 0.0
+            try:
+                data = json.loads(json_match.group())
+            except (json.JSONDecodeError, ValueError) as parse_exc:
+                logger.warning(f"Match scoring JSON parse error ({parse_exc}) for '{job_title}': {raw[:200]}")
+                return 0.0
         score = float(data.get("score", 0))
         missing = data.get("missing_required_skills") or data.get("missing_skills") or []
         logger.info(

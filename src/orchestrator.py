@@ -330,6 +330,12 @@ class Orchestrator:
                     )
                 except Exception as exc:
                     logger.error(f"AI tailoring error for job {record.id}: {exc}")
+                    await self.db.update_job_status(
+                        record.id, ApplicationStatus.FAILED,
+                        notes=f"Resume tailoring error: {str(exc)[:200]}",
+                    )
+                    counts["failed"] += 1
+                    continue
 
             if settings.dry_run:
                 _emit(f"🧪 [DRY RUN] Would apply to '{job.title}' @ {job.company} (ATS: {ats_type})")

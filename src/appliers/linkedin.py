@@ -280,7 +280,7 @@ class LinkedInApplier(BaseApplier):
         creds = self.profile.job_board_accounts.linkedin
         username = (creds.username or "").strip() if creds else ""
         password = (creds.password or "").strip() if creds else ""
-        if not username and settings.linkedin_email:
+        if (not username or not password) and settings.linkedin_email:
             username = settings.linkedin_email.strip()
             password = (settings.linkedin_password or "").strip()
 
@@ -438,7 +438,7 @@ class LinkedInApplier(BaseApplier):
         if "/login" in page.url or "/authwall" in page.url:
             logger.info("[LinkedIn] Redirected to login mid-run — re-authenticating …")
             await self._ensure_logged_in()
-            await page.goto(job.url, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(2.0)
 
         # Already applied to this job?

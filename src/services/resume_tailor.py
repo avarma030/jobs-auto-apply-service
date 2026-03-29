@@ -25,9 +25,11 @@ async def tailor_resume(
 
     for attempt in range(1, max_attempts + 1):
         logger.info(f"Tailoring resume for '{job_title}' — attempt {attempt}/{max_attempts}")
-        current_resume = await _tailor_once(
-            current_resume, job_title, job_description, client, model
-        )
+        result = await _tailor_once(current_resume, job_title, job_description, client, model)
+        if result.strip():
+            current_resume = result
+        else:
+            logger.warning(f"Tailoring attempt {attempt} returned empty — keeping previous version")
         current_score = await score_ats(current_resume, job_description, client, model)
         logger.info(f"ATS score after attempt {attempt}: {current_score:.0f}%")
 
@@ -118,11 +120,20 @@ Respond with ONLY valid JSON (no markdown, no code blocks, no commentary):
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            logger.warning(f"ATS scoring: no JSON found in Claude response — raw: {raw[:300]!r}")
-            return 0.0
-        data = json.loads(json_match.group())
+        # Strip markdown code fences if present, then try direct parse first
+        raw_clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
+        try:
+            data = json.loads(raw_clean)
+        except (json.JSONDecodeError, ValueError):
+            json_match = re.search(r"\{.*?\}", raw_clean, re.DOTALL)
+            if not json_match:
+                logger.warning(f"ATS scoring: no JSON found in Claude response — raw: {raw[:300]!r}")
+                return 0.0
+            try:
+                data = json.loads(json_match.group())
+            except (json.JSONDecodeError, ValueError) as parse_exc:
+                logger.warning(f"ATS scoring: JSON parse error ({parse_exc}) — raw: {raw[:300]!r}")
+                return 0.0
         score = min(max(float(data.get("ats_score", 0)), 0.0), 100.0)
         return score
     except Exception as exc:

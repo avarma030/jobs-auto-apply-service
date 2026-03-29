@@ -268,7 +268,7 @@ class LinkedInScraper(BaseScraper):
         logger.info("[LinkedIn] Warming session via Playwright (this takes ~15 s) …")
         creds = self.credentials  # set by BaseScraper from profile.job_board_accounts.linkedin
         # Resolve credentials: profile UI → environment variables fallback
-        if not creds.get("username") and settings.linkedin_email:
+        if (not creds.get("username") or not creds.get("password")) and settings.linkedin_email:
             creds = {
                 "username": settings.linkedin_email,
                 "password": settings.linkedin_password or "",
@@ -344,6 +344,7 @@ class LinkedInScraper(BaseScraper):
 
             except Exception as exc:
                 logger.warning(f"[LinkedIn] Session warming attempt {attempt + 1}/2 failed: {exc}")
+                login_form_found = False  # treat crash as "form not found" to enable retry
 
             if "li_at" in cookies:
                 return cookies  # Authenticated — no need to retry
@@ -356,11 +357,10 @@ class LinkedInScraper(BaseScraper):
 
         if "li_at" not in cookies:
             logger.warning(
-                "[LinkedIn] Could not obtain an authenticated session after %d attempt(s). "
+                f"[LinkedIn] Could not obtain an authenticated session after {attempt + 1} attempt(s). "
                 "Proceeding with unauthenticated cookies (scraping may be limited). "
                 "To fix: set HEADLESS_BROWSER=false in .env, run once, and solve any "
-                "LinkedIn security challenge manually — the session will persist.",
-                attempt + 1,
+                "LinkedIn security challenge manually — the session will persist."
             )
         return cookies
 
