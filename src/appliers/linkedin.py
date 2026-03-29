@@ -47,6 +47,11 @@ from src.appliers.base import (
 )
 from src.config import settings
 from src.models import Job, UserProfile
+from src.services.application_questions import (
+    normalize_question_key,
+    normalize_question_text,
+    semantic_yes_no,
+)
 from src.utils.browser import BrowserManager, BrowserManager as _BM
 
 # ── Cookie / session paths ─────────────────────────────────────────────────────
@@ -152,7 +157,7 @@ class LinkedInApplier(BaseApplier):
         self._bm: BrowserManager | None = None
         self._page: Page | None = None
         self._logged_in = False
-        self._unknown_questions: list[str] = []
+        self._unknown_question_prompts: dict[str, ApplicationQuestionPrompt] = {}
         self._answered_questions: list[AnsweredQuestion] = []
         self._learned_answers: dict[str, str] = {}
 
@@ -198,7 +203,7 @@ class LinkedInApplier(BaseApplier):
             self._logged_in = False
             await self._ensure_logged_in()
 
-        self._unknown_questions = []
+        self._unknown_question_prompts = {}
         self._answered_questions = []
         self._learned_answers = {}
         try:
@@ -215,10 +220,11 @@ class LinkedInApplier(BaseApplier):
             await self._bm.screenshot(self._page, f"error_{job.external_id}")
             result = self._fail(job, str(exc))
 
-        result.new_questions = list(dict.fromkeys(self._unknown_questions))
+        result.new_question_prompts = list(self._unknown_question_prompts.values())
+        result.new_questions = [prompt.question for prompt in result.new_question_prompts]
         result.answered_questions = list(self._answered_questions)
         result.learned_answers = dict(self._learned_answers)
-        self._unknown_questions = []
+        self._unknown_question_prompts = {}
         self._answered_questions = []
         self._learned_answers = {}
         return result
@@ -244,7 +250,7 @@ class LinkedInApplier(BaseApplier):
 
     @staticmethod
     def _normalize_choice(text: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "", text.lower())
+        return normalize_question_key(text)
 
     def _match_answer_to_options(self, answer: str, options: list[str]) -> str | None:
         if not options:
@@ -265,31 +271,45 @@ class LinkedInApplier(BaseApplier):
                 normalized_answer in normalized_option or normalized_option in normalized_answer
             ):
                 return option
+
+        semantic_answer = semantic_yes_no(cleaned_answer)
+        if semantic_answer is not None:
+            for option in options:
+                if semantic_yes_no(option) == semantic_answer:
+                    return option
         return None
 
     def _remember_answer(self, question: str, answer: str) -> None:
-        if not question:
+        normalized_question = normalize_question_text(question)
+        if not normalized_question:
             return
-        existing = self.profile.custom_answers.get(question)
+        existing = self.profile.custom_answers.get(normalized_question)
         if existing == answer:
             return
-        self.profile.custom_answers[question] = answer
-        self._learned_answers[question] = answer
+        self.profile.custom_answers[normalized_question] = answer
+        self._learned_answers[normalized_question] = answer
 
     def _record_answer(self, question: str, answer: str, source: str, field_type: str) -> None:
-        if not question:
+        normalized_question = normalize_question_text(question)
+        if not normalized_question:
             return
         self._answered_questions.append(
             AnsweredQuestion(
-                question=question,
+                question=normalized_question,
                 answer=answer,
                 source=source,
                 field_type=field_type,
             )
         )
         self._report_progress(
-            f"[LinkedIn][Question][{source}] {question} -> {self._preview_answer(answer)}"
+            f"[LinkedIn][Question][{source}] {normalized_question} -> {self._preview_answer(answer)}"
         )
+
+    def _record_prefilled_answer(self, question: str, answer: str, field_type: str) -> None:
+        cleaned_answer = self._clean_answer(answer)
+        if cleaned_answer is None:
+            return
+        self._record_answer(question, cleaned_answer, "prefilled", field_type)
 
     async def _resolve_answer(
         self,
@@ -297,11 +317,15 @@ class LinkedInApplier(BaseApplier):
         field_type: str,
         options: list[str] | None = None,
     ) -> tuple[str | None, str | None]:
-        question = label.strip()
+        question = normalize_question_text(label)
         if not question:
             return None, None
 
-        choice_options = [option for option in (options or []) if option.strip()]
+        choice_options = [
+            cleaned_option
+            for option in (options or [])
+            if (cleaned_option := self._clean_answer(option)) is not None
+        ]
 
         saved_answer = self._clean_answer(self._answer_for_label(question))
         if saved_answer is not None:
@@ -338,7 +362,13 @@ class LinkedInApplier(BaseApplier):
         suggested_answers = await resolver(
             [ApplicationQuestionPrompt(question=question, field_type=field_type, options=choice_options)]
         )
+        normalized_suggestions = {
+            normalize_question_key(raw_question): self._clean_answer(raw_answer)
+            for raw_question, raw_answer in suggested_answers.items()
+        }
         suggested_answer = self._clean_answer(suggested_answers.get(question))
+        if suggested_answer is None:
+            suggested_answer = normalized_suggestions.get(normalize_question_key(question))
         if suggested_answer is None:
             return None, None
 
@@ -353,12 +383,28 @@ class LinkedInApplier(BaseApplier):
         self._remember_answer(question, answer)
         return answer, "ai"
 
-    def _mark_unanswered(self, question: str, field_type: str) -> None:
-        if not question:
+    def _mark_unanswered(
+        self,
+        question: str,
+        field_type: str,
+        options: list[str] | None = None,
+    ) -> None:
+        normalized_question = normalize_question_text(question)
+        if not normalized_question:
             return
-        self._unknown_questions.append(question)
+        normalized_options = [
+            cleaned_option
+            for option in (options or [])
+            if (cleaned_option := self._clean_answer(option)) is not None
+        ]
+        self._unknown_question_prompts[normalized_question] = ApplicationQuestionPrompt(
+            question=normalized_question,
+            field_type=field_type,
+            options=normalized_options,
+        )
         self._report_progress(
-            f"[LinkedIn][Question][unanswered] Could not determine an answer for '{question}' ({field_type})",
+            f"[LinkedIn][Question][unanswered] Could not determine an answer for "
+            f"'{normalized_question}' ({field_type})",
             level="warning",
         )
 
@@ -837,11 +883,13 @@ class LinkedInApplier(BaseApplier):
         for inp in inputs:
             if not await inp.is_visible() or not await inp.is_enabled():
                 continue
+            label = await self._get_field_label(page, inp)
             current_val = await inp.input_value()
             if current_val.strip():
+                if label:
+                    self._record_prefilled_answer(label, current_val, "text")
                 continue  # already filled
 
-            label = await self._get_field_label(page, inp)
             value, source = await self._resolve_answer(label, "text")
             if value is not None and source is not None:
                 await inp.fill("")
@@ -855,20 +903,20 @@ class LinkedInApplier(BaseApplier):
         for area in areas:
             if not await area.is_visible() or not await area.is_enabled():
                 continue
+            label = await self._get_field_label(page, area)
             current_val = await area.input_value()
             if current_val.strip():
+                if label:
+                    self._record_prefilled_answer(label, current_val, "textarea")
                 continue
 
-            label = await self._get_field_label(page, area)
             label_lower = label.lower()
 
             if "cover letter" in label_lower or "cover_letter" in label_lower:
                 cl_text = getattr(self, "_cover_letter_text", None)
                 cl = cl_text if cl_text else self._build_cover_letter(job)
                 await area.fill(cl)
-                self._report_progress(
-                    f"[LinkedIn][Question][generated] {label or 'Cover letter'} -> {self._preview_answer(cl)}"
-                )
+                self._record_answer(label or "Cover letter", cl, "generated", "textarea")
                 continue
 
             if "additional" in label_lower or "summary" in label_lower or "about" in label_lower:
@@ -890,11 +938,22 @@ class LinkedInApplier(BaseApplier):
         for sel in selects:
             if not await sel.is_visible() or not await sel.is_enabled():
                 continue
+            label = await self._get_field_label(page, sel)
             current_val = await sel.input_value()
             if current_val and current_val not in ("", "Select an option"):
+                selected_label = current_val
+                try:
+                    selected_option = sel.locator("option:checked").first
+                    if await selected_option.count() > 0:
+                        candidate = self._clean_answer(await selected_option.inner_text())
+                        if candidate is not None:
+                            selected_label = candidate
+                except Exception:
+                    pass
+                if label:
+                    self._record_prefilled_answer(label, selected_label, "select")
                 continue
 
-            label = await self._get_field_label(page, sel)
             options = []
             option_elements = await sel.locator("option").all()
             for option in option_elements:
@@ -913,11 +972,11 @@ class LinkedInApplier(BaseApplier):
                         await sel.select_option(label=str(value))
                     except Exception:
                         logger.debug(f"[LinkedIn] Could not select '{value}' for '{label}'")
-                        self._mark_unanswered(label, "select")
+                        self._mark_unanswered(label, "select", options=options)
                         continue
                 self._record_answer(label, value, source, "select")
             elif label:
-                self._mark_unanswered(label, "select")
+                self._mark_unanswered(label, "select", options=options)
 
     async def _fill_radio_buttons(self, page: Page) -> None:
         fieldsets = await page.locator(self._modal_descendants(_RADIO_GROUPS)).all()
@@ -927,7 +986,9 @@ class LinkedInApplier(BaseApplier):
 
             legend = ""
             if await fieldset.locator("legend").count() > 0:
-                legend = (await fieldset.locator("legend").first.inner_text()).strip()
+                legend = normalize_question_text(
+                    (await fieldset.locator("legend").first.inner_text()).strip()
+                )
 
             radios = await fieldset.locator("input[type='radio']").all()
             radio_options: list[tuple[Locator, str]] = []
@@ -936,9 +997,24 @@ class LinkedInApplier(BaseApplier):
                 radio_label_el = page.locator(f"label[for='{radio_id}']")
                 radio_label = ""
                 if await radio_label_el.count() > 0:
-                    radio_label = (await radio_label_el.inner_text()).strip()
+                    radio_label = normalize_question_text(
+                        (await radio_label_el.inner_text()).strip()
+                    )
                 radio_value = (await radio.get_attribute("value") or "").strip()
                 radio_options.append((radio, radio_label or radio_value))
+
+            prefilled_option = None
+            for radio, option in radio_options:
+                try:
+                    if await radio.is_checked():
+                        prefilled_option = option or (await radio.get_attribute("value") or "").strip()
+                        break
+                except Exception:
+                    continue
+            if prefilled_option:
+                if legend:
+                    self._record_prefilled_answer(legend, prefilled_option, "radio")
+                continue
 
             answer, source = await self._resolve_answer(
                 legend,
@@ -947,7 +1023,11 @@ class LinkedInApplier(BaseApplier):
             )
             if answer is None or source is None:
                 if legend:
-                    self._mark_unanswered(legend, "radio")
+                    self._mark_unanswered(
+                        legend,
+                        "radio",
+                        options=[option for _, option in radio_options if option],
+                    )
                 continue
 
             matched_radio = False
@@ -959,7 +1039,11 @@ class LinkedInApplier(BaseApplier):
                     matched_radio = True
                     break
             if not matched_radio and legend:
-                self._mark_unanswered(legend, "radio")
+                self._mark_unanswered(
+                    legend,
+                    "radio",
+                    options=[option for _, option in radio_options if option],
+                )
 
     async def _fill_checkboxes(self, page: Page) -> None:
         checkboxes = await page.locator(self._modal_descendants(_CHECKBOXES)).all()
@@ -971,6 +1055,14 @@ class LinkedInApplier(BaseApplier):
             label = ""
             if label_el is not None and await label_el.count() > 0:
                 label = (await label_el.inner_text()).strip()
+
+            try:
+                if await cb.is_checked():
+                    if label:
+                        self._record_prefilled_answer(label, "Yes", "checkbox")
+                    continue
+            except Exception:
+                pass
 
             answer, source = await self._resolve_answer(label, "checkbox", options=["Yes", "No"])
             if answer is None or source is None:
@@ -1112,16 +1204,26 @@ class LinkedInApplier(BaseApplier):
 
     def _answer_for_label(self, label: str) -> str | None:
         """Look up the label against user profile custom_answers (case-insensitive)."""
-        label_lower = label.lower().strip()
+        label_lower = normalize_question_key(normalize_question_text(label))
+        if not label_lower:
+            return None
         for key, val in self.profile.custom_answers.items():
-            if key.lower().strip() in label_lower or label_lower in key.lower().strip():
+            normalized_key = normalize_question_key(normalize_question_text(key))
+            if normalized_key and (
+                normalized_key in label_lower or label_lower in normalized_key
+            ):
                 return val
         return None
 
     def _infer_value_from_label(self, label: str) -> str | None:
         """Infer an answer from user profile fields based on label text."""
-        label_lower = label.lower()
+        label_lower = normalize_question_text(label).lower()
         p = self.profile
+        preferred_work_modes = {
+            mode.lower()
+            for mode in getattr(p.preferences, "preferred_work_modes", [])
+            if isinstance(mode, str)
+        }
 
         if any(w in label_lower for w in ("first name", "given name")):
             return p.first_name
@@ -1149,6 +1251,28 @@ class LinkedInApplier(BaseApplier):
             return str(p.years_of_experience) if p.years_of_experience else ""
         if "summary" in label_lower or "headline" in label_lower:
             return p.headline or ""
+        if any(
+            phrase in label_lower
+            for phrase in (
+                "comfortable commuting",
+                "comfortable to commute",
+                "able to commute",
+                "commuting to this job",
+                "commute to this job",
+                "commute to the job",
+            )
+        ):
+            return "Yes" if preferred_work_modes & {"hybrid", "onsite"} else "No"
+        if any(
+            phrase in label_lower
+            for phrase in (
+                "comfortable working in a hybrid setting",
+                "comfortable working in hybrid",
+                "hybrid setting",
+                "hybrid environment",
+            )
+        ):
+            return "Yes" if "hybrid" in preferred_work_modes else "No"
 
         return None
 

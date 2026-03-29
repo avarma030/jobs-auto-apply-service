@@ -226,6 +226,47 @@ async def test_run_apply_persists_learned_answers_from_applier(monkeypatch):
     save_profile_mock.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_handle_new_questions_preserves_prompt_metadata_and_normalizes_keys(monkeypatch):
+    db = FakeDb([])
+    orch = Orchestrator(profile=make_profile(), db=db)
+
+    monkeypatch.setattr(orch, "_get_ai_client", lambda: object())
+
+    prompts = [
+        ApplicationQuestionPrompt(
+            question=(
+                "Are you comfortable commuting to this job's location?\n"
+                "Are you comfortable commuting to this job's location?\nRequired"
+            ),
+            field_type="radio",
+            options=["Yes", "No"],
+        )
+    ]
+    suggest_mock = AsyncMock(
+        return_value={"Are you comfortable commuting to this job's location?": "Yes"}
+    )
+
+    with patch("src.orchestrator.profile_extractor.suggest_answers", new=suggest_mock), patch(
+        "src.orchestrator.save_profile"
+    ) as save_profile_mock:
+        await orch._handle_new_questions(prompts, user_id=42)
+
+    called_prompts = suggest_mock.await_args.args[0]
+    assert len(called_prompts) == 1
+    assert called_prompts[0].question == "Are you comfortable commuting to this job's location?"
+    assert called_prompts[0].field_type == "radio"
+    assert called_prompts[0].options == ["Yes", "No"]
+    assert db.profile_answer_updates == [
+        {
+            "user_id": 42,
+            "custom_answers": {"Are you comfortable commuting to this job's location?": "Yes"},
+        }
+    ]
+    assert orch.profile.custom_answers["Are you comfortable commuting to this job's location?"] == "Yes"
+    save_profile_mock.assert_called_once()
+
+
 class FakeScraper:
     def __init__(self, credentials=None):
         self.credentials = credentials or {}

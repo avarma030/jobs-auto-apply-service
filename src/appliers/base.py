@@ -32,6 +32,7 @@ class ApplicationResult:
         message: str = "",
         confirmation_id: str | None = None,
         new_questions: list[str] | None = None,
+        new_question_prompts: list[ApplicationQuestionPrompt] | None = None,
         answered_questions: list[AnsweredQuestion] | None = None,
         learned_answers: dict[str, str] | None = None,
     ):
@@ -43,6 +44,7 @@ class ApplicationResult:
         # The orchestrator will use Claude to generate answers and save them back
         # to the profile so future applications answer them automatically.
         self.new_questions: list[str] = new_questions or []
+        self.new_question_prompts: list[ApplicationQuestionPrompt] = new_question_prompts or []
         self.answered_questions: list[AnsweredQuestion] = answered_questions or []
         self.learned_answers: dict[str, str] = learned_answers or {}
 

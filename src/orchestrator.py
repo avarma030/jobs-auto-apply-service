@@ -29,6 +29,7 @@ from src.scrapers.monster import MonsterScraper
 from src.scrapers.workday import WorkdayScraper
 from src.scrapers.ziprecruiter import ZipRecruiterScraper
 from src.services import ai_matcher, cover_letter as cover_letter_svc, pdf_builder, profile_extractor, resume_parser, resume_tailor
+from src.services.application_questions import normalize_question_text
 from src.services.job_classifier import detect_ats
 from src.utils.profile_loader import save_profile
 
@@ -181,10 +182,19 @@ class Orchestrator:
                     _emit(
                         f"[Profile][Saved] Stored {saved_count} new question-answer pair(s) for future applications"
                     )
-            if result.new_questions:
-                _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")
+            new_question_prompts = list(getattr(result, "new_question_prompts", []) or [])
+            if not new_question_prompts and result.new_questions:
+                new_question_prompts = [
+                    ApplicationQuestionPrompt(question=question, field_type="text")
+                    for question in result.new_questions
+                    if question.strip()
+                ]
+            if new_question_prompts:
+                _emit(
+                    f"  💡 Learned {len(new_question_prompts)} new Q&A pair(s) from this application"
+                )
                 await self._handle_new_questions(
-                    result.new_questions,
+                    new_question_prompts,
                     user_id=user_id,
                     progress_callback=_emit,
                 )
@@ -444,10 +454,19 @@ class Orchestrator:
                     _emit(
                         f"[Profile][Saved] Stored {saved_count} new question-answer pair(s) for future applications"
                     )
-            if result.new_questions:
-                _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")
+            new_question_prompts = list(getattr(result, "new_question_prompts", []) or [])
+            if not new_question_prompts and result.new_questions:
+                new_question_prompts = [
+                    ApplicationQuestionPrompt(question=question, field_type="text")
+                    for question in result.new_questions
+                    if question.strip()
+                ]
+            if new_question_prompts:
+                _emit(
+                    f"  💡 Learned {len(new_question_prompts)} new Q&A pair(s) from this application"
+                )
                 await self._handle_new_questions(
-                    result.new_questions,
+                    new_question_prompts,
                     user_id=user_id,
                     progress_callback=_emit,
                 )
@@ -538,9 +557,9 @@ class Orchestrator:
         progress_callback: Callable[[str], None] | None = None,
     ) -> int:
         cleaned_answers = {
-            str(question).strip(): str(answer).strip()
+            normalize_question_text(str(question)): str(answer).strip()
             for question, answer in answers.items()
-            if str(question).strip() and str(answer).strip()
+            if normalize_question_text(str(question)) and str(answer).strip()
         }
         if not cleaned_answers:
             return 0
@@ -573,14 +592,18 @@ class Orchestrator:
 
     async def _handle_new_questions(
         self,
-        questions: list[str],
+        prompts: list[ApplicationQuestionPrompt],
         user_id: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> None:
         prompts = [
-            ApplicationQuestionPrompt(question=question, field_type="text")
-            for question in questions
-            if question.strip()
+            ApplicationQuestionPrompt(
+                question=normalize_question_text(prompt.question),
+                field_type=prompt.field_type,
+                options=[str(option).strip() for option in prompt.options if str(option).strip()],
+            )
+            for prompt in prompts
+            if normalize_question_text(prompt.question)
         ]
         new_answers = await self._suggest_question_answers(
             prompts,
@@ -595,40 +618,6 @@ class Orchestrator:
             user_id=user_id,
             progress_callback=progress_callback,
         )
-        return
-        ai = self._get_ai_client()
-        if not ai:
-            logger.warning(f"New questions found but no AI client — skipping: {questions}")
-            return
-
-        try:
-            new_answers = await profile_extractor.suggest_answers(
-                questions, self.profile, ai, settings.anthropic_model
-            )
-        except Exception as exc:
-            logger.error(f"suggest_answers error: {exc}")
-            return
-
-        if not new_answers:
-            return
-
-        self.profile.custom_answers.update(new_answers)
-        logger.info(
-            f"Learned {len(new_answers)} new Q&A pairs: {list(new_answers.keys())}"
-        )
-
-        # Persist to filesystem (always — keeps CLI and API in sync)
-        try:
-            save_profile(self.profile, settings.user_profile_path)
-        except Exception as exc:
-            logger.warning(f"Could not save profile to file: {exc}")
-
-        # Persist to DB (API / multi-user mode)
-        if user_id is not None:
-            try:
-                await self.db.update_profile_custom_answers(user_id, self.profile.custom_answers)
-            except Exception as exc:
-                logger.warning(f"Could not save custom_answers to DB: {exc}")
 
     async def _scrape_board(
         self,

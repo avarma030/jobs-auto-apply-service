@@ -75,7 +75,7 @@ def make_applier(profile: UserProfile | None = None) -> LinkedInApplier:
     applier._bm = None
     applier._page = None
     applier._logged_in = False
-    applier._unknown_questions = []
+    applier._unknown_question_prompts = {}
     applier._answered_questions = []
     applier._learned_answers = {}
     return applier
@@ -257,6 +257,85 @@ async def test_resolve_answer_uses_ai_resolver_and_saves_exact_question():
     assert ai_answer == "No"
     assert ai_source == "ai"
     assert applier.profile.custom_answers["Are you open to relocation?"] == "No"
+
+
+@pytest.mark.asyncio
+async def test_resolve_answer_matches_ai_answers_against_normalized_question_key():
+    applier = make_applier()
+    applier.answer_resolver = AsyncMock(return_value={"Are you open to occasional travel?": "Yes"})
+
+    answer, source = await applier._resolve_answer(
+        "Are you open to occasional travel?\nAre you open to occasional travel?\nRequired",
+        "radio",
+        options=["Yes", "No"],
+    )
+
+    assert answer == "Yes"
+    assert source == "ai"
+    assert applier.profile.custom_answers["Are you open to occasional travel?"] == "Yes"
+
+
+@pytest.mark.asyncio
+async def test_resolve_answer_infers_commute_and_hybrid_questions_from_preferences():
+    applier = make_applier()
+
+    commute_answer, commute_source = await applier._resolve_answer(
+        "Are you comfortable commuting to this job's location?\n"
+        "Are you comfortable commuting to this job's location?\nRequired",
+        "radio",
+        options=["Yes", "No"],
+    )
+    hybrid_answer, hybrid_source = await applier._resolve_answer(
+        "Are you comfortable working in a hybrid setting?\n"
+        "Are you comfortable working in a hybrid setting?\nRequired",
+        "radio",
+        options=["Yes", "No"],
+    )
+
+    assert commute_answer == "Yes"
+    assert commute_source == "inferred"
+    assert hybrid_answer == "Yes"
+    assert hybrid_source == "inferred"
+    assert applier.profile.custom_answers["Are you comfortable commuting to this job's location?"] == "Yes"
+    assert applier.profile.custom_answers["Are you comfortable working in a hybrid setting?"] == "Yes"
+
+
+def test_match_answer_to_options_maps_yes_no_semantics_across_localized_options():
+    applier = make_applier()
+    assert applier._match_answer_to_options("Yes", ["Sí", "No"]) == "Sí"
+    assert applier._match_answer_to_options("No", ["Sí", "No"]) == "No"
+
+
+def test_mark_unanswered_stores_normalized_prompt_metadata():
+    applier = make_applier()
+
+    applier._mark_unanswered(
+        "Are you comfortable working in a hybrid setting?\n"
+        "Are you comfortable working in a hybrid setting?\nRequired",
+        "radio",
+        options=["Yes", "No"],
+    )
+
+    prompt = applier._unknown_question_prompts["Are you comfortable working in a hybrid setting?"]
+    assert prompt.field_type == "radio"
+    assert prompt.options == ["Yes", "No"]
+
+
+def test_record_prefilled_answer_logs_visible_question_and_answer():
+    applier = make_applier()
+    messages: list[str] = []
+    applier.progress_callback = messages.append
+
+    applier._record_prefilled_answer("Email address", "jane@example.com", "text")
+
+    assert len(applier._answered_questions) == 1
+    assert applier._answered_questions[0].question == "Email address"
+    assert applier._answered_questions[0].answer == "jane@example.com"
+    assert applier._answered_questions[0].source == "prefilled"
+    assert any(
+        "[LinkedIn][Question][prefilled] Email address -> jane@example.com" in message
+        for message in messages
+    )
 
 
 class TestInferValueFromLabel:

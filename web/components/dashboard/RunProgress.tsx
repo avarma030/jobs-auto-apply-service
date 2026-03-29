@@ -189,6 +189,7 @@ export function RunProgress({ onComplete }: Props) {
   const [boards, setBoards] = useState<string[]>(["linkedin"]);
 
   const { latest, messages, done } = useRunStream(runId);
+  const trimmedLocation = location.trim();
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -207,11 +208,12 @@ export function RunProgress({ onComplete }: Props) {
 
   async function startRun() {
     if (boards.length === 0) { alert("Select at least one job board."); return; }
+    if (!trimmedLocation) { alert("Location is required."); return; }
     setLoading(true);
     try {
       const res = await jobsApi.scrape({
         keywords: keywords.split(",").map((k) => k.trim()).filter(Boolean),
-        location: location || undefined,
+        location: trimmedLocation,
         work_modes: workModes,
         job_types: jobTypes,
         experience_levels: expLevels,
@@ -231,6 +233,7 @@ export function RunProgress({ onComplete }: Props) {
   }
 
   const isRunning = !!runId && !done;
+  const canStartRun = !loading && !isRunning && boards.length > 0 && trimmedLocation.length > 0;
   const parsedMessages = messages.map(parseLogMessage);
 
   return (
@@ -248,9 +251,17 @@ export function RunProgress({ onComplete }: Props) {
                   placeholder="software engineer, python dev" className="mt-1" />
               </div>
               <div>
-                <Label className="text-xs text-muted-foreground">Location (optional)</Label>
-                <Input value={location} onChange={(e) => setLocation(e.target.value)}
-                  placeholder="New York, NY" className="mt-1" />
+                <Label className="text-xs text-muted-foreground">Location</Label>
+                <Input
+                  required
+                  value={location}
+                  onChange={(e) => setLocation(e.target.value)}
+                  placeholder="New York, NY"
+                  className="mt-1"
+                />
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Enter the location you want this search run to target.
+                </p>
               </div>
             </div>
 
@@ -459,7 +470,7 @@ export function RunProgress({ onComplete }: Props) {
           </div>
         )}
 
-        <Button onClick={startRun} disabled={loading || isRunning} className="w-full">
+        <Button onClick={startRun} disabled={!canStartRun} className="w-full">
           <Play className="h-4 w-4 mr-2" />
           {isRunning ? "Running…" : loading ? "Starting…" : "Start Scraping"}
         </Button>
