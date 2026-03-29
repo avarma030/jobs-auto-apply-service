@@ -251,6 +251,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             easy_apply_only=req.easy_apply_only,
             max_age_days=req.max_age_days,
             max_jobs=req.max_jobs,
+            min_match_score=req.min_match_score,
         )
 
         # Load profile from DB for this user; fall back to sensible defaults so

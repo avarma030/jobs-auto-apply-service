@@ -53,6 +53,8 @@ class ScrapeRequest(BaseModel):
     max_age_days: int = 7
     # Maximum number of jobs to scrape per board (None = no limit)
     max_jobs: Optional[int] = None
+    # Minimum match % to qualify a job for tailoring + apply (None = use server default 75%)
+    min_match_score: Optional[int] = None
 
 
 class JobStatusUpdate(BaseModel):

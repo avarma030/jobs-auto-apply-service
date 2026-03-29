@@ -69,6 +69,7 @@ export function RunProgress({ onComplete }: Props) {
   const [easyApplyOnly, setEasyApplyOnly] = useState(false);
   const [maxAgeDays, setMaxAgeDays] = useState(7);
   const [maxJobs, setMaxJobs] = useState<string>("");  // empty = no limit
+  const [minMatchScore, setMinMatchScore] = useState<number>(75);
   const [boards, setBoards] = useState<string[]>(["linkedin"]);
 
   const { latest, messages, done } = useRunStream(runId);
@@ -102,6 +103,7 @@ export function RunProgress({ onComplete }: Props) {
         boards,
         max_age_days: maxAgeDays,
         max_jobs: maxJobs ? parseInt(maxJobs, 10) : undefined,
+        min_match_score: minMatchScore,
       });
       setRunId(res.run_id);
     } catch (err: any) {
@@ -143,6 +145,18 @@ export function RunProgress({ onComplete }: Props) {
                   value={maxJobs}
                   onChange={(e) => setMaxJobs(e.target.value)}
                   placeholder="e.g. 50"
+                  className="mt-1"
+                />
+              </div>
+              <div>
+                <Label className="text-xs text-muted-foreground">Min Match % (0–100)</Label>
+                <Input
+                  type="number"
+                  min="0"
+                  max="100"
+                  value={minMatchScore}
+                  onChange={(e) => setMinMatchScore(Number(e.target.value))}
+                  placeholder="75"
                   className="mt-1"
                 />
               </div>

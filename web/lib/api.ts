@@ -69,6 +69,7 @@ export const jobs = {
     boards: string[];
     max_age_days?: number;
     max_jobs?: number;
+    min_match_score?: number;
   }) =>
     request<{ run_id: string }>("/jobs/scrape", { method: "POST", body: JSON.stringify(body) }),
   /** Returns a download URL for Excel export. Open or assign to window.location.href. */

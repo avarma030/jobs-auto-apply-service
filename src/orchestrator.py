@@ -188,35 +188,9 @@ class Orchestrator:
             scrape_run_id=run_id,
         )
 
-        # ------------------------------------------------------------------
-        # Enrich jobs with full descriptions before scoring
-        # ------------------------------------------------------------------
-        need_details = [r for r in pending if not (r.description or "").strip()]
-        if need_details:
-            _emit(f"🔎 Fetching full descriptions for {len(need_details)} jobs …")
-            boards = settings.enabled_board_list()
-            for board in boards:
-                scraper_cls = SCRAPER_REGISTRY.get(board)
-                if not scraper_cls:
-                    continue
-                board_records = [r for r in need_details if r.source_board == board]
-                if not board_records:
-                    continue
-                try:
-                    async with scraper_cls(credentials=self._get_creds(board)) as scraper:
-                        for record in board_records:
-                            job = self._record_to_job(record)
-                            try:
-                                enriched = await scraper.get_job_details(job)
-                                if enriched.description:
-                                    record.description = enriched.description
-                                    record.easy_apply = enriched.easy_apply
-                                    await self.db.update_job_details(record.id, enriched)
-                            except Exception as exc:
-                                logger.warning(f"Could not fetch details for {job.title}: {exc}")
-                            await asyncio.sleep(settings.request_delay_seconds)
-                except Exception as exc:
-                    logger.error(f"[{board}] Detail fetch error: {exc}")
+        # Note: get_job_details() is called inline per-job in _scrape_board() while the
+        # scraper session is warm. Jobs that still have no description are skipped during
+        # scoring below with a clear message — no separate second-pass needed.
 
         if not resume_text:
             _emit(
@@ -226,7 +200,13 @@ class Orchestrator:
         if not ai:
             _emit("⚠️  ANTHROPIC_API_KEY not set — scoring and tailoring disabled.")
 
-        _emit(f"🧠 Scoring {len(pending)} jobs against your resume …")
+        # Resolve match threshold: per-run override takes precedence over global setting
+        effective_threshold = (
+            search_filter.min_match_score
+            if search_filter.min_match_score is not None
+            else settings.min_match_score
+        )
+        _emit(f"🧠 Scoring {len(pending)} jobs — threshold: {effective_threshold:.0f}% …")
 
         qualified: list[tuple] = []  # (record, job)
         skipped_score = 0
@@ -253,13 +233,13 @@ class Orchestrator:
             # Persist match score
             await self.db.update_job_ai_fields(record.id, match_score=score)
 
-            if score < settings.min_match_score:
+            if score < effective_threshold:
                 skipped_score += 1
-                _emit(f"  ❌ [{i}/{len(pending)}] '{job.title}' @ {job.company} — {score:.0f}% (below {settings.min_match_score:.0f}% threshold)")
+                _emit(f"  ❌ [{i}/{len(pending)}] '{job.title}' @ {job.company} — {score:.0f}% (below {effective_threshold:.0f}%)")
                 await self.db.update_job_status(
                     record.id,
                     ApplicationStatus.SKIPPED,
-                    notes=f"Match score {score:.0f}% < threshold {settings.min_match_score:.0f}%",
+                    notes=f"Match score {score:.0f}% < threshold {effective_threshold:.0f}%",
                 )
             else:
                 _emit(f"  ✅ [{i}/{len(pending)}] '{job.title}' @ {job.company} — {score:.0f}% match ✓")
