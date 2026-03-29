@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Type
@@ -8,7 +9,7 @@ from typing import Callable, Type
 import anthropic
 from loguru import logger
 
-from src.appliers.base import BaseApplier
+from src.appliers.base import ApplicationQuestionPrompt, BaseApplier
 from src.appliers.generic import GenericApplier
 from src.appliers.greenhouse import GreenhouseApplier
 from src.appliers.lever import LeverApplier
@@ -135,6 +136,7 @@ class Orchestrator:
                 continue
 
             applier = self._pick_applier(job)
+            self._configure_applier(applier, user_id=user_id, progress_callback=_emit)
             _emit(f"📤 Applying to '{job.title}' @ {job.company} …")
             try:
                 async with applier as a:
@@ -169,9 +171,23 @@ class Orchestrator:
                 message=result.message,
                 user_id=user_id,
             )
+            if result.learned_answers:
+                saved_count = await self._persist_custom_answers(
+                    result.learned_answers,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
+                if saved_count:
+                    _emit(
+                        f"[Profile][Saved] Stored {saved_count} new question-answer pair(s) for future applications"
+                    )
             if result.new_questions:
                 _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")
-                await self._handle_new_questions(result.new_questions)
+                await self._handle_new_questions(
+                    result.new_questions,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
 
         _emit(
             f"🏁 Apply run complete — applied: {counts['applied']}, "
@@ -384,6 +400,7 @@ class Orchestrator:
 
             _emit(f"📤 Applying to '{job.title}' @ {job.company} (ATS: {ats_type}) …")
             applier = self._pick_applier(job)
+            self._configure_applier(applier, user_id=user_id, progress_callback=_emit)
             try:
                 async with applier as a:
                     result = await a.apply(
@@ -417,9 +434,23 @@ class Orchestrator:
                 message=result.message,
                 user_id=user_id,
             )
+            if result.learned_answers:
+                saved_count = await self._persist_custom_answers(
+                    result.learned_answers,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
+                if saved_count:
+                    _emit(
+                        f"[Profile][Saved] Stored {saved_count} new question-answer pair(s) for future applications"
+                    )
             if result.new_questions:
                 _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")
-                await self._handle_new_questions(result.new_questions, user_id)
+                await self._handle_new_questions(
+                    result.new_questions,
+                    user_id=user_id,
+                    progress_callback=_emit,
+                )
 
         _emit(
             f"🏁 Pipeline complete — applied: {counts['applied']}, "
@@ -441,13 +472,130 @@ class Orchestrator:
             self._ai_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         return self._ai_client
 
+    def _configure_applier(
+        self,
+        applier: BaseApplier,
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> None:
+        applier.progress_callback = progress_callback
+        applier.answer_resolver = self._build_answer_resolver(
+            user_id=user_id,
+            progress_callback=progress_callback,
+        )
+
+    def _build_answer_resolver(
+        self,
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> Callable[[list[ApplicationQuestionPrompt]], Awaitable[dict[str, str]]]:
+        async def _resolve(prompts: list[ApplicationQuestionPrompt]) -> dict[str, str]:
+            return await self._suggest_question_answers(
+                prompts,
+                user_id=user_id,
+                progress_callback=progress_callback,
+            )
+
+        return _resolve
+
+    async def _suggest_question_answers(
+        self,
+        prompts: list[ApplicationQuestionPrompt],
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict[str, str]:
+        del user_id
+
+        questions = [prompt.question.strip() for prompt in prompts if prompt.question.strip()]
+        if not questions:
+            return {}
+
+        ai = self._get_ai_client()
+        if not ai:
+            logger.warning(f"New questions found but no AI client - skipping: {questions}")
+            return {}
+
+        if progress_callback:
+            progress_callback(
+                f"[AI][Questions] Attempting to answer {len(questions)} new application question(s)"
+            )
+
+        try:
+            return await profile_extractor.suggest_answers(
+                prompts,
+                self.profile,
+                ai,
+                settings.anthropic_model,
+            )
+        except Exception as exc:
+            logger.error(f"suggest_answers error: {exc}")
+            return {}
+
+    async def _persist_custom_answers(
+        self,
+        answers: dict[str, str],
+        user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> int:
+        cleaned_answers = {
+            str(question).strip(): str(answer).strip()
+            for question, answer in answers.items()
+            if str(question).strip() and str(answer).strip()
+        }
+        if not cleaned_answers:
+            return 0
+
+        changed_answers = {
+            question: answer
+            for question, answer in cleaned_answers.items()
+            if self.profile.custom_answers.get(question) != answer
+        }
+        if not changed_answers:
+            return 0
+
+        self.profile.custom_answers.update(changed_answers)
+        logger.info(
+            f"Learned {len(changed_answers)} new Q&A pairs: {list(changed_answers.keys())}"
+        )
+
+        try:
+            save_profile(self.profile, settings.user_profile_path)
+        except Exception as exc:
+            logger.warning(f"Could not save profile to file: {exc}")
+
+        if user_id is not None:
+            try:
+                await self.db.update_profile_custom_answers(user_id, changed_answers)
+            except Exception as exc:
+                logger.warning(f"Could not save custom_answers to DB: {exc}")
+
+        return len(changed_answers)
+
     async def _handle_new_questions(
         self,
         questions: list[str],
         user_id: int | None = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> None:
-        """Use Claude to generate answers for unknown screening questions,
-        then persist Q&A pairs to profile (file + DB) for future runs."""
+        prompts = [
+            ApplicationQuestionPrompt(question=question, field_type="text")
+            for question in questions
+            if question.strip()
+        ]
+        new_answers = await self._suggest_question_answers(
+            prompts,
+            user_id=user_id,
+            progress_callback=progress_callback,
+        )
+        if not new_answers:
+            return
+
+        await self._persist_custom_answers(
+            new_answers,
+            user_id=user_id,
+            progress_callback=progress_callback,
+        )
+        return
         ai = self._get_ai_client()
         if not ai:
             logger.warning(f"New questions found but no AI client — skipping: {questions}")

@@ -39,7 +39,12 @@ from typing import Optional
 from loguru import logger
 from playwright.async_api import Locator, Page, TimeoutError as PWTimeoutError
 
-from src.appliers.base import ApplicationResult, BaseApplier
+from src.appliers.base import (
+    AnsweredQuestion,
+    ApplicationQuestionPrompt,
+    ApplicationResult,
+    BaseApplier,
+)
 from src.config import settings
 from src.models import Job, UserProfile
 from src.utils.browser import BrowserManager, BrowserManager as _BM
@@ -148,6 +153,8 @@ class LinkedInApplier(BaseApplier):
         self._page: Page | None = None
         self._logged_in = False
         self._unknown_questions: list[str] = []
+        self._answered_questions: list[AnsweredQuestion] = []
+        self._learned_answers: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -192,6 +199,8 @@ class LinkedInApplier(BaseApplier):
             await self._ensure_logged_in()
 
         self._unknown_questions = []
+        self._answered_questions = []
+        self._learned_answers = {}
         try:
             # Note: we do NOT gate on job.easy_apply here because the DB flag is often
             # wrong (Voyager API scrape sets description but not easy_apply).
@@ -207,8 +216,151 @@ class LinkedInApplier(BaseApplier):
             result = self._fail(job, str(exc))
 
         result.new_questions = list(dict.fromkeys(self._unknown_questions))
+        result.answered_questions = list(self._answered_questions)
+        result.learned_answers = dict(self._learned_answers)
         self._unknown_questions = []
+        self._answered_questions = []
+        self._learned_answers = {}
         return result
+
+    def _report_progress(self, message: str, level: str = "info") -> None:
+        log_fn = getattr(logger, level, logger.info)
+        log_fn(message)
+        self._emit_progress(message)
+
+    @staticmethod
+    def _preview_answer(answer: str, max_len: int = 100) -> str:
+        compact = " ".join(str(answer).split())
+        if len(compact) <= max_len:
+            return compact
+        return f"{compact[: max_len - 3]}..."
+
+    @staticmethod
+    def _clean_answer(answer: str | None) -> str | None:
+        if answer is None:
+            return None
+        cleaned = str(answer).strip()
+        return cleaned or None
+
+    @staticmethod
+    def _normalize_choice(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", text.lower())
+
+    def _match_answer_to_options(self, answer: str, options: list[str]) -> str | None:
+        if not options:
+            return answer
+
+        cleaned_answer = self._clean_answer(answer)
+        if cleaned_answer is None:
+            return None
+
+        normalized_answer = self._normalize_choice(cleaned_answer)
+        for option in options:
+            normalized_option = self._normalize_choice(option)
+            if normalized_answer == normalized_option:
+                return option
+        for option in options:
+            normalized_option = self._normalize_choice(option)
+            if normalized_answer and (
+                normalized_answer in normalized_option or normalized_option in normalized_answer
+            ):
+                return option
+        return None
+
+    def _remember_answer(self, question: str, answer: str) -> None:
+        if not question:
+            return
+        existing = self.profile.custom_answers.get(question)
+        if existing == answer:
+            return
+        self.profile.custom_answers[question] = answer
+        self._learned_answers[question] = answer
+
+    def _record_answer(self, question: str, answer: str, source: str, field_type: str) -> None:
+        if not question:
+            return
+        self._answered_questions.append(
+            AnsweredQuestion(
+                question=question,
+                answer=answer,
+                source=source,
+                field_type=field_type,
+            )
+        )
+        self._report_progress(
+            f"[LinkedIn][Question][{source}] {question} -> {self._preview_answer(answer)}"
+        )
+
+    async def _resolve_answer(
+        self,
+        label: str,
+        field_type: str,
+        options: list[str] | None = None,
+    ) -> tuple[str | None, str | None]:
+        question = label.strip()
+        if not question:
+            return None, None
+
+        choice_options = [option for option in (options or []) if option.strip()]
+
+        saved_answer = self._clean_answer(self._answer_for_label(question))
+        if saved_answer is not None:
+            matched = self._match_answer_to_options(saved_answer, choice_options)
+            if choice_options and matched is None:
+                logger.debug(
+                    f"[LinkedIn] Saved answer for '{question}' did not match options: {choice_options}"
+                )
+            else:
+                answer = matched or saved_answer
+                self._remember_answer(question, answer)
+                return answer, "saved"
+
+        inferred_answer = self._clean_answer(self._infer_value_from_label(question))
+        if inferred_answer is not None:
+            matched = self._match_answer_to_options(inferred_answer, choice_options)
+            if choice_options and matched is None:
+                logger.debug(
+                    f"[LinkedIn] Inferred answer for '{question}' did not match options: {choice_options}"
+                )
+            else:
+                answer = matched or inferred_answer
+                self._remember_answer(question, answer)
+                return answer, "inferred"
+
+        resolver = getattr(self, "answer_resolver", None)
+        if resolver is None:
+            return None, None
+
+        self._report_progress(
+            f"[LinkedIn][Question][ai] Requesting answer for '{question}'",
+            level="debug",
+        )
+        suggested_answers = await resolver(
+            [ApplicationQuestionPrompt(question=question, field_type=field_type, options=choice_options)]
+        )
+        suggested_answer = self._clean_answer(suggested_answers.get(question))
+        if suggested_answer is None:
+            return None, None
+
+        matched = self._match_answer_to_options(suggested_answer, choice_options)
+        if choice_options and matched is None:
+            logger.debug(
+                f"[LinkedIn] AI answer for '{question}' did not match options: {choice_options}"
+            )
+            return None, None
+
+        answer = matched or suggested_answer
+        self._remember_answer(question, answer)
+        return answer, "ai"
+
+    def _mark_unanswered(self, question: str, field_type: str) -> None:
+        if not question:
+            return
+        self._unknown_questions.append(question)
+        self._report_progress(
+            f"[LinkedIn][Question][unanswered] Could not determine an answer for '{question}' ({field_type})",
+            level="warning",
+        )
 
     # ------------------------------------------------------------------
     # Session / login helpers
@@ -231,9 +383,8 @@ class LinkedInApplier(BaseApplier):
                 logger.debug("[LinkedIn] Scraper cookies present but no li_at — skipping injection")
                 return False
             if age > _COOKIE_MAX_AGE:
-                logger.info(
-                    f"[LinkedIn] Scraper cookies are {age / 3600:.1f}h old - older than preferred, "
-                    "but still attempting reuse"
+                self._report_progress(
+                    f"[LinkedIn][Auth] Scraper cookies are {age / 3600:.1f}h old - attempting reuse"
                 )
             # Convert flat dict → Playwright cookie objects
             pw_cookies = [
@@ -252,9 +403,8 @@ class LinkedInApplier(BaseApplier):
                 for k, v in cookies.items()
             ]
             await self._bm._context.add_cookies(pw_cookies)
-            logger.info(
-                f"[LinkedIn] Injected {len(pw_cookies)} warm scraper cookies "
-                f"({age / 60:.0f} min old, li_at present)"
+            self._report_progress(
+                f"[LinkedIn][Auth] Injected {len(pw_cookies)} warm scraper cookies ({age / 60:.0f} min old)"
             )
             return True
         except Exception as exc:
@@ -308,6 +458,7 @@ class LinkedInApplier(BaseApplier):
             logger.warning(f"[LinkedIn] Feed navigation failed: {exc}")
 
         if await self._is_logged_in(page):
+            self._report_progress("[LinkedIn][Auth] Session active")
             logger.info("[LinkedIn] Session active — already logged in ✓")
             self._logged_in = True
             return
@@ -322,6 +473,7 @@ class LinkedInApplier(BaseApplier):
             return
 
         logger.info(f"[LinkedIn] Logging in as {username} …")
+        self._report_progress(f"[LinkedIn][Auth] Logging in as {username}")
         try:
             await page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
@@ -332,6 +484,7 @@ class LinkedInApplier(BaseApplier):
         # If already redirected away from /login, check whether we're authenticated
         if "/login" not in page.url and "/checkpoint" not in page.url:
             if await self._is_logged_in(page):
+                self._report_progress("[LinkedIn][Auth] Persistent profile session detected")
                 logger.info("[LinkedIn] Persistent profile session detected — already logged in ✓")
                 self._logged_in = True
                 return
@@ -440,11 +593,13 @@ class LinkedInApplier(BaseApplier):
         page = self._page
         self._tailored_resume_path = tailored_resume_path
         self._cover_letter_text = cover_letter
+        self._report_progress(f"[LinkedIn][Apply] Starting Easy Apply for {job.title} @ {job.company}")
         logger.info(f"[LinkedIn] Easy Apply → {job.title} @ {job.company}")
 
         # Navigate to job page — normalize locale subdomains first (safety net for
         # URLs stored in DB before the scraper fix, e.g. de.linkedin.com → www.linkedin.com)
         job_url = re.sub(r"https://[a-z]{2}\.linkedin\.com/", "https://www.linkedin.com/", job.url)
+        self._report_progress(f"[LinkedIn][Apply] Opening job page: {job_url}")
         try:
             await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
@@ -453,6 +608,7 @@ class LinkedInApplier(BaseApplier):
 
         # Detect mid-run session expiry
         if "/login" in page.url or "/authwall" in page.url:
+            self._report_progress("[LinkedIn][Auth] Redirected to login mid-run")
             logger.info("[LinkedIn] Redirected to login mid-run — re-authenticating …")
             await self._ensure_logged_in()
             await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
@@ -509,6 +665,7 @@ class LinkedInApplier(BaseApplier):
         except PWTimeoutError:
             await self._bm.screenshot(page, f"modal_timeout_{job.external_id}")
             return self._fail(job, "Easy Apply modal did not open (timeout)")
+        self._report_progress("[LinkedIn][Apply] Easy Apply modal opened")
         logger.debug("[LinkedIn] Easy Apply modal opened")
 
         # Step through the multi-page modal
@@ -520,16 +677,23 @@ class LinkedInApplier(BaseApplier):
             await asyncio.sleep(random.uniform(0.6, 1.0))
 
             step_label = await self._get_step_label(page)
+            self._report_progress(
+                f"[LinkedIn][Step] {step + 1}{': ' + step_label if step_label else ''}"
+            )
             logger.info(f"[LinkedIn] Modal step {step + 1}{': ' + step_label if step_label else ''}")
 
             # Final step: submit button is now visible
             submit = await self._find_submit_button(page)
             if submit:
                 await self._bm.screenshot(page, f"pre_submit_{job.external_id}")
+                self._report_progress("[LinkedIn][Submit] Submitting application")
                 await submit.click()
                 await asyncio.sleep(2)
                 await self._bm.screenshot(page, f"post_submit_{job.external_id}")
                 logger.info(f"[LinkedIn] ✓ Application submitted: {job.title} @ {job.company}")
+                self._report_progress(
+                    f"[LinkedIn][Submit] Application submitted for {job.title} @ {job.company}"
+                )
                 return self._ok(job)
 
             # Fill all visible fields on this modal page
@@ -539,6 +703,10 @@ class LinkedInApplier(BaseApplier):
             error_el = page.locator(_ERROR_MSG).first
             if await error_el.count() > 0:
                 error_text = await error_el.inner_text()
+                self._report_progress(
+                    f"[LinkedIn][Validation] Step {step + 1} error: {error_text}",
+                    level="warning",
+                )
                 logger.warning(f"[LinkedIn] Validation error at step {step + 1}: {error_text}")
                 await self._bm.screenshot(page, f"form_error_{job.external_id}_{step}")
                 return self._fail(job, f"Form validation error: {error_text}")
@@ -556,10 +724,15 @@ class LinkedInApplier(BaseApplier):
             # Advance to next step
             next_btn = await self._find_next_button(page)
             if next_btn and await next_btn.is_enabled():
+                self._report_progress("[LinkedIn][Step] Advancing to the next step")
                 await next_btn.click()
                 # Give the modal animation time to transition before the next fill pass
                 await asyncio.sleep(0.5)
             else:
+                self._report_progress(
+                    f"[LinkedIn][Step] Could not advance past step {step + 1}",
+                    level="warning",
+                )
                 logger.warning(f"[LinkedIn] No Next/Submit button at step {step + 1}")
                 await self._bm.screenshot(page, f"no_next_{job.external_id}_{step}")
                 return self._fail(job, f"Stuck at modal step {step + 1} — no Next button")
@@ -669,17 +842,13 @@ class LinkedInApplier(BaseApplier):
                 continue  # already filled
 
             label = await self._get_field_label(page, inp)
-            value = self._answer_for_label(label)
-            if value is None:
-                value = self._infer_value_from_label(label)
-
-            if value is not None:
+            value, source = await self._resolve_answer(label, "text")
+            if value is not None and source is not None:
                 await inp.fill("")
-                await _BM.human_type(inp, str(value))
-                logger.debug(f"[LinkedIn] Filled '{label}' = '{value}'")
+                await _BM.human_type(inp, value)
+                self._record_answer(label, value, source, "text")
             elif label:
-                self._unknown_questions.append(label)
-                logger.debug(f"[LinkedIn] No answer for text input: '{label}'")
+                self._mark_unanswered(label, "text")
 
     async def _fill_textareas(self, page: Page, job: Job) -> None:
         areas = await page.locator(self._modal_descendants(_TEXTAREAS)).all()
@@ -697,19 +866,24 @@ class LinkedInApplier(BaseApplier):
                 cl_text = getattr(self, "_cover_letter_text", None)
                 cl = cl_text if cl_text else self._build_cover_letter(job)
                 await area.fill(cl)
+                self._report_progress(
+                    f"[LinkedIn][Question][generated] {label or 'Cover letter'} -> {self._preview_answer(cl)}"
+                )
                 continue
 
             if "additional" in label_lower or "summary" in label_lower or "about" in label_lower:
                 if self.profile.summary:
                     await area.fill(self.profile.summary)
+                    self._remember_answer(label, self.profile.summary)
+                    self._record_answer(label, self.profile.summary, "inferred", "textarea")
                     continue
 
-            value = self._answer_for_label(label)
-            if value:
-                await area.fill(str(value))
+            value, source = await self._resolve_answer(label, "textarea")
+            if value is not None and source is not None:
+                await area.fill(value)
+                self._record_answer(label, value, source, "textarea")
             elif label:
-                self._unknown_questions.append(label)
-                logger.debug(f"[LinkedIn] No answer for textarea: '{label}'")
+                self._mark_unanswered(label, "textarea")
 
     async def _fill_selects(self, page: Page) -> None:
         selects = await page.locator(self._modal_descendants(_SELECTS)).all()
@@ -721,11 +895,17 @@ class LinkedInApplier(BaseApplier):
                 continue
 
             label = await self._get_field_label(page, sel)
-            value = self._answer_for_label(label)
-            if value is None:
-                value = self._infer_value_from_label(label)
+            options = []
+            option_elements = await sel.locator("option").all()
+            for option in option_elements:
+                option_label = (await option.inner_text()).strip()
+                option_value = (await option.get_attribute("value") or "").strip()
+                candidate = option_label or option_value
+                if candidate and candidate.lower() != "select an option":
+                    options.append(candidate)
 
-            if value is not None:
+            value, source = await self._resolve_answer(label, "select", options=options)
+            if value is not None and source is not None:
                 try:
                     await sel.select_option(value=str(value))
                 except Exception:
@@ -733,9 +913,11 @@ class LinkedInApplier(BaseApplier):
                         await sel.select_option(label=str(value))
                     except Exception:
                         logger.debug(f"[LinkedIn] Could not select '{value}' for '{label}'")
+                        self._mark_unanswered(label, "select")
+                        continue
+                self._record_answer(label, value, source, "select")
             elif label:
-                self._unknown_questions.append(label)
-                logger.debug(f"[LinkedIn] No answer for select: '{label}'")
+                self._mark_unanswered(label, "select")
 
     async def _fill_radio_buttons(self, page: Page) -> None:
         fieldsets = await page.locator(self._modal_descendants(_RADIO_GROUPS)).all()
@@ -747,29 +929,37 @@ class LinkedInApplier(BaseApplier):
             if await fieldset.locator("legend").count() > 0:
                 legend = (await fieldset.locator("legend").first.inner_text()).strip()
 
-            answer = self._answer_for_label(legend)
-            if answer is None:
-                answer = self._infer_value_from_label(legend)
-            if answer is None:
-                if legend:
-                    self._unknown_questions.append(legend)
-                    logger.debug(f"[LinkedIn] No answer for radio: '{legend}'")
-                continue
-
             radios = await fieldset.locator("input[type='radio']").all()
+            radio_options: list[tuple[Locator, str]] = []
             for radio in radios:
                 radio_id = await radio.get_attribute("id") or ""
                 radio_label_el = page.locator(f"label[for='{radio_id}']")
                 radio_label = ""
                 if await radio_label_el.count() > 0:
                     radio_label = (await radio_label_el.inner_text()).strip()
-                if (
-                    radio_label.lower() == str(answer).lower()
-                    or await radio.get_attribute("value") == str(answer)
-                ):
+                radio_value = (await radio.get_attribute("value") or "").strip()
+                radio_options.append((radio, radio_label or radio_value))
+
+            answer, source = await self._resolve_answer(
+                legend,
+                "radio",
+                options=[option for _, option in radio_options if option],
+            )
+            if answer is None or source is None:
+                if legend:
+                    self._mark_unanswered(legend, "radio")
+                continue
+
+            matched_radio = False
+            for radio, option in radio_options:
+                radio_value = (await radio.get_attribute("value") or "").strip()
+                if option == answer or radio_value == answer:
                     await radio.check()
-                    logger.debug(f"[LinkedIn] Radio '{legend}' = '{radio_label}'")
+                    self._record_answer(legend, answer, source, "radio")
+                    matched_radio = True
                     break
+            if not matched_radio and legend:
+                self._mark_unanswered(legend, "radio")
 
     async def _fill_checkboxes(self, page: Page) -> None:
         checkboxes = await page.locator(self._modal_descendants(_CHECKBOXES)).all()
@@ -777,27 +967,88 @@ class LinkedInApplier(BaseApplier):
             if not await cb.is_visible():
                 continue
             cb_id = await cb.get_attribute("id") or ""
-            label_el = page.locator(f"label[for='{cb_id}']")
-            label = (await label_el.inner_text()).strip() if await label_el.count() > 0 else ""
+            label_el = page.locator(f"label[for='{cb_id}']") if cb_id else None
+            label = ""
+            if label_el is not None and await label_el.count() > 0:
+                label = (await label_el.inner_text()).strip()
 
-            answer = self._answer_for_label(label)
-            if answer is None:
+            answer, source = await self._resolve_answer(label, "checkbox", options=["Yes", "No"])
+            if answer is None or source is None:
                 if label:
-                    self._unknown_questions.append(label)
-                    logger.debug(f"[LinkedIn] No answer for checkbox: '{label}'")
+                    self._mark_unanswered(label, "checkbox")
                 continue
 
             should_check = str(answer).lower() in ("yes", "true", "1", "checked")
-            if should_check and not await cb.is_checked():
-                await cb.check()
-            elif not should_check and await cb.is_checked():
-                await cb.uncheck()
+            await self._set_checkbox_state(cb, should_check, label=label, label_el=label_el)
+            self._record_answer(label, "Yes" if should_check else "No", source, "checkbox")
+
+    async def _set_checkbox_state(
+        self,
+        checkbox: Locator,
+        should_check: bool,
+        label: str = "",
+        label_el: Locator | None = None,
+    ) -> None:
+        """Set checkbox state with fallbacks for covered/custom-styled inputs."""
+        current = await checkbox.is_checked()
+        if current == should_check:
+            return
+
+        action_name = "check" if should_check else "uncheck"
+        input_name = await checkbox.get_attribute("name") or await checkbox.get_attribute("id") or ""
+        target_name = label or input_name or "checkbox"
+
+        async def _native_toggle(*, force: bool = False) -> None:
+            if should_check:
+                await checkbox.check(timeout=2_000, force=force)
+            else:
+                await checkbox.uncheck(timeout=2_000, force=force)
+
+        for description, action in (
+            ("native toggle", lambda: _native_toggle(force=False)),
+            ("forced toggle", lambda: _native_toggle(force=True)),
+        ):
+            try:
+                await action()
+                if await checkbox.is_checked() == should_check:
+                    return
+            except Exception as exc:
+                logger.debug(f"[LinkedIn] Checkbox '{target_name}' {description} failed: {exc}")
+
+        if label_el is not None:
+            try:
+                await label_el.first.click(timeout=2_000, force=True)
+                if await checkbox.is_checked() == should_check:
+                    return
+            except Exception as exc:
+                logger.debug(f"[LinkedIn] Checkbox '{target_name}' label click failed: {exc}")
+
+        try:
+            await checkbox.evaluate(
+                """(el, checked) => {
+                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                    if (el.checked !== checked) {
+                        el.checked = checked;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                }""",
+                should_check,
+            )
+            if await checkbox.is_checked() == should_check:
+                logger.debug(f"[LinkedIn] Checkbox '{target_name}' set via DOM fallback")
+                return
+        except Exception as exc:
+            logger.debug(f"[LinkedIn] Checkbox '{target_name}' DOM fallback failed: {exc}")
+
+        raise RuntimeError(f"Could not {action_name} checkbox '{target_name}'")
 
     async def _handle_resume_upload(self, page: Page) -> None:
         """Upload resume — prefer tailored PDF, fall back to profile resume."""
         tailored = getattr(self, "_tailored_resume_path", None)
         if tailored and Path(tailored).exists():
             resume_path = Path(tailored)
+            self._report_progress(f"[LinkedIn][Resume] Using tailored resume: {resume_path.name}")
             logger.info(f"[LinkedIn] Using tailored resume: {resume_path.name}")
         else:
             resume_path = None
@@ -815,6 +1066,7 @@ class LinkedInApplier(BaseApplier):
             return
 
         await file_input.set_input_files(str(resume_path))
+        self._report_progress(f"[LinkedIn][Resume] Uploaded resume: {resume_path.name}")
         logger.info(f"[LinkedIn] Uploaded resume: {resume_path.name}")
         try:
             await page.wait_for_selector(self._modal_descendants(_RESUME_CARD), timeout=8_000)

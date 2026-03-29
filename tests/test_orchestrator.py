@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from src.appliers.base import ApplicationResult
+from src.appliers.base import ApplicationQuestionPrompt, ApplicationResult
 from src.config import settings
 from src.models import ApplicationStatus, JobSearchFilter, UserProfile
 from src.models.user_profile import ApplicationPreferences, JobBoardAccounts, SocialLinks
@@ -61,6 +61,7 @@ class FakeDb:
         self.pending_calls: list[dict[str, object]] = []
         self.status_updates: list[dict[str, object]] = []
         self.logged_applications: list[dict[str, object]] = []
+        self.profile_answer_updates: list[dict[str, object]] = []
 
     async def get_pending_jobs(self, limit=100, user_id=None, scrape_run_id=None):
         self.pending_calls.append(
@@ -92,8 +93,10 @@ class FakeDb:
     async def update_job_ai_fields(self, *args, **kwargs):
         raise AssertionError("AI fields should not be updated when tailoring is disabled")
 
-    async def update_profile_custom_answers(self, *args, **kwargs):
-        raise AssertionError("No new answers should be learned in this test")
+    async def update_profile_custom_answers(self, user_id, custom_answers):
+        self.profile_answer_updates.append(
+            {"user_id": user_id, "custom_answers": dict(custom_answers)}
+        )
 
 
 class StubApplier:
@@ -151,3 +154,65 @@ async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disable
     assert counts["failed"] == 0
     assert db.status_updates[0]["status"] == ApplicationStatus.APPLIED
     assert db.logged_applications[0]["status"] == ApplicationStatus.APPLIED
+    assert db.profile_answer_updates == []
+
+
+class LearningApplier:
+    def __init__(self):
+        self.progress_callback = None
+        self.answer_resolver = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    async def apply(self, job, tailored_resume_path=None, cover_letter=None):
+        assert self.answer_resolver is not None
+        prompts = [
+            ApplicationQuestionPrompt(
+                question="Are you open to relocation?",
+                field_type="radio",
+                options=["Yes", "No"],
+            )
+        ]
+        learned_answers = await self.answer_resolver(prompts)
+        if self.progress_callback:
+            self.progress_callback("[LinkedIn][Question][ai] Are you open to relocation? -> Yes")
+        return ApplicationResult(
+            job,
+            ApplicationStatus.APPLIED,
+            message="submitted",
+            learned_answers=learned_answers,
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_apply_persists_learned_answers_from_applier(monkeypatch):
+    record = make_job_record()
+    db = FakeDb([record])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    applier = LearningApplier()
+    progress_messages: list[str] = []
+
+    monkeypatch.setattr(orch, "_pick_applier", lambda job: applier)
+    monkeypatch.setattr(orch, "_get_ai_client", lambda: object())
+    monkeypatch.setattr(settings, "dry_run", False)
+
+    with patch("src.orchestrator.profile_extractor.suggest_answers", new=AsyncMock(return_value={
+        "Are you open to relocation?": "Yes"
+    })), patch("src.orchestrator.save_profile") as save_profile_mock:
+        counts = await orch.run_apply(user_id=42, progress_callback=progress_messages.append)
+
+    assert counts["applied"] == 1
+    assert db.profile_answer_updates == [
+        {
+            "user_id": 42,
+            "custom_answers": {"Are you open to relocation?": "Yes"},
+        }
+    ]
+    assert orch.profile.custom_answers["Are you open to relocation?"] == "Yes"
+    assert any("[AI][Questions]" in message for message in progress_messages)
+    assert any("[Profile][Saved]" in message for message in progress_messages)
+    save_profile_mock.assert_called_once()

@@ -75,7 +75,37 @@ def make_applier(profile: UserProfile | None = None) -> LinkedInApplier:
     applier._bm = None
     applier._page = None
     applier._logged_in = False
+    applier._unknown_questions = []
+    applier._answered_questions = []
+    applier._learned_answers = {}
     return applier
+
+
+class _FakeCheckbox:
+    def __init__(self, checked: bool = False, name: str = "jobDetailsEasyApplyTopChoiceCheckbox"):
+        self.checked = checked
+        self.name = name
+        self.calls: list[tuple] = []
+
+    async def is_checked(self) -> bool:
+        return self.checked
+
+    async def check(self, timeout=None, force=False) -> None:
+        self.calls.append(("check", timeout, force))
+        raise RuntimeError("pointer intercepted")
+
+    async def uncheck(self, timeout=None, force=False) -> None:
+        self.calls.append(("uncheck", timeout, force))
+        raise RuntimeError("pointer intercepted")
+
+    async def evaluate(self, _script, desired) -> None:
+        self.calls.append(("evaluate", desired))
+        self.checked = desired
+
+    async def get_attribute(self, name: str) -> str | None:
+        if name == "name":
+            return self.name
+        return None
 
 
 # ── Tests: can_apply ──────────────────────────────────────────────────────────
@@ -182,6 +212,52 @@ def test_modal_descendants_scopes_each_modal_root():
 
 
 # ── Tests: _infer_value_from_label ────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_set_checkbox_state_falls_back_to_dom_toggle_when_clicks_are_blocked():
+    applier = make_applier()
+    checkbox = _FakeCheckbox(checked=False)
+
+    await applier._set_checkbox_state(checkbox, True, label="Top choice")
+
+    assert checkbox.checked is True
+    assert ("check", 2_000, False) in checkbox.calls
+    assert ("check", 2_000, True) in checkbox.calls
+    assert ("evaluate", True) in checkbox.calls
+
+
+@pytest.mark.asyncio
+async def test_resolve_answer_learns_inferred_answers_for_future_runs():
+    applier = make_applier()
+
+    answer, source = await applier._resolve_answer("Phone number", "text")
+
+    assert answer == "+1-555-123-4567"
+    assert source == "inferred"
+    assert applier.profile.custom_answers["Phone number"] == "+1-555-123-4567"
+    assert applier._learned_answers["Phone number"] == "+1-555-123-4567"
+
+
+@pytest.mark.asyncio
+async def test_resolve_answer_uses_ai_resolver_and_saves_exact_question():
+    profile = make_profile(custom_answers={"authorized to work": "Yes"})
+    applier = make_applier(profile)
+    applier.answer_resolver = AsyncMock(return_value={"Are you open to relocation?": "No"})
+
+    saved_answer, saved_source = await applier._resolve_answer(
+        "Are you legally authorized to work in the US?",
+        "radio",
+        options=["Yes", "No"],
+    )
+    ai_answer, ai_source = await applier._resolve_answer("Are you open to relocation?", "checkbox")
+
+    assert saved_answer == "Yes"
+    assert saved_source == "saved"
+    assert applier.profile.custom_answers["Are you legally authorized to work in the US?"] == "Yes"
+    assert ai_answer == "No"
+    assert ai_source == "ai"
+    assert applier.profile.custom_answers["Are you open to relocation?"] == "No"
+
 
 class TestInferValueFromLabel:
     def test_first_name(self):
