@@ -12,6 +12,9 @@ data/*.db-shm
 data/*.db-wal
 data/.linkedin_cookies.json
 data/.linkedin_scraper_session/
+data/.linkedin_session/
+data/.linkedin_detail_session/
+data/uploads/
 
 # Logs
 logs/
