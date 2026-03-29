@@ -494,7 +494,7 @@ class LinkedInApplier(BaseApplier):
         self._ensure_linkedin_state()
         candidates: list[tuple[Path, str, str | None]] = [
             (self._cookie_path, "scoped", self._linkedin_identity),
-            (legacy_linkedin_cookie_path(), "legacy", None),
+            (legacy_linkedin_cookie_path(), "legacy", self._linkedin_identity),
         ]
         for path, source, expected_owner in candidates:
             if not path.exists():
@@ -506,7 +506,12 @@ class LinkedInApplier(BaseApplier):
                 cookie_owner = str(data.get("username") or "").strip().lower()
                 if expected_owner:
                     expected = expected_owner.strip().lower()
-                    if cookie_owner and cookie_owner != expected:
+                    if not cookie_owner:
+                        logger.info(
+                            f"[LinkedIn] Ignoring {source} cookie file without LinkedIn account metadata"
+                        )
+                        continue
+                    if cookie_owner != expected:
                         logger.info(
                             "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
                             f"{mask_linkedin_username(cookie_owner)}"
@@ -521,7 +526,7 @@ class LinkedInApplier(BaseApplier):
                     )
                 if source == "legacy":
                     self._report_progress(
-                        "[LinkedIn][Auth] Falling back to legacy shared LinkedIn cookies"
+                        "[LinkedIn][Auth] Falling back to legacy LinkedIn cookies for the same account"
                     )
                 # Convert flat dict → Playwright cookie objects
                 pw_cookies = [

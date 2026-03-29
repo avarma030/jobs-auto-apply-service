@@ -391,6 +391,7 @@ async def test_inject_scraper_cookies_keeps_jsessionid_js_readable(tmp_path):
         json.dumps(
             {
                 "saved_at": time.time(),
+                "username": "jane@example.com",
                 "cookies": {
                     "li_at": "li-at-token",
                     "JSESSIONID": '"ajax:123"',
@@ -437,6 +438,7 @@ async def test_inject_scraper_cookies_falls_back_to_legacy_cookie_file(tmp_path)
         json.dumps(
             {
                 "saved_at": time.time(),
+                "username": "rucha@example.com",
                 "cookies": {
                     "li_at": "legacy-li-at",
                     "JSESSIONID": '"ajax:456"',
@@ -463,7 +465,53 @@ async def test_inject_scraper_cookies_falls_back_to_legacy_cookie_file(tmp_path)
     cookies = applier._bm._context.add_cookies.await_args.args[0]
     by_name = {cookie["name"]: cookie for cookie in cookies}
     assert by_name["li_at"]["value"] == "legacy-li-at"
-    assert any("Falling back to legacy shared LinkedIn cookies" in message for message in messages)
+    assert any(
+        "Falling back to legacy LinkedIn cookies for the same account" in message
+        for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_scraper_cookies_refuses_legacy_cookie_file_without_matching_owner(tmp_path):
+    scoped_cookie_path = tmp_path / "scoped_cookies.json"
+    scoped_cookie_path.write_text(
+        json.dumps(
+            {
+                "saved_at": time.time(),
+                "username": "rucha@example.com",
+                "cookies": {"lang": "en-us"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    legacy_cookie_path = tmp_path / "legacy_cookies.json"
+    legacy_cookie_path.write_text(
+        json.dumps(
+            {
+                "saved_at": time.time(),
+                "username": "akshay@example.com",
+                "cookies": {
+                    "li_at": "legacy-li-at",
+                    "JSESSIONID": '"ajax:456"',
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    applier = make_applier()
+    applier._bm = MagicMock()
+    applier._bm._context = MagicMock()
+    applier._bm._context.add_cookies = AsyncMock()
+    applier._ensure_linkedin_state = MagicMock()
+    applier._cookie_path = scoped_cookie_path
+    applier._linkedin_identity = "rucha@example.com"
+
+    with patch.object(linkedin_mod, "legacy_linkedin_cookie_path", return_value=legacy_cookie_path):
+        injected = await applier._inject_scraper_cookies()
+
+    assert injected is False
+    applier._bm._context.add_cookies.assert_not_awaited()
 
 
 def test_ensure_linkedin_state_scopes_paths_to_profile_credentials():
