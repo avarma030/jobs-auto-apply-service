@@ -90,6 +90,10 @@ _FOLLOW_PROMPT_DISMISS = (
     "button[aria-label='Got it'], "
     "button.artdeco-modal__dismiss"
 )
+_AUTOCOMPLETE_RESULTS = (
+    "div[data-test-single-typeahead-entity-form-search-result='true'], "
+    ".search-typeahead-v2__hit--autocomplete"
+)
 
 # Job page — aria-label based selectors survive LinkedIn UI/class renames
 # Broad selector fallback for legacy DOMs. Primary detection uses role/name.
@@ -809,7 +813,24 @@ class LinkedInApplier(BaseApplier):
             try:
                 el = page.locator(selector.strip()).first
                 if await el.count() > 0 and await el.is_visible():
-                    await el.click()
+                    is_apply_modal_close = await el.evaluate(
+                        """(node) => {
+                            const applyModal = node.closest(
+                                'div.jobs-easy-apply-modal, div.jobs-apply-modal'
+                            );
+                            if (applyModal) {
+                                return true;
+                            }
+                            const dialog = node.closest('div[role="dialog"]');
+                            if (!dialog) {
+                                return false;
+                            }
+                            return /save this application/i.test(dialog.innerText || '');
+                        }"""
+                    )
+                    if is_apply_modal_close:
+                        continue
+                    await el.click(timeout=2_000, force=True)
                     await asyncio.sleep(0.3)
             except Exception:
                 pass
@@ -962,23 +983,14 @@ class LinkedInApplier(BaseApplier):
 
         if await self._autocomplete_overlay_visible(page):
             try:
-                await page.keyboard.press("ArrowDown")
-                await asyncio.sleep(0.1)
-                await page.keyboard.press("Enter")
-                await asyncio.sleep(0.2)
+                await self._select_autocomplete_suggestion(page)
             except Exception:
                 pass
 
         await self._dismiss_autocomplete_overlays(page)
 
     async def _autocomplete_overlay_visible(self, page: Page) -> bool:
-        selectors = (
-            "div[data-test-single-typeahead-entity-form-search-result='true']",
-            ".search-typeahead-v2__hit--autocomplete",
-            "div[role='listbox']",
-            "ul[role='listbox']",
-        )
-        for selector in selectors:
+        for selector in _AUTOCOMPLETE_RESULTS.split(", "):
             try:
                 locator = page.locator(selector)
                 if await locator.count() > 0 and await locator.first.is_visible():
@@ -987,14 +999,24 @@ class LinkedInApplier(BaseApplier):
                 continue
         return False
 
+    async def _select_autocomplete_suggestion(self, page: Page) -> bool:
+        for selector in _AUTOCOMPLETE_RESULTS.split(", "):
+            try:
+                options = page.locator(selector)
+                if await options.count() == 0 or not await options.first.is_visible():
+                    continue
+                await options.first.click(timeout=2_000, force=True)
+                await asyncio.sleep(0.2)
+                return True
+            except Exception:
+                continue
+        return False
+
     async def _dismiss_autocomplete_overlays(self, page: Page) -> None:
         if not await self._autocomplete_overlay_visible(page):
             return
-        try:
-            await page.keyboard.press("Escape")
-            await asyncio.sleep(0.2)
-        except Exception:
-            pass
+        if await self._select_autocomplete_suggestion(page):
+            return
         try:
             await page.evaluate(
                 """() => {
@@ -1007,8 +1029,39 @@ class LinkedInApplier(BaseApplier):
         except Exception:
             pass
 
+    async def _dismiss_save_application_prompt(self, page: Page) -> bool:
+        try:
+            dialog = page.locator("div[role='dialog']").filter(
+                has_text=re.compile(r"save this application", re.IGNORECASE)
+            ).first
+            if await dialog.count() == 0 or not await dialog.is_visible():
+                return False
+
+            candidates = [
+                dialog.locator("button[aria-label='Dismiss']").first,
+                dialog.locator("button[aria-label='Close']").first,
+                dialog.locator("button.artdeco-modal__dismiss").first,
+            ]
+            close_button = await self._first_visible(candidates)
+            if close_button is None:
+                return False
+
+            await close_button.click(timeout=2_000, force=True)
+            await asyncio.sleep(0.3)
+            still_visible = await dialog.count() > 0 and await dialog.is_visible()
+            if not still_visible:
+                logger.debug("[LinkedIn] Closed save-application confirmation dialog")
+                return True
+        except Exception as exc:
+            logger.debug(
+                "[LinkedIn] Save-application confirmation dismissal failed: "
+                f"{self._summarize_exception(exc)}"
+            )
+        return False
+
     async def _click_modal_button(self, page: Page, button: Locator, action_name: str) -> None:
         await self._dismiss_prompts(page)
+        await self._dismiss_save_application_prompt(page)
         await self._dismiss_autocomplete_overlays(page)
         try:
             await button.scroll_into_view_if_needed()
@@ -1027,18 +1080,15 @@ class LinkedInApplier(BaseApplier):
                     f"[LinkedIn] {action_name.title()} button {description} failed: "
                     f"{self._summarize_exception(exc)}"
                 )
+                await self._dismiss_save_application_prompt(page)
+                await self._dismiss_autocomplete_overlays(page)
 
         try:
-            await button.evaluate(
-                """(el) => {
-                    el.scrollIntoView({ block: 'center', inline: 'nearest' });
-                    el.click();
-                }"""
-            )
+            await button.dispatch_event("click", timeout=2_000)
             return
         except Exception as exc:
             logger.debug(
-                f"[LinkedIn] {action_name.title()} button DOM click failed: "
+                f"[LinkedIn] {action_name.title()} button event dispatch failed: "
                 f"{self._summarize_exception(exc)}"
             )
 

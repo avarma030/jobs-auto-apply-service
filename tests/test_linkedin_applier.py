@@ -158,8 +158,8 @@ class _FakeButton:
         if not force:
             raise RuntimeError("overlay intercepted")
 
-    async def evaluate(self, _script) -> None:
-        self.calls.append(("evaluate",))
+    async def dispatch_event(self, event_name: str, timeout=None) -> None:
+        self.calls.append(("dispatch_event", event_name, timeout))
 
 
 class _FakeKeyboard:
@@ -174,6 +174,7 @@ class _FakeOverlayLocator:
     def __init__(self, visible: bool):
         self.visible = visible
         self.first = self
+        self.clicks: list[tuple] = []
 
     async def count(self) -> int:
         return 1 if self.visible else 0
@@ -181,19 +182,109 @@ class _FakeOverlayLocator:
     async def is_visible(self) -> bool:
         return self.visible
 
+    async def click(self, timeout=None, force=False) -> None:
+        self.clicks.append((timeout, force))
+        self.visible = False
+
 
 class _FakePageWithOverlay:
     def __init__(self, visible: bool = True):
         self.visible = visible
         self.keyboard = _FakeKeyboard()
         self.evaluations: list[str] = []
+        self.overlay = _FakeOverlayLocator(visible)
 
     def locator(self, _selector: str):
-        return _FakeOverlayLocator(self.visible)
+        return self.overlay
 
     async def evaluate(self, script: str) -> None:
         self.evaluations.append(script)
         self.visible = False
+        self.overlay.visible = False
+
+
+class _FakeDismissButton:
+    def __init__(self, skip_click: bool = False):
+        self.skip_click = skip_click
+        self.first = self
+        self.clicks: list[tuple] = []
+
+    async def count(self) -> int:
+        return 1
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def evaluate(self, _script) -> bool:
+        return self.skip_click
+
+    async def click(self, timeout=None, force=False) -> None:
+        self.clicks.append((timeout, force))
+
+
+class _FakePromptPage:
+    def __init__(self, skip_click: bool = False):
+        self.dismiss = _FakeDismissButton(skip_click=skip_click)
+        self.empty = _FakeOverlayLocator(False)
+
+    def locator(self, selector: str):
+        if selector == "button[aria-label='Dismiss']":
+            return self.dismiss
+        return self.empty
+
+
+class _FakeSaveDialogCloseButton:
+    def __init__(self, dialog):
+        self.dialog = dialog
+        self.first = self
+        self.clicks: list[tuple] = []
+
+    async def count(self) -> int:
+        return 1
+
+    async def is_visible(self) -> bool:
+        return self.dialog.visible
+
+    async def click(self, timeout=None, force=False) -> None:
+        self.clicks.append((timeout, force))
+        self.dialog.visible = False
+
+
+class _FakeSaveDialogLocator:
+    def __init__(self, visible: bool = True):
+        self.visible = visible
+        self.first = self
+        self.close_button = _FakeSaveDialogCloseButton(self)
+        self.empty = _FakeOverlayLocator(False)
+
+    def filter(self, **_kwargs):
+        return self
+
+    async def count(self) -> int:
+        return 1 if self.visible else 0
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    def locator(self, selector: str):
+        if selector in {
+            "button[aria-label='Dismiss']",
+            "button[aria-label='Close']",
+            "button.artdeco-modal__dismiss",
+        }:
+            return self.close_button
+        return self.empty
+
+
+class _FakeSaveDialogPage:
+    def __init__(self, visible: bool = True):
+        self.dialog = _FakeSaveDialogLocator(visible=visible)
+        self.empty = _FakeOverlayLocator(False)
+
+    def locator(self, selector: str):
+        if selector == "div[role='dialog']":
+            return self.dialog
+        return self.empty
 
 
 # ── Tests: can_apply ──────────────────────────────────────────────────────────
@@ -336,6 +427,7 @@ async def test_set_radio_state_falls_back_to_label_click_when_input_is_blocked()
 async def test_click_modal_button_falls_back_to_forced_click_after_overlay_interception():
     applier = make_applier()
     applier._dismiss_prompts = AsyncMock()
+    applier._dismiss_save_application_prompt = AsyncMock(return_value=False)
     applier._dismiss_autocomplete_overlays = AsyncMock()
     button = _FakeButton()
     page = MagicMock()
@@ -345,18 +437,41 @@ async def test_click_modal_button_falls_back_to_forced_click_after_overlay_inter
     assert ("click", 2_000, False) in button.calls
     assert ("click", 2_000, True) in button.calls
     applier._dismiss_prompts.assert_awaited_once()
-    applier._dismiss_autocomplete_overlays.assert_awaited_once()
+    assert applier._dismiss_save_application_prompt.await_count == 2
+    assert applier._dismiss_autocomplete_overlays.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_dismiss_autocomplete_overlays_uses_escape_and_blur():
+async def test_dismiss_autocomplete_overlays_clicks_first_suggestion():
     applier = make_applier()
     page = _FakePageWithOverlay(visible=True)
 
     await applier._dismiss_autocomplete_overlays(page)
 
-    assert "Escape" in page.keyboard.calls
-    assert len(page.evaluations) == 1
+    assert page.overlay.clicks == [(2_000, True)]
+    assert page.evaluations == []
+
+
+@pytest.mark.asyncio
+async def test_dismiss_prompts_does_not_click_easy_apply_modal_dismiss_button():
+    applier = make_applier()
+    page = _FakePromptPage(skip_click=True)
+
+    await applier._dismiss_prompts(page)
+
+    assert page.dismiss.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_dismiss_save_application_prompt_closes_confirmation_dialog():
+    applier = make_applier()
+    page = _FakeSaveDialogPage(visible=True)
+
+    closed = await applier._dismiss_save_application_prompt(page)
+
+    assert closed is True
+    assert page.dialog.close_button.clicks == [(2_000, True)]
+    assert page.dialog.visible is False
 
 
 def test_prepare_text_input_value_coerces_ai_text_for_numeric_experience_question():
