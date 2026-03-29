@@ -69,6 +69,7 @@ export function RunProgress({ onComplete }: Props) {
   const [easyApplyOnly, setEasyApplyOnly] = useState(false);
   const [maxAgeDays, setMaxAgeDays] = useState(7);
   const [maxJobs, setMaxJobs] = useState<string>("");  // empty = no limit
+  const [tailorDocuments, setTailorDocuments] = useState(false);
   const [minMatchScore, setMinMatchScore] = useState<number>(75);
   const [boards, setBoards] = useState<string[]>(["linkedin"]);
 
@@ -103,7 +104,8 @@ export function RunProgress({ onComplete }: Props) {
         boards,
         max_age_days: maxAgeDays,
         max_jobs: maxJobs ? parseInt(maxJobs, 10) : undefined,
-        min_match_score: minMatchScore,
+        tailor_documents: tailorDocuments,
+        min_match_score: tailorDocuments ? minMatchScore : undefined,
       });
       setRunId(res.run_id);
     } catch (err: any) {
@@ -152,6 +154,7 @@ export function RunProgress({ onComplete }: Props) {
                 <Label className="text-xs text-muted-foreground">Min Match % (0–100)</Label>
                 <Input
                   type="number"
+                  disabled={!tailorDocuments}
                   min="0"
                   max="100"
                   value={minMatchScore}
@@ -160,6 +163,23 @@ export function RunProgress({ onComplete }: Props) {
                   className="mt-1"
                 />
               </div>
+            </div>
+
+            <div>
+              <Label className="text-xs text-muted-foreground">Application Mode</Label>
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                <ToggleChip active={!tailorDocuments} onClick={() => setTailorDocuments(false)}>
+                  Use Uploaded Resume
+                </ToggleChip>
+                <ToggleChip active={tailorDocuments} onClick={() => setTailorDocuments(true)}>
+                  Tailor Before Apply
+                </ToggleChip>
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {tailorDocuments
+                  ? "Scores jobs, tailors your resume and cover letter, then applies to qualified matches."
+                  : "Applies directly to the scraped jobs using your uploaded resume as-is."}
+              </p>
             </div>
 
             <div>

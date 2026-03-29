@@ -92,12 +92,32 @@ class Orchestrator:
         logger.info(f"Scraping complete — {total} new jobs found")
         return total
 
-    async def run_apply(self, user_id: int | None = None) -> dict:
-        """Apply to all pending jobs. Returns status counts."""
-        pending = await self.db.get_pending_jobs(limit=settings.max_applications_per_run, user_id=user_id)
-        logger.info(f"Applying to {len(pending)} pending jobs")
+    async def run_apply(
+        self,
+        user_id: int | None = None,
+        scrape_run_id: str | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict:
+        """Apply to pending jobs. Returns status counts."""
+        def _emit(msg: str) -> None:
+            if progress_callback:
+                progress_callback(msg)
+            else:
+                logger.info(msg)
 
-        counts: dict[str, int] = {}
+        pending = await self.db.get_pending_jobs(
+            limit=settings.max_applications_per_run,
+            user_id=user_id,
+            scrape_run_id=scrape_run_id,
+        )
+        _emit(f"Applying to {len(pending)} pending jobs")
+
+        counts: dict[str, int] = {
+            "applied": 0,
+            "failed": 0,
+            "skipped": 0,
+            "dry_run": 0,
+        }
         for record in pending:
             job = self._record_to_job(record)
             cover_letter_text: str | None = None
@@ -110,20 +130,32 @@ class Orchestrator:
                         logger.warning(f"Could not read cover letter for job {record.id}: {exc}")
 
             if settings.dry_run:
-                logger.info(f"[DRY RUN] Would apply to {job.title} @ {job.company}")
-                counts["dry_run"] = counts.get("dry_run", 0) + 1
+                _emit(f"🧪 [DRY RUN] Would apply to '{job.title}' @ {job.company}")
+                counts["dry_run"] += 1
                 continue
 
             applier = self._pick_applier(job)
-            async with applier as a:
-                result = await a.apply(
-                    job,
-                    tailored_resume_path=record.tailored_resume_path,
-                    cover_letter=cover_letter_text,
-                )
+            _emit(f"📤 Applying to '{job.title}' @ {job.company} …")
+            try:
+                async with applier as a:
+                    result = await a.apply(
+                        job,
+                        tailored_resume_path=record.tailored_resume_path,
+                        cover_letter=cover_letter_text,
+                    )
+            except Exception as exc:
+                logger.error(f"Applier error for job {record.id}: {exc}")
+                counts["failed"] += 1
+                await self.db.update_job_status(record.id, ApplicationStatus.FAILED, notes=str(exc))
+                continue
 
             status = result.status
-            counts[status] = counts.get(status, 0) + 1
+            status_key = status.value if isinstance(status, ApplicationStatus) else str(status)
+            counts[status_key] = counts.get(status_key, 0) + 1
+            if status == ApplicationStatus.APPLIED:
+                _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
+            else:
+                _emit(f"  ⚠️  Application result for '{job.title}': {status_key} — {result.message or ''}")
             await self.db.update_job_status(
                 record.id,
                 status,
@@ -138,9 +170,15 @@ class Orchestrator:
                 user_id=user_id,
             )
             if result.new_questions:
+                _emit(f"  💡 Learned {len(result.new_questions)} new Q&A pair(s) from this application")
                 await self._handle_new_questions(result.new_questions)
 
-        logger.info(f"Apply run complete: {counts}")
+        _emit(
+            f"🏁 Apply run complete — applied: {counts['applied']}, "
+            f"dry_run: {counts.get('dry_run', 0)}, "
+            f"failed: {counts['failed']}, "
+            f"skipped: {counts['skipped']}"
+        )
         return counts
 
     async def run_full_pipeline(
@@ -149,6 +187,7 @@ class Orchestrator:
         user_id: int | None = None,
         run_id: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        tailor_documents: bool = True,
     ) -> dict:
         """
         End-to-end pipeline:
@@ -172,6 +211,18 @@ class Orchestrator:
         _emit("🚀 Pipeline starting — scraping jobs …")
         jobs_found = await self.run_scrape(search_filter, user_id=user_id, run_id=run_id)
         _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
+
+        # If tailoring is disabled, apply the jobs from this run with the
+        # uploaded resume as-is.
+        if not tailor_documents:
+            _emit("📎 Tailoring disabled for this run — applying scraped jobs with the uploaded resume.")
+            counts = await self.run_apply(
+                user_id=user_id,
+                scrape_run_id=run_id,
+                progress_callback=_emit,
+            )
+            counts["scraped"] = jobs_found
+            return counts
 
         # Parse resume once — try per-user path first, then global fallback
         resume_text = ""
@@ -347,11 +398,12 @@ class Orchestrator:
                 continue
 
             status = result.status
-            counts[status] = counts.get(status, 0) + 1
+            status_key = status.value if isinstance(status, ApplicationStatus) else str(status)
+            counts[status_key] = counts.get(status_key, 0) + 1
             if status == ApplicationStatus.APPLIED:
                 _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
             else:
-                _emit(f"  ⚠️  Application result for '{job.title}': {status} — {result.message or ''}")
+                _emit(f"  ⚠️  Application result for '{job.title}': {status_key} — {result.message or ''}")
             await self.db.update_job_status(
                 record.id,
                 status,
