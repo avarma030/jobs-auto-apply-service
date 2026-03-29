@@ -658,6 +658,12 @@ class Orchestrator:
                         continue
                     await self.db.upsert_job(job, user_id=user_id, scrape_run_id=run_id)
                     count += 1
+                    if search_filter.max_jobs is not None and count >= search_filter.max_jobs:
+                        logger.info(
+                            f"[{board}] Reached max_jobs limit ({search_filter.max_jobs}) "
+                            "after detail verification"
+                        )
+                        break
                     await asyncio.sleep(settings.request_delay_seconds)
         except NotImplementedError:
             logger.warning(f"[{board}] Scraper not yet implemented — skipping")

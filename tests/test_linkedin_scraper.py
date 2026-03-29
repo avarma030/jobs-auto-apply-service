@@ -139,6 +139,33 @@ class TestParseJobCards:
         assert scraper._parse_job_cards("") == []
         assert scraper._parse_job_cards("<ul></ul>") == []
 
+    def test_detects_easy_apply_from_footer_text(self):
+        scraper = make_scraper()
+        footer_html = """
+<ul>
+  <li>
+    <div class="base-card" data-entity-urn="urn:li:jobPosting:3987654333">
+      <a class="base-card__full-link"
+         href="https://www.linkedin.com/jobs/view/3987654333/?refId=abc">
+      </a>
+      <div class="base-search-card__info">
+        <h3 class="base-search-card__title">Platform Engineer</h3>
+        <h4 class="base-search-card__subtitle">
+          <a class="hidden-nested-link" href="/company/acme">Acme Corp</a>
+        </h4>
+        <div class="base-search-card__metadata">
+          <span class="job-search-card__location">Remote</span>
+          <span class="job-search-card__footer-item">Easy Apply</span>
+          <time datetime="2024-06-01T00:00:00.000Z">3 days ago</time>
+        </div>
+      </div>
+    </div>
+  </li>
+</ul>
+"""
+        cards = scraper._parse_job_cards(footer_html)
+        assert cards[0]["easy_apply"] is True
+
 
 # ── Tests: _build_search_params ───────────────────────────────────────────────
 
@@ -326,7 +353,7 @@ async def test_search_deduplicates_same_job_id():
 
 
 @pytest.mark.asyncio
-async def test_search_easy_apply_only_continues_past_non_matching_first_page():
+async def test_search_easy_apply_only_defers_filter_until_detail_fetch():
     scraper = make_scraper()
     call_count = 0
 
@@ -346,7 +373,9 @@ async def test_search_easy_apply_only_continues_past_non_matching_first_page():
     async for job in scraper.search(f):
         jobs.append(job)
 
-    assert len(jobs) == 1
-    assert jobs[0].external_id == "3987654322"
-    assert jobs[0].easy_apply is True
+    assert len(jobs) == 2
+    assert jobs[0].external_id == "3987654321"
+    assert jobs[0].easy_apply is False
+    assert jobs[1].external_id == "3987654322"
+    assert jobs[1].easy_apply is True
     assert call_count == 3

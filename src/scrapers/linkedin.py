@@ -376,7 +376,10 @@ class LinkedInScraper(BaseScraper):
             if search_filter.max_age_days
             else None
         )
-        max_jobs = search_filter.max_jobs  # None = no limit
+        # Search-card Easy Apply badges are not consistently present in LinkedIn's
+        # guest search HTML, so when easy_apply_only is enabled we defer the hard
+        # filter until get_job_details() can confirm the job via Voyager/detail HTML.
+        max_jobs = None if search_filter.easy_apply_only else search_filter.max_jobs
         total_yielded = 0
 
         for page in range(_MAX_PAGES):
@@ -425,13 +428,12 @@ class LinkedInScraper(BaseScraper):
                 if any(kw.lower() in title.lower() for kw in search_filter.exclude_keywords):
                     continue
 
-                # When easy_apply_only is set, skip non-easy-apply cards without
-                # counting them toward max_jobs — so we keep scraping until we
-                # find max_jobs *easy-apply* jobs, not max_jobs total jobs.
                 card_easy_apply = card.get("easy_apply", False)
                 if search_filter.easy_apply_only and not card_easy_apply:
-                    logger.debug(f"[LinkedIn] Skipping non-easy-apply job {job_id}")
-                    continue
+                    logger.debug(
+                        f"[LinkedIn] Search card {job_id} has no Easy Apply badge - "
+                        "verifying via detail fetch before filtering"
+                    )
 
                 job = self._make_job(
                     external_id=job_id,
@@ -967,15 +969,27 @@ class LinkedInScraper(BaseScraper):
                     work_mode = WorkMode.HYBRID
 
             # Easy Apply badge in search result card
-            # LinkedIn renders one of these for Easy Apply-eligible jobs
+            # LinkedIn's guest HTML is inconsistent, so this is only an initial hint.
             easy_apply = False
             if card_el.select_one("li-icon[type='easy-apply-icon']"):
                 easy_apply = True
             else:
-                for span in card_el.select("span.result-benefits__text"):
-                    if "easy apply" in span.get_text(strip=True).lower():
+                for el in card_el.select(
+                    "span.result-benefits__text, "
+                    "span.job-search-card__footer-item, "
+                    "div.base-search-card__metadata span, "
+                    "span[class*='benefit'], "
+                    "span[class*='footer']"
+                ):
+                    text = el.get_text(" ", strip=True).lower()
+                    label = (el.get("aria-label") or el.get("title") or "").lower()
+                    if "easy apply" in text or "easy apply" in label:
                         easy_apply = True
                         break
+
+            if not easy_apply:
+                card_text = card_el.get_text(" ", strip=True).lower()
+                easy_apply = "easy apply" in card_text
 
             cards.append(
                 {

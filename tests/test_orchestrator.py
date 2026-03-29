@@ -6,9 +6,10 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import src.orchestrator as orchestrator_module
 from src.appliers.base import ApplicationQuestionPrompt, ApplicationResult
 from src.config import settings
-from src.models import ApplicationStatus, JobSearchFilter, UserProfile
+from src.models import ApplicationStatus, Job, JobSearchFilter, UserProfile
 from src.models.user_profile import ApplicationPreferences, JobBoardAccounts, SocialLinks
 from src.orchestrator import Orchestrator
 
@@ -62,6 +63,7 @@ class FakeDb:
         self.status_updates: list[dict[str, object]] = []
         self.logged_applications: list[dict[str, object]] = []
         self.profile_answer_updates: list[dict[str, object]] = []
+        self.upserted_jobs: list[dict[str, object]] = []
 
     async def get_pending_jobs(self, limit=100, user_id=None, scrape_run_id=None):
         self.pending_calls.append(
@@ -97,6 +99,12 @@ class FakeDb:
         self.profile_answer_updates.append(
             {"user_id": user_id, "custom_answers": dict(custom_answers)}
         )
+
+    async def upsert_job(self, job, user_id=None, scrape_run_id=None):
+        self.upserted_jobs.append(
+            {"job": job, "user_id": user_id, "scrape_run_id": scrape_run_id}
+        )
+        return job
 
 
 class StubApplier:
@@ -216,3 +224,66 @@ async def test_run_apply_persists_learned_answers_from_applier(monkeypatch):
     assert any("[AI][Questions]" in message for message in progress_messages)
     assert any("[Profile][Saved]" in message for message in progress_messages)
     save_profile_mock.assert_called_once()
+
+
+class FakeScraper:
+    def __init__(self, credentials=None):
+        self.credentials = credentials or {}
+        self.detail_calls: list[str] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    async def search(self, search_filter):
+        for idx in range(3):
+            yield Job(
+                title=f"ML Engineer {idx}",
+                company="Example Corp",
+                url=f"https://www.linkedin.com/jobs/view/{idx}",
+                source_board="linkedin",
+                external_id=str(idx),
+                easy_apply=False,
+            )
+
+    async def get_job_details(self, job):
+        self.detail_calls.append(job.external_id or "")
+        job.easy_apply = job.external_id == "0"
+        job.description = "Verified by detail fetch"
+        return job
+
+
+@pytest.mark.asyncio
+async def test_scrape_board_easy_apply_only_defers_filter_until_detail_fetch(monkeypatch):
+    db = FakeDb([])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    fake_scraper = FakeScraper()
+
+    monkeypatch.setitem(
+        orchestrator_module.SCRAPER_REGISTRY,
+        "linkedin",
+        lambda credentials=None: fake_scraper,
+    )
+    monkeypatch.setattr(settings, "request_delay_seconds", 0)
+
+    count = await orch._scrape_board(
+        "linkedin",
+        JobSearchFilter(
+            keywords=["ml engineer"],
+            easy_apply_only=True,
+            max_age_days=0,
+            max_jobs=1,
+        ),
+        user_id=9,
+        run_id="run-xyz",
+    )
+
+    assert count == 1
+    assert fake_scraper.detail_calls == ["0"]
+    assert len(db.upserted_jobs) == 1
+    assert db.upserted_jobs[0]["job"].external_id == "0"
+    assert db.upserted_jobs[0]["job"].easy_apply is True
+    assert db.upserted_jobs[0]["user_id"] == 9
+    assert db.upserted_jobs[0]["scrape_run_id"] == "run-xyz"
