@@ -474,11 +474,7 @@ class LinkedInScraper(BaseScraper):
     async def search(self, search_filter: JobSearchFilter) -> AsyncIterator[Job]:  # type: ignore[override]
         params = self._build_search_params(search_filter)
         seen_ids: set[str] = set()
-        cutoff = (
-            datetime.now(tz=timezone.utc) - timedelta(days=search_filter.max_age_days)
-            if search_filter.max_age_days
-            else None
-        )
+        cutoff = search_filter.age_cutoff_utc()
         # Search-card Easy Apply badges are not consistently present in LinkedIn's
         # guest search HTML, so when easy_apply_only is enabled we defer the hard
         # filter until get_job_details() can confirm the job via Voyager/detail HTML.
@@ -1182,8 +1178,9 @@ class LinkedInScraper(BaseScraper):
                 params["f_E"] = ",".join(dict.fromkeys(el_codes))
 
         # ── Date posted (f_TPR) ───────────────────────────────────────────────
-        if f.max_age_days:
-            params["f_TPR"] = f"r{f.max_age_days * 86400}"
+        max_age_seconds = f.effective_max_age_seconds()
+        if max_age_seconds:
+            params["f_TPR"] = f"r{max_age_seconds}"
 
         # ── Easy Apply only (f_LF) ────────────────────────────────────────────
         if getattr(f, "easy_apply_only", False):

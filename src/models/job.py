@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
@@ -92,5 +92,19 @@ class JobSearchFilter(BaseModel):
     salary_min: Optional[float] = None
     exclude_keywords: list[str] = Field(default_factory=list)
     max_age_days: int = 7  # only scrape jobs posted within N days
+    max_age_hours: Optional[int] = None  # optional higher-resolution age window
     max_jobs: Optional[int] = None  # max jobs to scrape per board (None = no limit)
     min_match_score: Optional[int] = None  # per-run override; None = use global settings.min_match_score
+
+    def effective_max_age_seconds(self) -> int | None:
+        if self.max_age_hours is not None:
+            return self.max_age_hours * 3600 if self.max_age_hours > 0 else None
+        if self.max_age_days > 0:
+            return self.max_age_days * 86400
+        return None
+
+    def age_cutoff_utc(self) -> datetime | None:
+        seconds = self.effective_max_age_seconds()
+        if not seconds:
+            return None
+        return datetime.now(tz=timezone.utc) - timedelta(seconds=seconds)

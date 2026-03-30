@@ -5,7 +5,7 @@ import io
 import json
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -16,8 +16,15 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_user, get_session
-from src.api.schemas.jobs import JobResponse, JobStatusUpdate, JobsPage, ScrapeRequest
-from src.database.models import JobRecord, ScrapeRun, User
+from src.api.schemas.jobs import (
+    JobResponse,
+    JobStatusUpdate,
+    JobsPage,
+    SavedSearchState,
+    ScrapeRequest,
+)
+from src.database.models import JobRecord, ScrapeRun, User, UserSettings
+from src.services.saved_searches import saved_search_state, update_saved_search_config
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 _ARTIFACT_ROOT = (Path.cwd() / "data" / "uploads").resolve()
@@ -147,6 +154,16 @@ async def export_jobs(
     )
 
 
+@router.get("/saved-search", response_model=SavedSearchState)
+async def get_saved_search(
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    row = await _get_or_create_settings(current_user.id, session)
+    settings_data = json.loads(row.settings_json or "{}")
+    return saved_search_state(settings_data.get("saved_search"))
+
+
 @router.get("/{job_id}", response_model=JobResponse)
 async def get_job(
     job_id: int,
@@ -202,6 +219,7 @@ async def trigger_scrape(
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
+    started_at = datetime.utcnow()
     run = ScrapeRun(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -209,9 +227,23 @@ async def trigger_scrape(
         boards=",".join(body.boards),
         keywords=",".join(body.keywords),
         location=body.location,
-        started_at=datetime.utcnow(),
+        started_at=started_at,
     )
     session.add(run)
+    if body.save_search:
+        row = await _get_or_create_settings(current_user.id, session)
+        settings_data = json.loads(row.settings_json or "{}")
+        updated_saved_search = update_saved_search_config(
+            settings_data.get("saved_search"),
+            body,
+            run_started_at=started_at.replace(tzinfo=timezone.utc),
+            run_id=run.id,
+        )
+        settings_data["saved_search"] = updated_saved_search.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+        row.settings_json = json.dumps(settings_data)
     await session.commit()
     background_tasks.add_task(_run_scrape, run.id, current_user.id, body)
     return {"run_id": run.id}
@@ -278,6 +310,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             experience_levels=exp_level_enums,
             easy_apply_only=req.easy_apply_only,
             max_age_days=req.max_age_days,
+            max_age_hours=req.max_age_hours,
             max_jobs=req.max_jobs,
             min_match_score=req.min_match_score,
         )
@@ -343,6 +376,17 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _get_or_create_settings(user_id: int, session: AsyncSession) -> UserSettings:
+    row = (
+        await session.execute(select(UserSettings).where(UserSettings.user_id == user_id))
+    ).scalar_one_or_none()
+    if row is None:
+        row = UserSettings(user_id=user_id, settings_json="{}")
+        session.add(row)
+        await session.flush()
+    return row
+
 
 async def _get_job_or_404(job_id: int, user_id: int, session: AsyncSession) -> JobRecord:
     r = (

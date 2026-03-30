@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { jobs as jobsApi } from "@/lib/api";
 import { useRunStream } from "@/lib/sse";
+import type { SavedSearchState } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -40,11 +41,13 @@ const EXP_LEVELS = [
   { value: "executive", label: "Executive" },
 ];
 const AGE_OPTIONS = [
-  { value: 1, label: "24h" },
-  { value: 3, label: "3 days" },
-  { value: 7, label: "7 days" },
-  { value: 14, label: "14 days" },
-  { value: 30, label: "30 days" },
+  { value: 1, label: "1h" },
+  { value: 3, label: "3h" },
+  { value: 24, label: "24h" },
+  { value: 72, label: "3 days" },
+  { value: 168, label: "7 days" },
+  { value: 336, label: "14 days" },
+  { value: 720, label: "30 days" },
 ];
 const ALL_BOARDS = ["linkedin", "indeed", "glassdoor", "ziprecruiter", "dice", "monster"];
 
@@ -106,6 +109,18 @@ function parseLogMessage(raw: string): ParsedLog {
     text: remaining || raw,
     tone,
   };
+}
+
+function formatScheduleTime(value: string | null | undefined) {
+  if (!value) return null;
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return null;
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(dt);
 }
 
 function logToneClasses(tone: LogTone) {
@@ -182,14 +197,27 @@ export function RunProgress({ onComplete }: Props) {
   const [jobTypes, setJobTypes] = useState<string[]>([]);
   const [expLevels, setExpLevels] = useState<string[]>([]);
   const [easyApplyOnly, setEasyApplyOnly] = useState(false);
-  const [maxAgeDays, setMaxAgeDays] = useState(7);
+  const [maxAgeHours, setMaxAgeHours] = useState(168);
   const [maxJobs, setMaxJobs] = useState<string>("");  // empty = no limit
   const [tailorDocuments, setTailorDocuments] = useState(false);
   const [minMatchScore, setMinMatchScore] = useState<number>(75);
   const [boards, setBoards] = useState<string[]>(["linkedin"]);
+  const [savedSearchEnabled, setSavedSearchEnabled] = useState(false);
+  const [savedSearchIntervalHours, setSavedSearchIntervalHours] = useState<1 | 3>(3);
+  const [savedSearchState, setSavedSearchState] = useState<SavedSearchState | null>(null);
 
   const { latest, messages, done } = useRunStream(runId);
   const trimmedLocation = location.trim();
+
+  useEffect(() => {
+    jobsApi.getSavedSearch()
+      .then((saved) => {
+        setSavedSearchState(saved);
+        setSavedSearchEnabled(saved.enabled);
+        setSavedSearchIntervalHours(saved.interval_hours);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -219,10 +247,36 @@ export function RunProgress({ onComplete }: Props) {
         experience_levels: expLevels,
         easy_apply_only: easyApplyOnly,
         boards,
-        max_age_days: maxAgeDays,
+        max_age_hours: maxAgeHours,
         max_jobs: maxJobs ? parseInt(maxJobs, 10) : undefined,
         tailor_documents: tailorDocuments,
         min_match_score: tailorDocuments ? minMatchScore : undefined,
+        save_search: true,
+        saved_search_enabled: savedSearchEnabled,
+        saved_search_interval_hours: savedSearchEnabled ? savedSearchIntervalHours : undefined,
+      });
+      const startedAt = new Date().toISOString();
+      setSavedSearchState({
+        enabled: savedSearchEnabled,
+        interval_hours: savedSearchIntervalHours,
+        criteria: {
+          keywords: keywords.split(",").map((k) => k.trim()).filter(Boolean),
+          location: trimmedLocation,
+          work_modes: workModes,
+          job_types: jobTypes,
+          experience_levels: expLevels,
+          easy_apply_only: easyApplyOnly,
+          boards,
+          max_age_hours: maxAgeHours,
+          max_jobs: maxJobs ? parseInt(maxJobs, 10) : undefined,
+          tailor_documents: tailorDocuments,
+          min_match_score: tailorDocuments ? minMatchScore : undefined,
+        },
+        last_triggered_at: savedSearchEnabled ? startedAt : savedSearchState?.last_triggered_at ?? null,
+        last_run_id: res.run_id,
+        next_trigger_at: savedSearchEnabled
+          ? new Date(Date.now() + savedSearchIntervalHours * 60 * 60 * 1000).toISOString()
+          : null,
       });
       setRunId(res.run_id);
     } catch (err: any) {
@@ -357,8 +411,8 @@ export function RunProgress({ onComplete }: Props) {
                   <Label className="text-xs text-muted-foreground">Posted Within</Label>
                   <div className="flex gap-1.5 mt-1 flex-wrap">
                     {AGE_OPTIONS.map(({ value, label }) => (
-                      <ToggleChip key={value} active={maxAgeDays === value}
-                        onClick={() => setMaxAgeDays(value)}>
+                      <ToggleChip key={value} active={maxAgeHours === value}
+                        onClick={() => setMaxAgeHours(value)}>
                         {label}
                       </ToggleChip>
                     ))}
@@ -387,6 +441,53 @@ export function RunProgress({ onComplete }: Props) {
                 </div>
               </div>
             )}
+
+            <div className="rounded-lg border p-3 bg-gray-50 space-y-3">
+              <div>
+                <Label className="text-xs text-muted-foreground">Recurring Search</Label>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Save this search and let the backend rerun the same auto-apply pipeline for newly posted jobs.
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  id="saved-search-enabled"
+                  type="checkbox"
+                  checked={savedSearchEnabled}
+                  onChange={(e) => setSavedSearchEnabled(e.target.checked)}
+                  className="h-4 w-4 rounded border-gray-300 text-blue-600 cursor-pointer"
+                />
+                <Label htmlFor="saved-search-enabled" className="text-xs cursor-pointer">
+                  Re-run this saved search automatically
+                </Label>
+              </div>
+              {savedSearchEnabled && (
+                <div>
+                  <Label className="text-xs text-muted-foreground">Run Every</Label>
+                  <div className="mt-1 flex gap-1.5 flex-wrap">
+                    {[1, 3].map((hours) => (
+                      <ToggleChip
+                        key={hours}
+                        active={savedSearchIntervalHours === hours}
+                        onClick={() => setSavedSearchIntervalHours(hours as 1 | 3)}
+                      >
+                        {hours}h
+                      </ToggleChip>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    For the safest coverage, keep the repeat interval aligned with your Posted Within window.
+                  </p>
+                </div>
+              )}
+              {savedSearchState?.enabled && (
+                <p className="text-xs text-muted-foreground">
+                  {savedSearchState.next_trigger_at
+                    ? `Next automatic run: ${formatScheduleTime(savedSearchState.next_trigger_at)}`
+                    : "This search is saved and ready for automatic reruns."}
+                </p>
+              )}
+            </div>
           </>
         )}
 

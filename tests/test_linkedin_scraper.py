@@ -315,6 +315,12 @@ class TestBuildSearchParams:
         params = scraper._build_search_params(f)
         assert params["f_TPR"] == "r604800"
 
+    def test_max_age_hours_sets_f_tpr(self):
+        scraper = make_scraper()
+        f = JobSearchFilter(keywords=["engineer"], max_age_days=7, max_age_hours=3)
+        params = scraper._build_search_params(f)
+        assert params["f_TPR"] == "r10800"
+
     def test_job_type_full_time(self):
         scraper = make_scraper()
         f = JobSearchFilter(keywords=["engineer"], job_types=[JobType.FULL_TIME])

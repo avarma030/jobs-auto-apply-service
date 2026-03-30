@@ -98,6 +98,31 @@ export interface Settings {
   custom_answers: Record<string, string>;
 }
 
+export interface SearchCriteria {
+  keywords: string[];
+  location?: string;
+  work_modes?: string[];
+  job_types?: string[];
+  experience_levels?: string[];
+  easy_apply_only?: boolean;
+  remote_only?: boolean;
+  boards: string[];
+  max_age_days?: number;
+  max_age_hours?: number | null;
+  max_jobs?: number | null;
+  tailor_documents?: boolean;
+  min_match_score?: number | null;
+}
+
+export interface SavedSearchState {
+  enabled: boolean;
+  interval_hours: 1 | 3;
+  criteria?: SearchCriteria | null;
+  last_triggered_at?: string | null;
+  last_run_id?: string | null;
+  next_trigger_at?: string | null;
+}
+
 export interface Profile {
   first_name?: string;
   last_name?: string;

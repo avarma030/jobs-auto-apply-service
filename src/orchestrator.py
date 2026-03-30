@@ -69,6 +69,8 @@ class Orchestrator:
     @staticmethod
     def _search_criteria_for_log(search_filter: JobSearchFilter) -> dict[str, object]:
         raw = search_filter.model_dump(mode="json", exclude_none=True)
+        if raw.get("max_age_hours") is not None:
+            raw.pop("max_age_days", None)
         return {
             key: value
             for key, value in raw.items()

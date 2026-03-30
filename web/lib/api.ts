@@ -6,6 +6,7 @@ import type {
   JobsPage,
   Profile,
   Run,
+  SavedSearchState,
   Settings,
   Stats,
   TokenResponse,
@@ -68,11 +69,16 @@ export const jobs = {
     remote_only?: boolean;
     boards: string[];
     max_age_days?: number;
+    max_age_hours?: number;
     max_jobs?: number;
     tailor_documents?: boolean;
     min_match_score?: number;
+    save_search?: boolean;
+    saved_search_enabled?: boolean;
+    saved_search_interval_hours?: 1 | 3;
   }) =>
     request<{ run_id: string }>("/jobs/scrape", { method: "POST", body: JSON.stringify(body) }),
+  getSavedSearch: () => request<SavedSearchState>("/jobs/saved-search"),
   /** Returns a download URL for Excel export. Open or assign to window.location.href. */
   exportUrl: (params?: { status?: string; board?: string }): string => {
     const q = new URLSearchParams();

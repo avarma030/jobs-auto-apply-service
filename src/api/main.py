@@ -7,9 +7,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routers import applications, auth, jobs, profile, runs, settings, stats
+from src.api.routers.jobs import _run_scrape
 from src.config import settings as app_settings
 from src.database.db import Database
 from src.database.models import Base
+from src.services.saved_search_scheduler import SavedSearchScheduler
 
 
 @asynccontextmanager
@@ -18,8 +20,12 @@ async def lifespan(app: FastAPI):
     db = Database(app_settings.database_url)
     await db.init()
     app.state.db = db
+    scheduler = SavedSearchScheduler(db, _run_scrape)
+    scheduler.start()
+    app.state.saved_search_scheduler = scheduler
     yield
     # Shutdown
+    await scheduler.stop()
     await db.close()
 
 
