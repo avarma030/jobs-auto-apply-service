@@ -96,6 +96,11 @@ class SavedSearchState(SavedSearchConfig):
     runs: list[SavedSearchRunSummary] = Field(default_factory=list)
 
 
+class SavedSearchUpdateRequest(BaseModel):
+    enabled: bool
+    interval_hours: Optional[Literal[1, 3]] = None
+
+
 class JobStatusUpdate(BaseModel):
     status: str  # approved | skipped | pending
 

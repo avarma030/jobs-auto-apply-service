@@ -227,6 +227,7 @@ export default function DashboardPage() {
   const [selectedRun, setSelectedRun] = useState<RunDetail | null>(null);
   const [loadingRunDetail, setLoadingRunDetail] = useState(false);
   const [runDetailError, setRunDetailError] = useState<string | null>(null);
+  const [savedSearchUpdating, setSavedSearchUpdating] = useState(false);
 
   const loadRunDetail = useCallback(async (runId: string) => {
     setLoadingRunDetail(true);
@@ -272,6 +273,22 @@ export default function DashboardPage() {
   const savedSearchRuns = savedSearch?.runs ?? [];
   const selectedRunCriteria = selectedRun?.search_criteria;
 
+  const toggleSavedSearch = useCallback(async () => {
+    if (!savedSearch?.criteria) return;
+    setSavedSearchUpdating(true);
+    try {
+      const updated = await jobsApi.updateSavedSearch({
+        enabled: !savedSearch.enabled,
+        interval_hours: savedSearch.interval_hours,
+      });
+      setSavedSearch(updated);
+    } catch (error: any) {
+      alert(error.message ?? "Could not update the saved search.");
+    } finally {
+      setSavedSearchUpdating(false);
+    }
+  }, [savedSearch]);
+
   return (
     <div className="flex-1 overflow-y-auto">
       <TopBar title="Dashboard" subtitle="Your application overview" />
@@ -279,7 +296,7 @@ export default function DashboardPage() {
         <StatsCards stats={stats} />
 
         <div className="grid grid-cols-1 xl:grid-cols-[1.4fr,1fr] gap-6">
-          <RunProgress onComplete={reload} />
+          <RunProgress onComplete={reload} savedSearchStateOverride={savedSearch} />
 
           <div className="space-y-6">
             <Card>
@@ -295,7 +312,24 @@ export default function DashboardPage() {
                       </Badge>
                       <Badge variant="outline">Every {savedSearch.interval_hours}h</Badge>
                       <Badge variant="outline">Runs so far: {savedSearch.run_count}</Badge>
+                      <Button
+                        variant={savedSearch.enabled ? "outline" : "default"}
+                        size="sm"
+                        disabled={savedSearchUpdating}
+                        onClick={toggleSavedSearch}
+                      >
+                        {savedSearchUpdating
+                          ? "Updating..."
+                          : savedSearch.enabled
+                            ? "Pause auto-trigger"
+                            : "Resume auto-trigger"}
+                      </Button>
                     </div>
+                    <p className="text-xs text-muted-foreground">
+                      {savedSearch.enabled
+                        ? "This saved search is active and the scheduler will rerun it automatically on the selected interval."
+                        : "Paused means the search criteria is saved, but automatic reruns are currently disabled. Resume it to start the recurring trigger again."}
+                    </p>
                     <CriteriaPreview criteria={savedSearch.criteria} />
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
                       <div className="rounded-lg border p-3">

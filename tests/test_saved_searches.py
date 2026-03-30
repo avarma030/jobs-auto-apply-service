@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import select
 
-from src.api.schemas.jobs import SavedSearchConfig, ScrapeRequest, SearchCriteria
+from src.api.schemas.jobs import (
+    SavedSearchConfig,
+    SavedSearchUpdateRequest,
+    ScrapeRequest,
+    SearchCriteria,
+)
 from src.database.db import Database
 from src.database.models import ScrapeRun, User, UserSettings
 from src.services.saved_search_scheduler import SavedSearchScheduler
@@ -16,6 +21,7 @@ from src.services.saved_searches import (
     saved_search_key,
     scrape_request_from_saved_search,
     serialized_search_criteria,
+    update_saved_search_enabled,
     update_saved_search_config,
 )
 
@@ -91,6 +97,48 @@ def test_saved_search_key_stays_stable_for_equivalent_criteria():
     assert payload["max_age_hours"] == 3
     assert "max_age_days" not in payload
     assert saved_search_key(criteria) == saved_search_key(criteria.model_copy())
+
+
+def test_update_saved_search_enabled_resumes_from_toggle_time():
+    toggled_at = datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc)
+    current = SavedSearchConfig(
+        enabled=False,
+        interval_hours=3,
+        criteria=SearchCriteria(keywords=["product manager"], location="Dublin"),
+        last_triggered_at=datetime(2026, 3, 29, 9, 0, tzinfo=timezone.utc),
+        last_run_id="run-1",
+    ).model_dump(mode="json", exclude_none=True)
+
+    updated = update_saved_search_enabled(
+        current,
+        SavedSearchUpdateRequest(enabled=True),
+        toggled_at=toggled_at,
+    )
+
+    assert updated.enabled is True
+    assert updated.last_triggered_at == toggled_at
+    assert updated.last_run_id == "run-1"
+
+
+def test_update_saved_search_enabled_can_pause_without_resetting_history():
+    previous_trigger = datetime(2026, 3, 30, 9, 0, tzinfo=timezone.utc)
+    current = SavedSearchConfig(
+        enabled=True,
+        interval_hours=1,
+        criteria=SearchCriteria(keywords=["ai engineer"], location="Berlin"),
+        last_triggered_at=previous_trigger,
+        last_run_id="run-77",
+    ).model_dump(mode="json", exclude_none=True)
+
+    updated = update_saved_search_enabled(
+        current,
+        SavedSearchUpdateRequest(enabled=False),
+        toggled_at=datetime(2026, 3, 30, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert updated.enabled is False
+    assert updated.last_triggered_at == previous_trigger
+    assert updated.last_run_id == "run-77"
 
 
 def test_scrape_request_from_saved_search_round_trips_criteria():

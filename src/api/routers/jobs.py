@@ -22,6 +22,7 @@ from src.api.schemas.jobs import (
     JobsPage,
     SavedSearchRunSummary,
     SavedSearchState,
+    SavedSearchUpdateRequest,
     SearchCriteria,
     ScrapeRequest,
 )
@@ -31,6 +32,7 @@ from src.services.saved_searches import (
     saved_search_state,
     search_criteria_from_request,
     serialized_search_criteria,
+    update_saved_search_enabled,
     update_saved_search_config,
 )
 
@@ -169,45 +171,38 @@ async def get_saved_search(
 ):
     row = await _get_or_create_settings(current_user.id, session)
     settings_data = json.loads(row.settings_json or "{}")
-    raw_saved_search = settings_data.get("saved_search")
-    state = saved_search_state(raw_saved_search)
-    if state.criteria is None:
-        return state
-
-    run_filter = _saved_search_run_filter(current_user.id, state.criteria)
-    run_count = (
-        await session.execute(select(func.count()).select_from(ScrapeRun).where(run_filter))
-    ).scalar_one()
-    run_rows = list(
-        (
-            await session.execute(
-                select(ScrapeRun)
-                .where(run_filter)
-                .order_by(ScrapeRun.started_at.desc())
-                .limit(10)
-            )
-        ).scalars().all()
-    )
-    summary_by_run = await _job_status_counts_for_runs(
+    return await _build_saved_search_state(
         session,
         current_user.id,
-        [run.id for run in run_rows],
+        settings_data.get("saved_search"),
     )
-    runs = [
-        SavedSearchRunSummary(
-            id=run.id,
-            status=run.status,
-            trigger_type=run.trigger_type or "manual",
-            started_at=run.started_at,
-            finished_at=run.finished_at,
-            jobs_found=run.jobs_found,
-            jobs_applied=run.jobs_applied,
-            job_summary=summary_by_run.get(run.id, {}),
-            error_message=run.error_message,
-        )
-        for run in run_rows
-    ]
-    return saved_search_state(raw_saved_search, run_count=run_count, runs=runs)
+
+
+@router.put("/saved-search", response_model=SavedSearchState)
+async def update_saved_search(
+    body: SavedSearchUpdateRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    row = await _get_or_create_settings(current_user.id, session)
+    settings_data = json.loads(row.settings_json or "{}")
+    current_raw = settings_data.get("saved_search")
+    current_state = saved_search_state(current_raw)
+    if current_state.criteria is None:
+        raise HTTPException(status_code=404, detail="No saved search found")
+
+    updated_saved_search = update_saved_search_enabled(
+        current_raw,
+        body,
+        toggled_at=datetime.now(timezone.utc),
+    )
+    settings_data["saved_search"] = updated_saved_search.model_dump(
+        mode="json",
+        exclude_none=True,
+    )
+    row.settings_json = json.dumps(settings_data)
+    await session.commit()
+    return await _build_saved_search_state(session, current_user.id, settings_data["saved_search"])
 
 
 @router.get("/{job_id}", response_model=JobResponse)
@@ -436,6 +431,51 @@ async def _get_or_create_settings(user_id: int, session: AsyncSession) -> UserSe
         session.add(row)
         await session.flush()
     return row
+
+
+async def _build_saved_search_state(
+    session: AsyncSession,
+    user_id: int,
+    raw_saved_search: object,
+) -> SavedSearchState:
+    state = saved_search_state(raw_saved_search)
+    if state.criteria is None:
+        return state
+
+    run_filter = _saved_search_run_filter(user_id, state.criteria)
+    run_count = (
+        await session.execute(select(func.count()).select_from(ScrapeRun).where(run_filter))
+    ).scalar_one()
+    run_rows = list(
+        (
+            await session.execute(
+                select(ScrapeRun)
+                .where(run_filter)
+                .order_by(ScrapeRun.started_at.desc())
+                .limit(10)
+            )
+        ).scalars().all()
+    )
+    summary_by_run = await _job_status_counts_for_runs(
+        session,
+        user_id,
+        [run.id for run in run_rows],
+    )
+    runs = [
+        SavedSearchRunSummary(
+            id=run.id,
+            status=run.status,
+            trigger_type=run.trigger_type or "manual",
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            jobs_found=run.jobs_found,
+            jobs_applied=run.jobs_applied,
+            job_summary=summary_by_run.get(run.id, {}),
+            error_message=run.error_message,
+        )
+        for run in run_rows
+    ]
+    return saved_search_state(raw_saved_search, run_count=run_count, runs=runs)
 
 
 async def _get_job_or_404(job_id: int, user_id: int, session: AsyncSession) -> JobRecord:

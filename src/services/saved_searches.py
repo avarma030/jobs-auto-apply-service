@@ -9,6 +9,7 @@ from src.api.schemas.jobs import (
     SavedSearchConfig,
     SavedSearchRunSummary,
     SavedSearchState,
+    SavedSearchUpdateRequest,
     ScrapeRequest,
     SearchCriteria,
 )
@@ -93,6 +94,22 @@ def update_saved_search_config(
     if updated.enabled and run_started_at is not None:
         updated.last_triggered_at = _as_utc(run_started_at)
         updated.last_run_id = run_id
+    return updated
+
+
+def update_saved_search_enabled(
+    current_raw: Any,
+    req: SavedSearchUpdateRequest,
+    *,
+    toggled_at: datetime | None = None,
+) -> SavedSearchConfig:
+    current = load_saved_search_config(current_raw)
+    updated = current.model_copy(deep=True)
+    updated.enabled = req.enabled
+    if req.interval_hours is not None:
+        updated.interval_hours = req.interval_hours
+    if updated.enabled:
+        updated.last_triggered_at = _as_utc(toggled_at or datetime.now(timezone.utc))
     return updated
 
 

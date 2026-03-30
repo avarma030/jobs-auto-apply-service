@@ -24,6 +24,7 @@ import {
 
 interface Props {
   onComplete?: () => void;
+  savedSearchStateOverride?: SavedSearchState | null;
 }
 
 const WORK_MODES = ["remote", "hybrid", "onsite"];
@@ -185,7 +186,7 @@ function ToggleChip({
   );
 }
 
-export function RunProgress({ onComplete }: Props) {
+export function RunProgress({ onComplete, savedSearchStateOverride }: Props) {
   const [runId, setRunId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -218,6 +219,13 @@ export function RunProgress({ onComplete }: Props) {
       })
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!savedSearchStateOverride) return;
+    setSavedSearchState(savedSearchStateOverride);
+    setSavedSearchEnabled(savedSearchStateOverride.enabled);
+    setSavedSearchIntervalHours(savedSearchStateOverride.interval_hours);
+  }, [savedSearchStateOverride]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;

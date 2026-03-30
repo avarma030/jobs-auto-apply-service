@@ -80,6 +80,11 @@ export const jobs = {
   }) =>
     request<{ run_id: string }>("/jobs/scrape", { method: "POST", body: JSON.stringify(body) }),
   getSavedSearch: () => request<SavedSearchState>("/jobs/saved-search"),
+  updateSavedSearch: (body: { enabled: boolean; interval_hours?: 1 | 3 }) =>
+    request<SavedSearchState>("/jobs/saved-search", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
   /** Returns a download URL for Excel export. Open or assign to window.location.href. */
   exportUrl: (params?: { status?: string; board?: string }): string => {
     const q = new URLSearchParams();
