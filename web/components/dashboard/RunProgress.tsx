@@ -221,10 +221,15 @@ export function RunProgress({ onComplete, savedSearchStateOverride }: Props) {
   }, []);
 
   useEffect(() => {
-    if (!savedSearchStateOverride) return;
+    if (savedSearchStateOverride === undefined) return;
     setSavedSearchState(savedSearchStateOverride);
-    setSavedSearchEnabled(savedSearchStateOverride.enabled);
-    setSavedSearchIntervalHours(savedSearchStateOverride.interval_hours);
+    if (savedSearchStateOverride) {
+      setSavedSearchEnabled(savedSearchStateOverride.enabled);
+      setSavedSearchIntervalHours(savedSearchStateOverride.interval_hours);
+    } else {
+      setSavedSearchEnabled(false);
+      setSavedSearchIntervalHours(3);
+    }
   }, [savedSearchStateOverride]);
 
   useEffect(() => {

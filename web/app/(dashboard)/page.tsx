@@ -228,6 +228,7 @@ export default function DashboardPage() {
   const [loadingRunDetail, setLoadingRunDetail] = useState(false);
   const [runDetailError, setRunDetailError] = useState<string | null>(null);
   const [savedSearchUpdating, setSavedSearchUpdating] = useState(false);
+  const [savedSearchDeleting, setSavedSearchDeleting] = useState(false);
 
   const loadRunDetail = useCallback(async (runId: string) => {
     setLoadingRunDetail(true);
@@ -289,6 +290,24 @@ export default function DashboardPage() {
     }
   }, [savedSearch]);
 
+  const deleteSavedSearch = useCallback(async () => {
+    if (!savedSearch?.criteria) return;
+    const confirmed = window.confirm(
+      "Delete this saved recurring search? This will stop automatic reruns, but your previous runs will still remain in history.",
+    );
+    if (!confirmed) return;
+
+    setSavedSearchDeleting(true);
+    try {
+      await jobsApi.deleteSavedSearch();
+      setSavedSearch(null);
+    } catch (error: any) {
+      alert(error.message ?? "Could not delete the saved search.");
+    } finally {
+      setSavedSearchDeleting(false);
+    }
+  }, [savedSearch]);
+
   return (
     <div className="flex-1 overflow-y-auto">
       <TopBar title="Dashboard" subtitle="Your application overview" />
@@ -315,7 +334,7 @@ export default function DashboardPage() {
                       <Button
                         variant={savedSearch.enabled ? "outline" : "default"}
                         size="sm"
-                        disabled={savedSearchUpdating}
+                        disabled={savedSearchUpdating || savedSearchDeleting}
                         onClick={toggleSavedSearch}
                       >
                         {savedSearchUpdating
@@ -323,6 +342,14 @@ export default function DashboardPage() {
                           : savedSearch.enabled
                             ? "Pause auto-trigger"
                             : "Resume auto-trigger"}
+                      </Button>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        disabled={savedSearchUpdating || savedSearchDeleting}
+                        onClick={deleteSavedSearch}
+                      >
+                        {savedSearchDeleting ? "Deleting..." : "Delete saved search"}
                       </Button>
                     </div>
                     <p className="text-xs text-muted-foreground">

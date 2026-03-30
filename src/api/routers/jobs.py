@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import openpyxl
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -203,6 +203,19 @@ async def update_saved_search(
     row.settings_json = json.dumps(settings_data)
     await session.commit()
     return await _build_saved_search_state(session, current_user.id, settings_data["saved_search"])
+
+
+@router.delete("/saved-search", status_code=204)
+async def delete_saved_search(
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    row = await _get_or_create_settings(current_user.id, session)
+    settings_data = json.loads(row.settings_json or "{}")
+    settings_data.pop("saved_search", None)
+    row.settings_json = json.dumps(settings_data)
+    await session.commit()
+    return Response(status_code=204)
 
 
 @router.get("/{job_id}", response_model=JobResponse)

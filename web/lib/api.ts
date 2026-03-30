@@ -85,6 +85,10 @@ export const jobs = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+  deleteSavedSearch: () =>
+    request<void>("/jobs/saved-search", {
+      method: "DELETE",
+    }),
   /** Returns a download URL for Excel export. Open or assign to window.location.href. */
   exportUrl: (params?: { status?: string; board?: string }): string => {
     const q = new URLSearchParams();
