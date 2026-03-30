@@ -77,6 +77,12 @@ class Orchestrator:
             if value not in ("", [], {})
         }
 
+    @staticmethod
+    def _resolve_current_run_limit(search_filter: JobSearchFilter) -> int:
+        if search_filter.max_jobs is not None:
+            return search_filter.max_jobs
+        return settings.max_applications_per_run
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -115,6 +121,7 @@ class Orchestrator:
         self,
         user_id: int | None = None,
         scrape_run_id: str | None = None,
+        limit: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> dict:
         """Apply to pending jobs. Returns status counts."""
@@ -124,8 +131,9 @@ class Orchestrator:
             else:
                 logger.info(msg)
 
+        pending_limit = limit if limit is not None else settings.max_applications_per_run
         pending = await self.db.get_pending_jobs(
-            limit=settings.max_applications_per_run,
+            limit=pending_limit,
             user_id=user_id,
             scrape_run_id=scrape_run_id,
         )
@@ -292,10 +300,17 @@ class Orchestrator:
             self._search_criteria_for_log(search_filter),
             ensure_ascii=False,
         )
+        current_run_limit = self._resolve_current_run_limit(search_filter)
         _emit(f"[Search][Criteria] {criteria_json}")
         _emit("🚀 Pipeline starting — scraping jobs …")
         jobs_found = await self.run_scrape(search_filter, user_id=user_id, run_id=run_id)
         _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
+
+        if search_filter.max_jobs is not None and jobs_found < search_filter.max_jobs:
+            _emit(
+                f"[Search][Result] Requested {search_filter.max_jobs} jobs, "
+                f"but only {jobs_found} matched the current criteria. Proceeding with {jobs_found}."
+            )
 
         # If tailoring is disabled, apply the jobs from this run with the
         # uploaded resume as-is.
@@ -304,6 +319,7 @@ class Orchestrator:
             counts = await self.run_apply(
                 user_id=user_id,
                 scrape_run_id=run_id,
+                limit=current_run_limit,
                 progress_callback=_emit,
             )
             counts["scraped"] = jobs_found
@@ -328,7 +344,7 @@ class Orchestrator:
         # Load ONLY jobs from this run — never re-process leftover pending jobs from
         # previous runs, which would give wrong counts and re-score already-seen jobs.
         pending = await self.db.get_pending_jobs(
-            limit=settings.max_applications_per_run,
+            limit=current_run_limit,
             user_id=user_id,
             scrape_run_id=run_id,
         )

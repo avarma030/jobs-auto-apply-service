@@ -69,7 +69,9 @@ class FakeDb:
         self.pending_calls.append(
             {"limit": limit, "user_id": user_id, "scrape_run_id": scrape_run_id}
         )
-        return list(self.records)
+        if limit is None:
+            return list(self.records)
+        return list(self.records[:limit])
 
     async def update_job_status(self, job_id, status, applied_at=None, notes=None):
         self.status_updates.append(
@@ -181,6 +183,91 @@ async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disable
     assert db.logged_applications[0]["status"] == ApplicationStatus.APPLIED
     assert db.profile_answer_updates == []
     assert any("[Search][Criteria]" in message and "ml engineer" in message for message in progress_messages)
+
+
+@pytest.mark.asyncio
+async def test_run_full_pipeline_uses_requested_max_jobs_for_current_run_apply_limit(monkeypatch):
+    records = [make_job_record(job_id=i) for i in range(1, 5)]
+    db = FakeDb(records)
+    orch = Orchestrator(profile=make_profile(), db=db)
+    applier = StubApplier()
+
+    orch.run_scrape = AsyncMock(return_value=4)
+    monkeypatch.setattr(orch, "_pick_applier", lambda job: applier)
+    monkeypatch.setattr(settings, "dry_run", False)
+    monkeypatch.setattr(settings, "max_applications_per_run", 2)
+
+    counts = await orch.run_full_pipeline(
+        JobSearchFilter(keywords=["ai engineer"], max_jobs=4),
+        user_id=7,
+        run_id="run-456",
+        tailor_documents=False,
+    )
+
+    assert db.pending_calls == [
+        {
+            "limit": 4,
+            "user_id": 7,
+            "scrape_run_id": "run-456",
+        }
+    ]
+    assert len(applier.calls) == 4
+    assert counts["scraped"] == 4
+    assert counts["applied"] == 4
+
+
+@pytest.mark.asyncio
+async def test_run_full_pipeline_emits_requested_vs_matched_message_when_fewer_jobs_found(monkeypatch):
+    db = FakeDb([])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    progress_messages: list[str] = []
+
+    orch.run_scrape = AsyncMock(return_value=3)
+    orch.run_apply = AsyncMock(
+        return_value={"applied": 0, "failed": 0, "skipped": 0, "dry_run": 0}
+    )
+
+    counts = await orch.run_full_pipeline(
+        JobSearchFilter(keywords=["product manager"], max_jobs=5),
+        user_id=9,
+        run_id="run-789",
+        progress_callback=progress_messages.append,
+        tailor_documents=False,
+    )
+
+    orch.run_apply.assert_awaited_once()
+    assert orch.run_apply.await_args.kwargs["user_id"] == 9
+    assert orch.run_apply.await_args.kwargs["scrape_run_id"] == "run-789"
+    assert orch.run_apply.await_args.kwargs["limit"] == 5
+    assert callable(orch.run_apply.await_args.kwargs["progress_callback"])
+    assert counts["scraped"] == 3
+    assert any(
+        "Requested 5 jobs, but only 3 matched the current criteria. Proceeding with 3."
+        in message
+        for message in progress_messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_full_pipeline_does_not_emit_requested_vs_matched_message_when_target_is_met(monkeypatch):
+    db = FakeDb([])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    progress_messages: list[str] = []
+
+    orch.run_scrape = AsyncMock(return_value=4)
+    orch.run_apply = AsyncMock(
+        return_value={"applied": 0, "failed": 0, "skipped": 0, "dry_run": 0}
+    )
+
+    await orch.run_full_pipeline(
+        JobSearchFilter(keywords=["product manager"], max_jobs=4),
+        user_id=9,
+        run_id="run-790",
+        progress_callback=progress_messages.append,
+        tailor_documents=False,
+    )
+
+    assert not any("[Search][Result]" in message for message in progress_messages)
 
 
 class LearningApplier:
