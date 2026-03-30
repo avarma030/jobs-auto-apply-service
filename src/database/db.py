@@ -100,8 +100,19 @@ class Database:
             record.easy_apply = job.easy_apply
             record.posted_at = _strip_tz(job.posted_at)
             record.scraped_at = _strip_tz(job.scraped_at)
-            if is_new or job.application_status != ApplicationStatus.PENDING:
+
+            existing_status = str(getattr(record, "application_status", "") or "").lower()
+            should_revive_failed_job = (
+                not is_new
+                and job.application_status == ApplicationStatus.PENDING
+                and existing_status == ApplicationStatus.FAILED.value
+            )
+            if is_new or job.application_status != ApplicationStatus.PENDING or should_revive_failed_job:
                 record.application_status = job.application_status
+                if should_revive_failed_job:
+                    record.applied_at = None
+                    if job.notes is None:
+                        record.notes = None
             if job.applied_at is not None:
                 record.applied_at = _strip_tz(job.applied_at)
             if job.notes is not None:

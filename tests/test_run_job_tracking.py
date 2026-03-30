@@ -58,6 +58,38 @@ async def test_current_run_pending_jobs_include_rescraped_existing_job(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_rescraped_failed_job_is_requeued_for_current_run(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    db = Database(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await db.init()
+
+    async with db.session_factory() as session:
+        session.add(User(id=1, email="user@example.com", hashed_password="secret"))
+        session.add_all(
+            [
+                ScrapeRun(id="run-old", user_id=1, status="done"),
+                ScrapeRun(id="run-new", user_id=1, status="running"),
+            ]
+        )
+        await session.commit()
+
+    failed_job = make_job(
+        application_status=ApplicationStatus.FAILED,
+        notes="Form validation error: Enter a decimal number larger than 0.0",
+    )
+    await db.upsert_job(failed_job, user_id=1, scrape_run_id="run-old")
+    await db.upsert_job(make_job(), user_id=1, scrape_run_id="run-new")
+
+    pending = await db.get_pending_jobs(limit=10, user_id=1, scrape_run_id="run-new")
+
+    assert len(pending) == 1
+    assert pending[0].application_status == ApplicationStatus.PENDING
+    assert pending[0].notes is None
+
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_run_summary_helpers_count_linked_jobs_without_overwriting_legacy_run_ids(tmp_path):
     db_path = tmp_path / "jobs.db"
     db = Database(f"sqlite+aiosqlite:///{db_path.as_posix()}")
@@ -98,5 +130,32 @@ async def test_run_summary_helpers_count_linked_jobs_without_overwriting_legacy_
     assert run_summaries["run-new"].pending == 1
     assert saved_search_summaries["run-old"]["pending"] == 1
     assert saved_search_summaries["run-new"]["pending"] == 1
+
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_rescraped_applied_job_is_not_requeued(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    db = Database(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await db.init()
+
+    async with db.session_factory() as session:
+        session.add(User(id=1, email="user@example.com", hashed_password="secret"))
+        session.add_all(
+            [
+                ScrapeRun(id="run-old", user_id=1, status="done"),
+                ScrapeRun(id="run-new", user_id=1, status="running"),
+            ]
+        )
+        await session.commit()
+
+    applied_job = make_job(application_status=ApplicationStatus.APPLIED)
+    await db.upsert_job(applied_job, user_id=1, scrape_run_id="run-old")
+    await db.upsert_job(make_job(), user_id=1, scrape_run_id="run-new")
+
+    pending = await db.get_pending_jobs(limit=10, user_id=1, scrape_run_id="run-new")
+
+    assert pending == []
 
     await db.close()
