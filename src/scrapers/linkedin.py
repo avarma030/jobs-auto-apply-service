@@ -528,6 +528,8 @@ class LinkedInScraper(BaseScraper):
                 break
 
             new_this_page = 0
+            old_this_page = 0
+            eligible_age_this_page = 0
             for card in cards:
                 # Respect max_jobs limit
                 if max_jobs is not None and total_yielded >= max_jobs:
@@ -541,11 +543,14 @@ class LinkedInScraper(BaseScraper):
 
                 # Age gate
                 posted_at = card.get("posted_at")
-                if cutoff and posted_at and posted_at < cutoff:
+                cutoff_posted_at = self._card_posted_at_for_cutoff(card)
+                if cutoff and cutoff_posted_at and cutoff_posted_at < cutoff:
+                    old_this_page += 1
                     logger.debug(
-                        f"[LinkedIn] Job {job_id} too old ({posted_at}), stopping pagination"
+                        f"[LinkedIn] Job {job_id} too old ({cutoff_posted_at}), skipping card"
                     )
-                    return
+                    continue
+                eligible_age_this_page += 1
 
                 # Skip excluded keywords
                 title = card.get("title", "")
@@ -573,6 +578,11 @@ class LinkedInScraper(BaseScraper):
                 yield job
 
             logger.info(f"[LinkedIn] Page {page + 1}: {new_this_page} new jobs")
+            if cutoff and old_this_page and eligible_age_this_page == 0:
+                logger.debug(
+                    f"[LinkedIn] Page {page + 1} is fully outside the requested age window, stopping pagination"
+                )
+                break
             if new_this_page == 0:
                 if search_filter.easy_apply_only:
                     logger.debug(
@@ -1114,6 +1124,7 @@ class LinkedInScraper(BaseScraper):
             # Posted at
             time_el = card_el.select_one("time")
             posted_at: datetime | None = None
+            posted_text = time_el.get_text(strip=True) if time_el else ""
             if time_el and time_el.get("datetime"):
                 try:
                     posted_at = datetime.fromisoformat(time_el["datetime"]).replace(
@@ -1162,6 +1173,7 @@ class LinkedInScraper(BaseScraper):
                     "location": location,
                     "url": url,
                     "posted_at": posted_at,
+                    "posted_text": posted_text,
                     "work_mode": work_mode,
                     "easy_apply": easy_apply,
                 }
@@ -1176,6 +1188,7 @@ class LinkedInScraper(BaseScraper):
         params: dict = {
             "keywords": " ".join(f.keywords),
             "count": _PAGE_SIZE,
+            "sortBy": "DD",
         }
 
         if f.location:
@@ -1217,6 +1230,47 @@ class LinkedInScraper(BaseScraper):
             params["f_LF"] = "f_AL"
 
         return params
+
+    @staticmethod
+    def _parse_relative_posted_at(text: str, *, now: datetime | None = None) -> datetime | None:
+        raw = (text or "").strip().lower()
+        if not raw:
+            return None
+        current = now or datetime.now(timezone.utc)
+        if raw in {"just now", "today"}:
+            return current
+        if raw == "yesterday":
+            return current - timedelta(days=1)
+
+        match = re.search(
+            r"(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago",
+            raw,
+        )
+        if not match:
+            return None
+
+        value = int(match.group(1))
+        unit = match.group(2)
+        if unit == "minute":
+            delta = timedelta(minutes=value)
+        elif unit == "hour":
+            delta = timedelta(hours=value)
+        elif unit == "day":
+            delta = timedelta(days=value)
+        elif unit == "week":
+            delta = timedelta(weeks=value)
+        elif unit == "month":
+            delta = timedelta(days=30 * value)
+        else:
+            delta = timedelta(days=365 * value)
+        return current - delta
+
+    def _card_posted_at_for_cutoff(self, card: dict) -> datetime | None:
+        posted_text = str(card.get("posted_text") or "").strip()
+        relative_posted_at = self._parse_relative_posted_at(posted_text)
+        if relative_posted_at is not None:
+            return relative_posted_at
+        return card.get("posted_at")
 
     # ------------------------------------------------------------------
     # Value parsers
