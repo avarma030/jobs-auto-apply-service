@@ -9,6 +9,8 @@ from pydantic import BaseModel
 class ApplicationResponse(BaseModel):
     id: int
     job_id: int
+    job_title: Optional[str] = None
+    company_name: Optional[str] = None
     attempted_at: datetime
     status: str
     confirmation_id: Optional[str] = None

@@ -21,15 +21,19 @@ async def list_applications(
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    q = select(ApplicationRecord).where(ApplicationRecord.user_id == current_user.id)
+    q = (
+        select(ApplicationRecord, JobRecord)
+        .outerjoin(JobRecord, JobRecord.id == ApplicationRecord.job_id)
+        .where(ApplicationRecord.user_id == current_user.id)
+    )
     if status:
         q = q.where(ApplicationRecord.status == status)
 
     total = (await session.execute(select(func.count()).select_from(q.subquery()))).scalar_one()
     q = q.order_by(ApplicationRecord.attempted_at.desc()).offset((page - 1) * page_size).limit(page_size)
-    records = list((await session.execute(q)).scalars().all())
+    rows = list((await session.execute(q)).all())
     return ApplicationsPage(
-        items=[ApplicationResponse.model_validate(r) for r in records],
+        items=[_serialize_application(app_record, job_record) for app_record, job_record in rows],
         total=total,
         page=page,
         page_size=page_size,
@@ -43,7 +47,8 @@ async def get_application(
     current_user: User = Depends(get_current_user),
 ):
     r = await _get_or_404(app_id, current_user.id, session)
-    return ApplicationResponse.model_validate(r)
+    job = await session.get(JobRecord, r.job_id)
+    return _serialize_application(r, job)
 
 
 @router.put("/{app_id}", response_model=ApplicationResponse)
@@ -59,7 +64,8 @@ async def update_application(
         r.message = body.notes
     await session.commit()
     await session.refresh(r)
-    return ApplicationResponse.model_validate(r)
+    job = await session.get(JobRecord, r.job_id)
+    return _serialize_application(r, job)
 
 
 async def _get_or_404(app_id: int, user_id: int, session: AsyncSession) -> ApplicationRecord:
@@ -73,3 +79,15 @@ async def _get_or_404(app_id: int, user_id: int, session: AsyncSession) -> Appli
     if r is None:
         raise HTTPException(status_code=404, detail="Application not found")
     return r
+
+
+def _serialize_application(
+    application: ApplicationRecord, job: JobRecord | None
+) -> ApplicationResponse:
+    response = ApplicationResponse.model_validate(application)
+    return response.model_copy(
+        update={
+            "job_title": getattr(job, "title", None),
+            "company_name": getattr(job, "company", None),
+        }
+    )

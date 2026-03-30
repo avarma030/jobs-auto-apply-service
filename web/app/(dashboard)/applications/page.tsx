@@ -81,7 +81,10 @@ export default function ApplicationsPage() {
                 data.items.map((app) => (
                   <tr key={app.id} className="hover:bg-gray-50">
                     <td className="px-4 py-3">
-                      <p className="font-medium">Job #{app.job_id}</p>
+                      <p className="font-medium">{app.job_title || `Job #${app.job_id}`}</p>
+                      {app.company_name && (
+                        <p className="text-xs text-muted-foreground mt-0.5">{app.company_name}</p>
+                      )}
                       {app.confirmation_id && (
                         <p className="text-xs text-muted-foreground">Ref: {app.confirmation_id}</p>
                       )}

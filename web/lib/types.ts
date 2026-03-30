@@ -46,6 +46,8 @@ export interface JobsPage {
 export interface Application {
   id: number;
   job_id: number;
+  job_title?: string;
+  company_name?: string;
   attempted_at: string;
   status: string;
   confirmation_id?: string;
