@@ -52,6 +52,19 @@ class RunJobResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RunEventResponse(BaseModel):
+    id: int
+    event_type: str
+    level: str
+    message: Optional[str] = None
+    status: Optional[str] = None
+    jobs_found: Optional[int] = None
+    jobs_applied: Optional[int] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 class RunResponse(BaseModel):
     id: str
     status: str
@@ -72,3 +85,4 @@ class RunResponse(BaseModel):
 
 class RunDetailResponse(RunResponse):
     jobs: list[RunJobResponse] = Field(default_factory=list)
+    events: list[RunEventResponse] = Field(default_factory=list)

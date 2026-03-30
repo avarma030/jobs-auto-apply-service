@@ -12,6 +12,7 @@ from src.database.models import (
     ApplicationRecord,
     Base,
     JobRecord,
+    RunEventRecord,
     RunJobRecord,
     SemanticCacheRecord,
 )
@@ -284,6 +285,59 @@ class Database:
             session.add(record)
             await session.commit()
             return record
+
+    async def append_run_event(
+        self,
+        run_id: str,
+        *,
+        user_id: int | None = None,
+        event_type: str = "progress",
+        level: str = "info",
+        message: str | None = None,
+        status: str | None = None,
+        jobs_found: int | None = None,
+        jobs_applied: int | None = None,
+        payload: dict | None = None,
+    ) -> RunEventRecord:
+        async with self.session_factory() as session:
+            record = RunEventRecord(
+                run_id=run_id,
+                user_id=user_id,
+                event_type=event_type,
+                level=level,
+                message=message,
+                status=status,
+                jobs_found=jobs_found,
+                jobs_applied=jobs_applied,
+                payload_json=json.dumps(payload) if payload is not None else None,
+            )
+            session.add(record)
+            await session.commit()
+            await session.refresh(record)
+            return record
+
+    async def get_run_events(
+        self,
+        run_id: str,
+        *,
+        user_id: int | None = None,
+        after_id: int = 0,
+        limit: int = 500,
+    ) -> list[RunEventRecord]:
+        async with self.session_factory() as session:
+            q = (
+                select(RunEventRecord)
+                .where(
+                    RunEventRecord.run_id == run_id,
+                    RunEventRecord.id > after_id,
+                )
+                .order_by(RunEventRecord.id.asc())
+                .limit(limit)
+            )
+            if user_id is not None:
+                q = q.where(RunEventRecord.user_id == user_id)
+            result = await session.execute(q)
+            return list(result.scalars().all())
 
     async def get_semantic_cache(
         self,

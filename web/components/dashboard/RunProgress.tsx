@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { jobs as jobsApi } from "@/lib/api";
+import { jobs as jobsApi, settings as settingsApi } from "@/lib/api";
 import { useRunStream } from "@/lib/sse";
-import type { SavedSearchState } from "@/lib/types";
+import type { BoardCapability, SavedSearchState } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -50,7 +50,10 @@ const AGE_OPTIONS = [
   { value: 336, label: "14 days" },
   { value: 720, label: "30 days" },
 ];
-const ALL_BOARDS = ["linkedin", "indeed", "glassdoor", "ziprecruiter", "dice", "monster"];
+
+function boardLabel(slug: string, capabilities: BoardCapability[]) {
+  return capabilities.find((cap) => cap.slug === slug)?.label ?? slug.charAt(0).toUpperCase() + slug.slice(1);
+}
 
 type LogTone = "success" | "warning" | "error" | "info";
 
@@ -206,18 +209,34 @@ export function RunProgress({ onComplete, savedSearchStateOverride }: Props) {
   const [savedSearchEnabled, setSavedSearchEnabled] = useState(false);
   const [savedSearchIntervalHours, setSavedSearchIntervalHours] = useState<1 | 3>(3);
   const [savedSearchState, setSavedSearchState] = useState<SavedSearchState | null>(null);
+  const [supportedBoards, setSupportedBoards] = useState<string[]>(["linkedin"]);
+  const [boardCapabilities, setBoardCapabilities] = useState<BoardCapability[]>([]);
 
   const { latest, messages, done } = useRunStream(runId);
   const trimmedLocation = location.trim();
+  const productionBoards = boardCapabilities.filter((cap) => cap.production_ready && cap.scrape_supported);
+  const plannedBoards = boardCapabilities.filter((cap) => !cap.production_ready);
 
   useEffect(() => {
-    jobsApi.getSavedSearch()
-      .then((saved) => {
+    Promise.all([
+      jobsApi.getSavedSearch().catch(() => null),
+      settingsApi.get().catch(() => null),
+    ]).then(([saved, settings]) => {
+      if (saved) {
         setSavedSearchState(saved);
         setSavedSearchEnabled(saved.enabled);
         setSavedSearchIntervalHours(saved.interval_hours);
-      })
-      .catch(() => {});
+      }
+      if (settings) {
+        const supported = settings.supported_boards?.length ? settings.supported_boards : ["linkedin"];
+        setSupportedBoards(supported);
+        setBoardCapabilities(settings.board_capabilities ?? []);
+        setBoards((prev) => {
+          const filtered = prev.filter((board) => supported.includes(board));
+          return filtered.length > 0 ? filtered : supported.slice(0, 1);
+        });
+      }
+    });
   }, []);
 
   useEffect(() => {
@@ -242,6 +261,13 @@ export function RunProgress({ onComplete, savedSearchStateOverride }: Props) {
       return () => clearTimeout(t);
     }
   }, [done, onComplete]);
+
+  useEffect(() => {
+    setBoards((prev) => {
+      const filtered = prev.filter((board) => supportedBoards.includes(board));
+      return filtered.length > 0 ? filtered : supportedBoards.slice(0, 1);
+    });
+  }, [supportedBoards]);
 
   function toggle(arr: string[], val: string, set: (v: string[]) => void) {
     set(arr.includes(val) ? arr.filter((x) => x !== val) : [...arr, val]);
@@ -443,16 +469,49 @@ export function RunProgress({ onComplete, savedSearchStateOverride }: Props) {
                   </Label>
                 </div>
 
-                <div>
-                  <Label className="text-xs text-muted-foreground">Job Boards</Label>
-                  <div className="flex gap-1.5 mt-1 flex-wrap">
-                    {ALL_BOARDS.map((b) => (
-                      <ToggleChip key={b} active={boards.includes(b)}
-                        onClick={() => toggle(boards, b, setBoards)}>
-                        {b.charAt(0).toUpperCase() + b.slice(1)}
-                      </ToggleChip>
-                    ))}
+                <div className="space-y-2">
+                  <div>
+                    <Label className="text-xs text-muted-foreground">Production Job Boards</Label>
+                    <div className="flex gap-1.5 mt-1 flex-wrap">
+                      {(productionBoards.length > 0 ? productionBoards : [{
+                        slug: "linkedin",
+                        label: "LinkedIn",
+                        scrape_supported: true,
+                        apply_supported: true,
+                        production_ready: true,
+                        status: "production",
+                      } satisfies BoardCapability]).map((board) => (
+                        <ToggleChip
+                          key={board.slug}
+                          active={boards.includes(board.slug)}
+                          onClick={() => toggle(boards, board.slug, setBoards)}
+                        >
+                          {boardLabel(board.slug, boardCapabilities)}
+                        </ToggleChip>
+                      ))}
+                    </div>
                   </div>
+                  {plannedBoards.length > 0 ? (
+                    <div>
+                      <Label className="text-xs text-muted-foreground">Planned Boards</Label>
+                      <div className="mt-1 flex flex-wrap gap-1.5">
+                        {plannedBoards.map((board) => (
+                          <button
+                            key={board.slug}
+                            type="button"
+                            disabled
+                            className="px-2.5 py-1 rounded-full text-xs font-medium border border-dashed border-gray-300 bg-white text-gray-400 cursor-not-allowed"
+                            title={`${board.label} is ${board.status} and not yet available for live scraping.`}
+                          >
+                            {board.label}
+                          </button>
+                        ))}
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Only production-ready boards can be used in live runs right now.
+                      </p>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             )}

@@ -159,3 +159,41 @@ async def test_rescraped_applied_job_is_not_requeued(tmp_path):
     assert pending == []
 
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_run_events_are_persisted_and_returned_in_order(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    db = Database(f"sqlite+aiosqlite:///{db_path.as_posix()}")
+    await db.init()
+
+    async with db.session_factory() as session:
+        session.add(User(id=1, email="user@example.com", hashed_password="secret"))
+        session.add(ScrapeRun(id="run-events", user_id=1, status="running"))
+        await session.commit()
+
+    await db.append_run_event(
+        "run-events",
+        user_id=1,
+        event_type="status",
+        status="running",
+        message="Run started",
+    )
+    await db.append_run_event(
+        "run-events",
+        user_id=1,
+        event_type="progress",
+        level="info",
+        message="[Search][Criteria] {\"keywords\": [\"ai engineer\"]}",
+        jobs_found=3,
+    )
+
+    events = await db.get_run_events("run-events", user_id=1)
+    incremental = await db.get_run_events("run-events", user_id=1, after_id=events[0].id)
+
+    assert [event.event_type for event in events] == ["status", "progress"]
+    assert events[0].message == "Run started"
+    assert events[1].jobs_found == 3
+    assert [event.id for event in incremental] == [events[1].id]
+
+    await db.close()

@@ -117,6 +117,17 @@ export interface RunJobSummary {
   rejected: number;
 }
 
+export interface RunEvent {
+  id: number;
+  event_type: string;
+  level: string;
+  message?: string | null;
+  status?: string | null;
+  jobs_found?: number | null;
+  jobs_applied?: number | null;
+  created_at: string;
+}
+
 export interface RunJob {
   id: number;
   title: string;
@@ -136,6 +147,16 @@ export interface RunJob {
 
 export interface RunDetail extends Run {
   jobs: RunJob[];
+  events: RunEvent[];
+}
+
+export interface BoardCapability {
+  slug: string;
+  label: string;
+  scrape_supported: boolean;
+  apply_supported: boolean;
+  production_ready: boolean;
+  status: string;
 }
 
 export interface Settings {
@@ -149,6 +170,8 @@ export interface Settings {
   blacklisted_companies: string[];
   request_delay_seconds: number;
   custom_answers: Record<string, string>;
+  supported_boards: string[];
+  board_capabilities: BoardCapability[];
 }
 
 export interface SearchCriteria {

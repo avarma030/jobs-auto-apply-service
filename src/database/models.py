@@ -80,6 +80,28 @@ class ScrapeRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class RunEventRecord(Base):
+    """Append-only event log for a scrape/apply run."""
+
+    __tablename__ = "run_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("scrape_runs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="progress")
+    level: Mapped[str] = mapped_column(String(16), nullable=False, default="info")
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    jobs_found: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    jobs_applied: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class RunJobRecord(Base):
     """Association table recording which jobs were discovered in each run."""
 

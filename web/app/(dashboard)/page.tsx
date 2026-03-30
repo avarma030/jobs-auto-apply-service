@@ -61,6 +61,14 @@ function statusVariant(status: string) {
   }
 }
 
+function eventVariant(level?: string | null, status?: string | null) {
+  if (level === "error" || status === "failed") return "destructive" as const;
+  if (level === "warning" || status === "stopped") return "warning" as const;
+  if (status === "done" || level === "success") return "success" as const;
+  if (status === "running") return "info" as const;
+  return "secondary" as const;
+}
+
 function formatDateTime(value?: string | null) {
   if (!value) return "Not available";
   const dt = new Date(value);
@@ -477,6 +485,49 @@ export default function DashboardPage() {
                 <div className="rounded-lg border p-4 space-y-3">
                   <p className="font-medium text-sm">Job summary</p>
                   <SummaryPills summary={selectedRun.job_summary} />
+                </div>
+
+                <div className="rounded-lg border p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="font-medium text-sm">Run timeline</p>
+                    <Badge variant="secondary">{selectedRun.events.length}</Badge>
+                  </div>
+                  {selectedRun.events.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">
+                      No persisted run events were recorded for this run.
+                    </p>
+                  ) : (
+                    <div className="space-y-3">
+                      {selectedRun.events.map((event) => (
+                        <div key={event.id} className="rounded-lg border p-3">
+                          <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div className="space-y-1">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <Badge variant={eventVariant(event.level, event.status)}>
+                                  {event.event_type}
+                                </Badge>
+                                {event.status ? (
+                                  <Badge variant="outline">{event.status}</Badge>
+                                ) : null}
+                                <span className="text-xs text-muted-foreground">
+                                  {formatDateTime(event.created_at)}
+                                </span>
+                              </div>
+                              <p className="text-sm">
+                                {event.message || "Run event recorded"}
+                              </p>
+                            </div>
+                            {(event.jobs_found != null || event.jobs_applied != null) ? (
+                              <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                                {event.jobs_found != null ? <span>Found: {event.jobs_found}</span> : null}
+                                {event.jobs_applied != null ? <span>Applied: {event.jobs_applied}</span> : null}
+                              </div>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 <div className="rounded-lg border p-4 space-y-3">

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import openpyxl
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,7 +26,9 @@ from src.api.schemas.jobs import (
     SearchCriteria,
     ScrapeRequest,
 )
-from src.database.models import JobRecord, RunJobRecord, ScrapeRun, User, UserSettings
+from src.database.models import JobRecord, RunEventRecord, RunJobRecord, ScrapeRun, User, UserSettings
+from src.services.board_capabilities import normalize_enabled_boards, unsupported_requested_boards
+from src.services.run_dispatcher import dispatch_scrape_run
 from src.services.saved_searches import (
     saved_search_key,
     saved_search_state,
@@ -269,31 +271,50 @@ async def update_job_status(
 @router.post("/scrape", status_code=202)
 async def trigger_scrape(
     body: ScrapeRequest,
-    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
+    unsupported = unsupported_requested_boards(body.boards)
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported boards requested for production execution: "
+                + ", ".join(sorted(unsupported))
+            ),
+        )
+    effective_request = body.model_copy(update={"boards": normalize_enabled_boards(body.boards)})
     started_at = datetime.utcnow()
-    criteria = search_criteria_from_request(body)
+    criteria = search_criteria_from_request(effective_request)
     run = ScrapeRun(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
         status="pending",
-        boards=",".join(body.boards),
-        keywords=",".join(body.keywords),
-        location=body.location,
+        boards=",".join(effective_request.boards),
+        keywords=",".join(effective_request.keywords),
+        location=effective_request.location,
         trigger_type="manual",
         search_criteria_json=serialized_search_criteria(criteria),
-        saved_search_key=saved_search_key(criteria) if body.save_search else None,
+        saved_search_key=saved_search_key(criteria) if effective_request.save_search else None,
         started_at=started_at,
     )
     session.add(run)
-    if body.save_search:
+    session.add(
+        RunEventRecord(
+            run_id=run.id,
+            user_id=current_user.id,
+            event_type="status",
+            level="info",
+            message="Run queued",
+            status="pending",
+        )
+    )
+    if effective_request.save_search:
         row = await _get_or_create_settings(current_user.id, session)
         settings_data = json.loads(row.settings_json or "{}")
         updated_saved_search = update_saved_search_config(
             settings_data.get("saved_search"),
-            body,
+            effective_request,
             run_started_at=started_at.replace(tzinfo=timezone.utc),
             run_id=run.id,
         )
@@ -303,7 +324,7 @@ async def trigger_scrape(
         )
         row.settings_json = json.dumps(settings_data)
     await session.commit()
-    background_tasks.add_task(_run_scrape, run.id, current_user.id, body)
+    await dispatch_scrape_run(run.id, current_user.id, effective_request)
     return {"run_id": run.id}
 
 
@@ -319,7 +340,6 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
     """
     import json as _json
 
-    from src.api.routers.runs import append_run_progress
     from src.config import settings
     from src.database.db import Database
     from src.database.models import UserProfile as UserProfileRecord
@@ -330,13 +350,64 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
     db = Database(settings.database_url)
     await db.init()
 
+    event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+    async def _event_writer() -> None:
+        while True:
+            item = await event_queue.get()
+            try:
+                if item is None:
+                    return
+                await db.append_run_event(run_id, user_id=user_id, **item)
+            finally:
+                event_queue.task_done()
+
+    def _queue_event(
+        *,
+        event_type: str,
+        level: str = "info",
+        message: str | None = None,
+        status: str | None = None,
+        jobs_found: int | None = None,
+        jobs_applied: int | None = None,
+        payload: dict | None = None,
+    ) -> None:
+        event_queue.put_nowait(
+            {
+                "event_type": event_type,
+                "level": level,
+                "message": message,
+                "status": status,
+                "jobs_found": jobs_found,
+                "jobs_applied": jobs_applied,
+                "payload": payload,
+            }
+        )
+
+    def _infer_progress_level(message: str) -> str:
+        lowered = message.lower()
+        if "failed" in lowered or "error" in lowered or "validation" in lowered:
+            return "error"
+        if "warning" in lowered or "skipped" in lowered or "stale" in lowered:
+            return "warning"
+        if "complete" in lowered or "applied" in lowered or "[saved]" in lowered:
+            return "success"
+        return "info"
+
+    writer_task = asyncio.create_task(_event_writer())
+
     async with db.session_factory() as session:
         run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()
         run.status = "running"
         await session.commit()
+    _queue_event(event_type="status", status="running", message="Run started")
 
     def _progress(msg: str) -> None:
-        append_run_progress(run_id, msg)
+        _queue_event(
+            event_type="progress",
+            level=_infer_progress_level(msg),
+            message=msg,
+        )
 
     try:
         # Resolve work modes: prefer work_modes list; fall back to remote_only flag
@@ -419,6 +490,14 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             run.jobs_applied = total_applied
             run.finished_at = datetime.utcnow()
             await session.commit()
+        _queue_event(
+            event_type="status",
+            level="success",
+            message="Run completed",
+            status="done",
+            jobs_found=total_found,
+            jobs_applied=total_applied,
+        )
 
     except Exception as exc:
         async with db.session_factory() as session:
@@ -427,7 +506,16 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             run.error_message = str(exc)
             run.finished_at = datetime.utcnow()
             await session.commit()
+        _queue_event(
+            event_type="status",
+            level="error",
+            message=str(exc),
+            status="failed",
+        )
     finally:
+        await event_queue.join()
+        event_queue.put_nowait(None)
+        await writer_task
         await db.close()
 
 

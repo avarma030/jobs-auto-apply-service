@@ -10,7 +10,7 @@ from loguru import logger
 from sqlalchemy import select
 
 from src.database.db import Database
-from src.database.models import ScrapeRun, UserSettings
+from src.database.models import RunEventRecord, ScrapeRun, UserSettings
 from src.services.saved_searches import (
     load_saved_search_config,
     saved_search_is_due,
@@ -82,6 +82,16 @@ class SavedSearchScheduler:
                     started_at=now.replace(tzinfo=None),
                 )
                 session.add(run)
+                session.add(
+                    RunEventRecord(
+                        run_id=run.id,
+                        user_id=row.user_id,
+                        event_type="status",
+                        level="info",
+                        message="Run queued by saved search scheduler",
+                        status="pending",
+                    )
+                )
 
                 settings_data = json.loads(row.settings_json or "{}")
                 saved_search = settings_data.get("saved_search") or {}

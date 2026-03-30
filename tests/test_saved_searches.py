@@ -14,7 +14,7 @@ from src.api.schemas.jobs import (
     SearchCriteria,
 )
 from src.database.db import Database
-from src.database.models import ScrapeRun, User, UserSettings
+from src.database.models import RunEventRecord, ScrapeRun, User, UserSettings
 from src.services.saved_search_scheduler import SavedSearchScheduler
 from src.services.saved_searches import (
     saved_search_state,
@@ -239,6 +239,11 @@ async def test_saved_search_scheduler_triggers_due_search(tmp_path):
         ).scalar_one()
         saved = json.loads(settings_row.settings_json)["saved_search"]
         assert saved["last_run_id"] == runs[0].id
+        run_events = list((await session.execute(select(RunEventRecord))).scalars().all())
+        assert len(run_events) == 1
+        assert run_events[0].run_id == runs[0].id
+        assert run_events[0].status == "pending"
+        assert run_events[0].message == "Run queued by saved search scheduler"
 
     await db.close()
 

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { settings as settingsApi, profile as profileApi } from "@/lib/api";
-import type { Settings } from "@/lib/types";
+import type { BoardCapability, Settings } from "@/lib/types";
 import { TopBar } from "@/components/layout/TopBar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,7 +11,6 @@ import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Save, Plus, Trash2 } from "lucide-react";
 
-const ALL_BOARDS = ["linkedin", "indeed", "glassdoor", "ziprecruiter", "dice", "monster", "lever", "greenhouse", "workday"];
 const WORK_MODES = ["remote", "hybrid", "onsite"];
 
 const EMPTY: Settings = {
@@ -25,6 +24,8 @@ const EMPTY: Settings = {
   blacklisted_companies: [],
   request_delay_seconds: 2.0,
   custom_answers: {},
+  supported_boards: ["linkedin"],
+  board_capabilities: [],
 };
 
 export default function SettingsPage() {
@@ -35,6 +36,8 @@ export default function SettingsPage() {
   const [saved, setSaved] = useState(false);
   const [newAnswer, setNewAnswer] = useState({ q: "", a: "" });
   const [newBlacklist, setNewBlacklist] = useState("");
+  const productionBoards = s.board_capabilities.filter((board) => board.production_ready && board.scrape_supported);
+  const plannedBoards = s.board_capabilities.filter((board) => !board.production_ready);
 
   useEffect(() => {
     settingsApi.get().then(setS).catch(() => {});
@@ -67,6 +70,7 @@ export default function SettingsPage() {
   }
 
   function toggleBoard(board: string) {
+    if (!s.supported_boards.includes(board)) return;
     setS((prev) => ({
       ...prev,
       enabled_boards: prev.enabled_boards.includes(board)
@@ -162,20 +166,45 @@ export default function SettingsPage() {
           </CardHeader>
           <CardContent>
             <div className="flex flex-wrap gap-2">
-              {ALL_BOARDS.map((b) => (
+              {(productionBoards.length > 0 ? productionBoards : [{
+                slug: "linkedin",
+                label: "LinkedIn",
+                scrape_supported: true,
+                apply_supported: true,
+                production_ready: true,
+                status: "production",
+              } satisfies BoardCapability]).map((board) => (
                 <button
-                  key={b}
-                  onClick={() => toggleBoard(b)}
+                  key={board.slug}
+                  onClick={() => toggleBoard(board.slug)}
                   className={`px-3 py-1.5 rounded-full text-sm font-medium border capitalize transition-colors ${
-                    s.enabled_boards.includes(b)
+                    s.enabled_boards.includes(board.slug)
                       ? "bg-blue-600 text-white border-blue-600"
                       : "border-gray-300 text-gray-600 hover:border-blue-400"
                   }`}
                 >
-                  {b}
+                  {board.label}
                 </button>
               ))}
             </div>
+            {plannedBoards.length > 0 ? (
+              <div className="mt-4">
+                <Label className="text-xs text-muted-foreground">Planned boards</Label>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {plannedBoards.map((board) => (
+                    <button
+                      key={board.slug}
+                      type="button"
+                      disabled
+                      className="px-3 py-1.5 rounded-full text-sm font-medium border border-dashed border-gray-300 text-gray-400 bg-white cursor-not-allowed"
+                      title={`${board.label} is ${board.status} and not yet available for live runs.`}
+                    >
+                      {board.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
           </CardContent>
         </Card>
 
