@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { profile as profileApi } from "@/lib/api";
-import type { Profile } from "@/lib/types";
+import type { BoardAccountState, Profile } from "@/lib/types";
 import { TopBar } from "@/components/layout/TopBar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -15,6 +15,7 @@ type ExtractionToast = { type: "success" | "error"; message: string } | null;
 
 export default function ProfilePage() {
   const [profile, setProfile] = useState<Profile>({});
+  const [boardAccountStates, setBoardAccountStates] = useState<BoardAccountState[]>([]);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -22,7 +23,13 @@ export default function ProfilePage() {
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    profileApi.get().then((r) => setProfile(r.profile)).catch(() => {});
+    profileApi
+      .get()
+      .then((r) => {
+        setProfile(toEditableProfile(r.profile));
+        setBoardAccountStates(r.board_account_states ?? []);
+      })
+      .catch(() => {});
   }, []);
 
   function set<K extends keyof Profile>(key: K, value: Profile[K]) {
@@ -32,7 +39,9 @@ export default function ProfilePage() {
   async function save() {
     setSaving(true);
     try {
-      await profileApi.update(profile);
+      const response = await profileApi.update(profile);
+      setProfile(toEditableProfile(response.profile));
+      setBoardAccountStates(response.board_account_states ?? []);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } finally {
@@ -49,13 +58,13 @@ export default function ProfilePage() {
       const res = await profileApi.uploadResume(file);
       // If the server auto-extracted a profile, pre-fill the form fields
       if (res.extracted_profile && res.profile_updated) {
-        setProfile(res.extracted_profile as Profile);
+        setProfile(toEditableProfile(res.extracted_profile as Profile));
         setExtractionToast({
           type: "success",
           message: `Profile auto-filled from resume — please review and click Save.`,
         });
       } else {
-        set("resume_path" as any, `data/uploads/${file.name}`);
+        set("resume_path" as any, res.resume_path);
         if (res.extracted_profile === null || res.extracted_profile === undefined) {
           const msg = res.ai_extraction_enabled
             ? res.extraction_error
@@ -75,6 +84,7 @@ export default function ProfilePage() {
   const skills = profile.skills ?? [];
   const experience = profile.work_experience ?? [];
   const education = profile.education ?? [];
+  const linkedinState = boardAccountStates.find((state) => state.board === "linkedin");
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -213,7 +223,7 @@ export default function ProfilePage() {
           <CardHeader>
             <CardTitle className="text-base">Job Board Credentials</CardTitle>
             <p className="text-xs text-muted-foreground mt-1">
-              Used to log in and apply to jobs on your behalf. Stored securely in your profile.
+              Used to log in and apply to jobs on your behalf. Secrets are stored securely for your account and never sent back to the browser after save.
             </p>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -241,14 +251,50 @@ export default function ProfilePage() {
                 />
               </div>
               <p className="text-xs text-muted-foreground mt-1">
-                Enables authenticated scraping (bypasses CAPTCHA) and Easy Apply.
+                Leave password blank to keep the currently stored secret unchanged.
               </p>
+              {linkedinState && (
+                <div className="mt-3 rounded-lg border bg-slate-50 px-3 py-3 text-sm text-slate-700">
+                  <p className="font-medium text-slate-900">LinkedIn session status</p>
+                  <p className="mt-1">Username: {linkedinState.username ?? "Not configured"}</p>
+                  <p>Auth state: {formatAuthState(linkedinState.auth_state)}</p>
+                  {linkedinState.challenge_kind && (
+                    <p>Challenge: {formatAuthState(linkedinState.challenge_kind)}</p>
+                  )}
+                  {linkedinState.last_validated_at && (
+                    <p>Last validated: {formatTimestamp(linkedinState.last_validated_at)}</p>
+                  )}
+                  {linkedinState.last_success_at && (
+                    <p>Last successful use: {formatTimestamp(linkedinState.last_success_at)}</p>
+                  )}
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>
       </div>
     </div>
   );
+}
+
+function toEditableProfile(profile: Profile): Profile {
+  const jobBoardAccounts = { ...(profile.job_board_accounts ?? {}) };
+  if (jobBoardAccounts.linkedin) {
+    jobBoardAccounts.linkedin = { ...jobBoardAccounts.linkedin, password: "" };
+  }
+  return { ...profile, job_board_accounts: jobBoardAccounts };
+}
+
+function formatAuthState(value: string): string {
+  return value
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function formatTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString();
 }
 
 function Field({

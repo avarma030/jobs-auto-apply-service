@@ -189,7 +189,7 @@ async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disable
 async def test_run_full_pipeline_uses_requested_max_jobs_for_current_run_apply_limit(monkeypatch):
     records = [make_job_record(job_id=i) for i in range(1, 5)]
     db = FakeDb(records)
-    orch = Orchestrator(profile=make_profile(), db=db)
+    orch = Orchestrator(profile=make_profile(), db=db, runtime_scope="cli")
     applier = StubApplier()
 
     orch.run_scrape = AsyncMock(return_value=4)
@@ -220,7 +220,7 @@ async def test_run_full_pipeline_uses_requested_max_jobs_for_current_run_apply_l
 async def test_run_full_pipeline_scores_all_jobs_found_when_max_jobs_not_specified(monkeypatch):
     records = [make_job_record(job_id=i) for i in range(1, 25)]
     db = FakeDb(records)
-    orch = Orchestrator(profile=make_profile(), db=db)
+    orch = Orchestrator(profile=make_profile(), db=db, runtime_scope="cli")
     progress_messages: list[str] = []
 
     orch.run_scrape = AsyncMock(return_value=24)
@@ -334,7 +334,7 @@ class LearningApplier:
 async def test_run_apply_persists_learned_answers_from_applier(monkeypatch):
     record = make_job_record()
     db = FakeDb([record])
-    orch = Orchestrator(profile=make_profile(), db=db)
+    orch = Orchestrator(profile=make_profile(), db=db, runtime_scope="cli")
     applier = LearningApplier()
     progress_messages: list[str] = []
 
@@ -419,7 +419,7 @@ async def test_run_apply_halts_remaining_linkedin_jobs_after_auth_failure(monkey
 @pytest.mark.asyncio
 async def test_handle_new_questions_preserves_prompt_metadata_and_normalizes_keys(monkeypatch):
     db = FakeDb([])
-    orch = Orchestrator(profile=make_profile(), db=db)
+    orch = Orchestrator(profile=make_profile(), db=db, runtime_scope="cli")
 
     monkeypatch.setattr(orch, "_get_ai_client", lambda: object())
 

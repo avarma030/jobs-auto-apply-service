@@ -54,11 +54,13 @@ from src.services.application_questions import (
 )
 from src.services.linkedin_state import (
     detect_linkedin_auth_challenge,
+    linkedin_account_key,
     legacy_linkedin_cookie_path,
     linkedin_cookie_path,
     linkedin_session_dir,
     mask_linkedin_username,
 )
+from src.services.user_runtime import upsert_board_session_state
 from src.utils.browser import BrowserManager, BrowserManager as _BM
 
 # â”€â”€ Cookie / session paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -184,8 +186,22 @@ class LinkedInApplier(BaseApplier):
     board_name = "LinkedIn"
     board_slug = "linkedin"
 
-    def __init__(self, profile: UserProfile):
-        super().__init__(profile)
+    def __init__(
+        self,
+        profile: UserProfile,
+        *,
+        credentials: dict | None = None,
+        db=None,
+        user_id: int | None = None,
+        runtime_scope: str = "web",
+    ):
+        super().__init__(
+            profile,
+            credentials=credentials,
+            db=db,
+            user_id=user_id,
+            runtime_scope=runtime_scope,
+        )
         self._bm: BrowserManager | None = None
         self._page: Page | None = None
         self._logged_in = False
@@ -202,11 +218,20 @@ class LinkedInApplier(BaseApplier):
         self._auth_error: str | None = None
 
     def _resolve_linkedin_credentials(self) -> tuple[str, str, str]:
-        creds = self.profile.job_board_accounts.linkedin
-        username = (creds.username or "").strip() if creds else ""
-        password = (creds.password or "").strip() if creds else ""
+        runtime_scope = getattr(self, "runtime_scope", "web")
+        credential_map = getattr(self, "credentials", {}) or {}
+        username = str(credential_map.get("username") or "").strip()
+        password = str(credential_map.get("password") or "").strip()
+        if not username or not password:
+            creds = self.profile.job_board_accounts.linkedin
+            username = username or ((creds.username or "").strip() if creds else "")
+            password = password or ((creds.password or "").strip() if creds else "")
         source = "profile"
-        if (not username or not password) and settings.linkedin_email:
+        if (
+            runtime_scope == "cli"
+            and (not username or not password)
+            and settings.linkedin_email
+        ):
             username = settings.linkedin_email.strip()
             password = (settings.linkedin_password or "").strip()
             source = "environment"
@@ -217,12 +242,64 @@ class LinkedInApplier(BaseApplier):
         identity = username or (self.profile.email or "").strip()
         if not identity:
             identity = "default"
+        previous_identity = getattr(self, "_linkedin_identity", None)
         self._linkedin_username = username
         self._linkedin_password = password
         self._linkedin_identity = identity
         self._linkedin_credential_source = source
-        self._cookie_path = linkedin_cookie_path(identity)
-        self._session_dir = linkedin_session_dir(identity, "applier")
+        if previous_identity != identity or not hasattr(self, "_cookie_path"):
+            self._cookie_path = linkedin_cookie_path(identity)
+        if previous_identity != identity or not hasattr(self, "_session_dir"):
+            self._session_dir = linkedin_session_dir(identity, "applier")
+
+    @staticmethod
+    def _classify_auth_state(message: str | None) -> tuple[str, str | None]:
+        lowered = (message or "").lower()
+        if "2-factor" in lowered or "two-factor" in lowered or "mobile device" in lowered:
+            return "2fa_required", "2fa_required"
+        if "captcha" in lowered:
+            return "checkpoint", "checkpoint_or_captcha"
+        if "checkpoint" in lowered or "security" in lowered:
+            return "checkpoint", "checkpoint_or_captcha"
+        if "stale" in lowered or "expired" in lowered or "redirected to login" in lowered:
+            return "expired", None
+        return "expired", None
+
+    async def _record_session_state(
+        self,
+        *,
+        auth_state: str,
+        challenge_kind: str | None = None,
+        last_error: str | None = None,
+        validated: bool = False,
+        success: bool = False,
+    ) -> None:
+        db = getattr(self, "db", None)
+        user_id = getattr(self, "user_id", None)
+        if db is None or user_id is None:
+            return
+        self._ensure_linkedin_state()
+        now = time.time()
+        from datetime import datetime
+
+        timestamp = datetime.utcfromtimestamp(now)
+        async with db.session_factory() as session:
+            await upsert_board_session_state(
+                session,
+                user_id=user_id,
+                board=self.board_slug,
+                account_key=linkedin_account_key(self._linkedin_identity),
+                session_kind="applier",
+                account_username=self._linkedin_username or self._linkedin_identity,
+                cookie_path=str(self._cookie_path),
+                session_path=str(self._session_dir),
+                auth_state=auth_state,
+                challenge_kind=challenge_kind,
+                last_validated_at=timestamp if validated else None,
+                last_success_at=timestamp if success else None,
+                last_error=last_error,
+            )
+            await session.commit()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -637,7 +714,26 @@ class LinkedInApplier(BaseApplier):
                 age = time.time() - data.get("saved_at", 0)
                 cookies = data.get("cookies", {})
                 cookie_owner = str(data.get("username") or "").strip().lower()
-                if expected_owner:
+                if source == "legacy":
+                    expected = str(expected_owner or "").strip().lower()
+                    if not expected:
+                        logger.info(
+                            "[LinkedIn] Ignoring legacy cookie file because the active "
+                            "LinkedIn account could not be attributed safely"
+                        )
+                        continue
+                    if not cookie_owner:
+                        logger.info(
+                            "[LinkedIn] Ignoring legacy cookie file without LinkedIn account metadata"
+                        )
+                        continue
+                    if cookie_owner != expected:
+                        logger.info(
+                            "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
+                            f"{mask_linkedin_username(cookie_owner)}"
+                        )
+                        continue
+                elif expected_owner:
                     expected = expected_owner.strip().lower()
                     if not cookie_owner:
                         logger.info(
@@ -658,8 +754,16 @@ class LinkedInApplier(BaseApplier):
                         f"[LinkedIn][Auth] Scraper cookies are {age / 3600:.1f}h old - attempting reuse"
                     )
                 if source == "legacy":
+                    try:
+                        self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
+                        self._cookie_path.write_text(json.dumps(data))
+                    except Exception as exc:
+                        logger.warning(
+                            f"[LinkedIn] Could not import legacy cookies into scoped state: {exc}"
+                        )
                     self._report_progress(
-                        "[LinkedIn][Auth] Falling back to legacy LinkedIn cookies for the same account"
+                        "[LinkedIn][Auth] Falling back to legacy LinkedIn cookies for the same "
+                        "account (imported into scoped state)"
                     )
                 # Convert flat dict â†’ Playwright cookie objects
                 pw_cookies = [
@@ -747,6 +851,11 @@ class LinkedInApplier(BaseApplier):
             self._report_progress("[LinkedIn][Auth] Session active")
             logger.info("[LinkedIn] Session active â€” already logged in âœ“")
             self._logged_in = True
+            await self._record_session_state(
+                auth_state="authenticated",
+                validated=True,
+                success=True,
+            )
             return True
             return
 
@@ -754,8 +863,11 @@ class LinkedInApplier(BaseApplier):
         if not username or not password:
             logger.warning(
                 "[LinkedIn] No credentials available. "
-                "Set LINKEDIN_EMAIL + LINKEDIN_PASSWORD env vars, "
-                "or enter them in the Profile â†’ Job Board Credentials section."
+                "Enter them in the Profile â†’ Job Board Credentials section."
+            )
+            await self._record_session_state(
+                auth_state="expired",
+                last_error="No LinkedIn credentials are configured for the active profile.",
             )
             return self._set_auth_error(
                 "No LinkedIn credentials are configured for the active profile."
@@ -780,6 +892,11 @@ class LinkedInApplier(BaseApplier):
                 self._report_progress("[LinkedIn][Auth] Persistent profile session detected")
                 logger.info("[LinkedIn] Persistent profile session detected â€” already logged in âœ“")
                 self._logged_in = True
+                await self._record_session_state(
+                    auth_state="authenticated",
+                    validated=True,
+                    success=True,
+                )
                 return
 
         # Wait for the standard email input with a short timeout so we detect
@@ -798,6 +915,11 @@ class LinkedInApplier(BaseApplier):
             if await self._is_logged_in(page):
                 logger.info("[LinkedIn] Already logged in (persistent profile active) âœ“")
                 self._logged_in = True
+                await self._record_session_state(
+                    auth_state="authenticated",
+                    validated=True,
+                    success=True,
+                )
                 return
             challenge = await detect_linkedin_auth_challenge(page)
             if challenge:
@@ -808,6 +930,11 @@ class LinkedInApplier(BaseApplier):
                 )
                 await self._bm.screenshot(page, screenshot_name)
                 self._set_auth_error(challenge.message)
+                await self._record_session_state(
+                    auth_state="2fa_required" if challenge.kind == "2fa_required" else "checkpoint",
+                    challenge_kind=challenge.kind,
+                    last_error=challenge.message,
+                )
                 self._report_progress(f"[LinkedIn][Auth] {challenge.message}", level="warning")
                 logger.error(
                     f"[LinkedIn] {challenge.message} Current URL: {page.url}. "
@@ -816,6 +943,10 @@ class LinkedInApplier(BaseApplier):
                 return
             await self._bm.screenshot(page, "linkedin_login_no_form")
             self._set_auth_error(f"LinkedIn login form was not visible at {page.url}.")
+            await self._record_session_state(
+                auth_state="expired",
+                last_error=f"LinkedIn login form was not visible at {page.url}.",
+            )
             logger.error(
                 f"[LinkedIn] Login form not visible at {page.url} â€” cannot authenticate. "
                 "Try running with HEADLESS_BROWSER=false to diagnose."
@@ -860,6 +991,11 @@ class LinkedInApplier(BaseApplier):
             )
             await self._bm.screenshot(page, screenshot_name)
             self._set_auth_error(challenge.message)
+            await self._record_session_state(
+                auth_state="2fa_required" if challenge.kind == "2fa_required" else "checkpoint",
+                challenge_kind=challenge.kind,
+                last_error=challenge.message,
+            )
             self._report_progress(f"[LinkedIn][Auth] {challenge.message}", level="warning")
             logger.warning(
                 f"[LinkedIn] {challenge.message} Current URL: {current_url}. "
@@ -881,23 +1017,37 @@ class LinkedInApplier(BaseApplier):
                 }
                 self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
                 self._cookie_path.write_text(json.dumps(payload))
-                if fresh.get("li_at"):
+                if getattr(self, "runtime_scope", "web") == "cli" and fresh.get("li_at"):
                     legacy_path = legacy_linkedin_cookie_path()
                     legacy_path.parent.mkdir(parents=True, exist_ok=True)
                     legacy_path.write_text(json.dumps(payload))
                 logger.info("[LinkedIn] Fresh session cookies saved to disk")
             except Exception as exc:
                 logger.warning(f"[LinkedIn] Could not save cookies: {exc}")
+            await self._record_session_state(
+                auth_state="authenticated",
+                validated=True,
+                success=True,
+            )
         else:
             await self._bm.screenshot(page, "linkedin_login_failed")
             challenge = await detect_linkedin_auth_challenge(page)
             if challenge:
                 self._set_auth_error(challenge.message)
+                await self._record_session_state(
+                    auth_state="2fa_required" if challenge.kind == "2fa_required" else "checkpoint",
+                    challenge_kind=challenge.kind,
+                    last_error=challenge.message,
+                )
                 self._report_progress(f"[LinkedIn][Auth] {challenge.message}", level="warning")
                 logger.warning(f"[LinkedIn] Login failed due to auth challenge: {challenge.message}")
                 return
             self._set_auth_error(
                 f"LinkedIn login did not complete successfully (current URL: {current_url})."
+            )
+            await self._record_session_state(
+                auth_state="expired",
+                last_error=f"LinkedIn login did not complete successfully (current URL: {current_url}).",
             )
             logger.warning(
                 f"[LinkedIn] Login may have failed — currently at: {current_url} "
@@ -2320,7 +2470,7 @@ class LinkedInApplier(BaseApplier):
             resume_path = None
             if self.profile.resume_path:
                 resume_path = Path(self.profile.resume_path)
-            elif settings.resume_path:
+            elif getattr(self, "runtime_scope", "web") == "cli" and settings.resume_path:
                 resume_path = Path(settings.resume_path)
 
         if not resume_path or not resume_path.exists():

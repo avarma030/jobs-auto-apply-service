@@ -32,6 +32,7 @@ from src.scrapers.ziprecruiter import ZipRecruiterScraper
 from src.services import ai_matcher, cover_letter as cover_letter_svc, pdf_builder, profile_extractor, resume_parser, resume_tailor
 from src.services.application_questions import normalize_question_text
 from src.services.job_classifier import detect_ats
+from src.services.runtime_state import user_resume_path, user_tailored_dir
 from src.utils.profile_loader import save_profile
 
 SCRAPER_REGISTRY: dict[str, Type[BaseScraper]] = {
@@ -54,16 +55,19 @@ APPLIER_REGISTRY: list[Type[BaseApplier]] = [
     GenericApplier,  # fallback — must be last
 ]
 
-# Where tailored assets are stored: data/uploads/{user_id}/tailored/{job_id}/
-_UPLOAD_BASE = Path("data/uploads")
-
-
 class Orchestrator:
     """Coordinates scraping and applying across all enabled job boards."""
 
-    def __init__(self, profile: UserProfile, db: Database):
+    def __init__(
+        self,
+        profile: UserProfile,
+        db: Database,
+        *,
+        runtime_scope: str = "web",
+    ):
         self.profile = profile
         self.db = db
+        self.runtime_scope = runtime_scope
         self._ai_client: anthropic.AsyncAnthropic | None = None
 
     @staticmethod
@@ -330,12 +334,16 @@ class Orchestrator:
 
         # Parse resume once — try per-user path first, then global fallback
         resume_text = ""
-        resume_path = settings.resume_path
-        if user_id is not None:
-            user_resume = Path("data/uploads") / str(user_id) / "resume.pdf"
-            if user_resume.exists():
-                resume_path = user_resume
-        if resume_path.exists():
+        resume_path: Path | None = None
+        if self.profile.resume_path:
+            resume_path = Path(self.profile.resume_path)
+        elif user_id is not None:
+            candidate_resume = user_resume_path(user_id)
+            if candidate_resume.exists():
+                resume_path = candidate_resume
+        elif self.runtime_scope == "cli" and settings.resume_path:
+            resume_path = Path(settings.resume_path)
+        if resume_path and resume_path.exists():
             try:
                 resume_text = resume_parser.parse_resume(resume_path)
                 _emit(f"📄 Resume parsed ({len(resume_text):,} chars)")
@@ -433,7 +441,7 @@ class Orchestrator:
 
         for idx, (record, job) in enumerate(qualified, 1):
             uid = user_id or 0
-            job_dir = _UPLOAD_BASE / str(uid) / "tailored" / str(record.id)
+            job_dir = user_tailored_dir(uid, record.id)
 
             tailored_resume_path: str | None = None
             cl_text: str | None = None
@@ -589,6 +597,12 @@ class Orchestrator:
         user_id: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> None:
+        if hasattr(applier, "db"):
+            applier.db = self.db
+        if hasattr(applier, "user_id"):
+            applier.user_id = user_id
+        if hasattr(applier, "runtime_scope"):
+            applier.runtime_scope = self.runtime_scope
         applier.progress_callback = progress_callback
         applier.answer_resolver = self._build_answer_resolver(
             user_id=user_id,
@@ -669,10 +683,11 @@ class Orchestrator:
             f"Learned {len(changed_answers)} new Q&A pairs: {list(changed_answers.keys())}"
         )
 
-        try:
-            save_profile(self.profile, settings.user_profile_path)
-        except Exception as exc:
-            logger.warning(f"Could not save profile to file: {exc}")
+        if self.runtime_scope == "cli":
+            try:
+                save_profile(self.profile, settings.user_profile_path)
+            except Exception as exc:
+                logger.warning(f"Could not save profile to file: {exc}")
 
         if user_id is not None:
             try:
@@ -722,7 +737,16 @@ class Orchestrator:
         creds = self._get_creds(board)
         count = 0
         try:
-            async with scraper_cls(credentials=creds) as scraper:
+            try:
+                scraper = scraper_cls(
+                    credentials=creds,
+                    db=self.db,
+                    user_id=user_id,
+                    runtime_scope=self.runtime_scope,
+                )
+            except TypeError:
+                scraper = scraper_cls(credentials=creds)
+            async with scraper as scraper:
                 async for job in scraper.search(search_filter):
                     # Fetch full details (description, salary, skills) while
                     # the scraper session is still warm and has active cookies
@@ -778,11 +802,22 @@ class Orchestrator:
         return count
 
     def _pick_applier(self, job: Job) -> BaseApplier:
+        credentials = self._get_creds(job.source_board)
         for cls in APPLIER_REGISTRY:
-            instance = cls(profile=self.profile)
+            instance = cls(
+                profile=self.profile,
+                credentials=credentials,
+                db=self.db,
+                runtime_scope=self.runtime_scope,
+            )
             if instance.can_apply(job):
                 return instance
-        return GenericApplier(profile=self.profile)
+        return GenericApplier(
+            profile=self.profile,
+            credentials=credentials,
+            db=self.db,
+            runtime_scope=self.runtime_scope,
+        )
 
     @staticmethod
     def _should_halt_board_after_failure(board: str, message: str | None) -> bool:

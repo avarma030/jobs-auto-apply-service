@@ -3,10 +3,14 @@ from __future__ import annotations
 import abc
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from loguru import logger
 
 from src.models import ApplicationStatus, Job, UserProfile
+
+if TYPE_CHECKING:
+    from src.database import Database
 
 
 @dataclass
@@ -65,8 +69,20 @@ class BaseApplier(abc.ABC):
     board_name: str = ""
     board_slug: str = ""
 
-    def __init__(self, profile: UserProfile):
+    def __init__(
+        self,
+        profile: UserProfile,
+        *,
+        credentials: dict | None = None,
+        db: "Database" | None = None,
+        user_id: int | None = None,
+        runtime_scope: str = "web",
+    ):
         self.profile = profile
+        self.credentials = credentials or {}
+        self.db = db
+        self.user_id = user_id
+        self.runtime_scope = runtime_scope
         self.progress_callback: Callable[[str], None] | None = None
         self.answer_resolver: Callable[
             [list[ApplicationQuestionPrompt]],

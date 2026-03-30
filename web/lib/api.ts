@@ -5,6 +5,7 @@ import type {
   Job,
   JobsPage,
   Profile,
+  ProfileResponse,
   RunDetail,
   Run,
   SavedSearchState,
@@ -124,9 +125,9 @@ export const applications = {
 
 // Profile
 export const profile = {
-  get: () => request<{ profile: Profile }>("/profile"),
+  get: () => request<ProfileResponse>("/profile"),
   update: (data: Profile) =>
-    request<{ profile: Profile }>("/profile", { method: "PUT", body: JSON.stringify({ profile: data }) }),
+    request<ProfileResponse>("/profile", { method: "PUT", body: JSON.stringify({ profile: data }) }),
   uploadResume: (file: File): Promise<{
     resume_path: string;
     filename: string;

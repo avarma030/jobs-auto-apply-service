@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     # Database
     # ------------------------------------------------------------------
     database_url: str = "sqlite+aiosqlite:///./data/jobs.db"
+    data_encryption_key: str | None = None
 
     # ------------------------------------------------------------------
     # User profile

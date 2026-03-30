@@ -50,11 +50,13 @@ from src.scrapers.base import BaseScraper
 from src.services.linkedin_state import (
     detect_linkedin_auth_challenge,
     legacy_linkedin_cookie_path,
+    linkedin_account_key,
     linkedin_cookie_path,
     linkedin_session_dir,
     linkedin_two_factor_auth_guidance,
     mask_linkedin_username,
 )
+from src.services.user_runtime import upsert_board_session_state
 from src.utils.browser import BrowserManager
 
 # â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -221,26 +223,40 @@ class LinkedInScraper(BaseScraper):
         self._detail_api_authwall_backoff_until = 0.0
         self._ensure_linkedin_state()
 
-        # Load cached cookies â€” warm a fresh session if missing / stale
-        cached = self._load_cookies()
-        if cached:
-            logger.info(
-                f"[LinkedIn] Loaded {len(cached)} cached cookies from disk "
-                f"(authenticated={self._has_authenticated_cookie(cached)})"
-            )
-            self._cookies = cached
-        else:
-            self._cookies = await self._warm_session()
-            if self._cookies:
-                self._save_cookies(self._cookies)
+        try:
+            # Load cached cookies â€” warm a fresh session if missing / stale
+            cached = self._load_cookies()
+            if cached:
+                logger.info(
+                    f"[LinkedIn] Loaded {len(cached)} cached cookies from disk "
+                    f"(authenticated={self._has_authenticated_cookie(cached)})"
+                )
+                self._cookies = cached
+            else:
+                self._cookies = await self._warm_session()
+                if self._cookies:
+                    self._save_cookies(self._cookies)
 
-        if not self.has_authenticated_session():
-            raise RuntimeError(
-                "LinkedIn authentication unavailable: an authenticated LinkedIn session "
-                "is required for deterministic scraping and Easy Apply verification."
+            if not self.has_authenticated_session():
+                raise RuntimeError(
+                    "LinkedIn authentication unavailable: an authenticated LinkedIn session "
+                    "is required for deterministic scraping and Easy Apply verification."
+                )
+        except Exception as exc:
+            auth_state, challenge_kind = self._classify_auth_state(str(exc))
+            await self._record_session_state(
+                auth_state=auth_state,
+                challenge_kind=challenge_kind,
+                last_error=str(exc),
             )
+            raise
 
         self._client = self._make_client()
+        await self._record_session_state(
+            auth_state="authenticated",
+            validated=True,
+            success=True,
+        )
 
     def _make_client(self, proxy: str | None = None) -> AsyncSession:
         """Build a curl-cffi session that impersonates Chrome's TLS fingerprint.
@@ -266,10 +282,16 @@ class LinkedInScraper(BaseScraper):
         )
 
     def _resolve_linkedin_credentials(self) -> tuple[str, str, str]:
-        username = str(self.credentials.get("username") or "").strip()
-        password = str(self.credentials.get("password") or "").strip()
+        runtime_scope = getattr(self, "runtime_scope", "web")
+        credential_map = getattr(self, "credentials", {}) or {}
+        username = str(credential_map.get("username") or "").strip()
+        password = str(credential_map.get("password") or "").strip()
         source = "profile"
-        if (not username or not password) and settings.linkedin_email:
+        if (
+            runtime_scope == "cli"
+            and (not username or not password)
+            and settings.linkedin_email
+        ):
             username = settings.linkedin_email.strip()
             password = (settings.linkedin_password or "").strip()
             source = "environment"
@@ -278,13 +300,65 @@ class LinkedInScraper(BaseScraper):
     def _ensure_linkedin_state(self) -> None:
         username, password, source = self._resolve_linkedin_credentials()
         identity = username or "default"
+        previous_identity = getattr(self, "_linkedin_identity", None)
         self._linkedin_username = username
         self._linkedin_password = password
         self._linkedin_identity = identity
         self._linkedin_credential_source = source
-        self._cookie_path = linkedin_cookie_path(identity)
-        self._session_dir = linkedin_session_dir(identity, "scraper")
-        self._detail_session_dir = linkedin_session_dir(identity, "detail")
+        if previous_identity != identity or not hasattr(self, "_cookie_path"):
+            self._cookie_path = linkedin_cookie_path(identity)
+        if previous_identity != identity or not hasattr(self, "_session_dir"):
+            self._session_dir = linkedin_session_dir(identity, "scraper")
+        if previous_identity != identity or not hasattr(self, "_detail_session_dir"):
+            self._detail_session_dir = linkedin_session_dir(identity, "detail")
+
+    @staticmethod
+    def _classify_auth_state(message: str | None) -> tuple[str, str | None]:
+        lowered = (message or "").lower()
+        if "2-factor" in lowered or "two-factor" in lowered or "mobile device" in lowered:
+            return "2fa_required", "2fa_required"
+        if "captcha" in lowered:
+            return "checkpoint", "checkpoint_or_captcha"
+        if "checkpoint" in lowered or "security" in lowered:
+            return "checkpoint", "checkpoint_or_captcha"
+        if "rate limit" in lowered or "blocked" in lowered or "auth-wall" in lowered:
+            return "rate_limited", None
+        return "expired", None
+
+    async def _record_session_state(
+        self,
+        *,
+        auth_state: str,
+        challenge_kind: str | None = None,
+        last_error: str | None = None,
+        validated: bool = False,
+        success: bool = False,
+        session_kind: str = "scraper",
+    ) -> None:
+        db = getattr(self, "db", None)
+        user_id = getattr(self, "user_id", None)
+        if db is None or user_id is None:
+            return
+        self._ensure_linkedin_state()
+        now = datetime.utcnow()
+        session_path = self._session_dir if session_kind == "scraper" else self._detail_session_dir
+        async with db.session_factory() as session:
+            await upsert_board_session_state(
+                session,
+                user_id=user_id,
+                board=self.board_slug,
+                account_key=linkedin_account_key(self._linkedin_identity),
+                session_kind=session_kind,
+                account_username=self._linkedin_username or self._linkedin_identity,
+                cookie_path=str(self._cookie_path),
+                session_path=str(session_path),
+                auth_state=auth_state,
+                challenge_kind=challenge_kind,
+                last_validated_at=now if validated else None,
+                last_success_at=now if success else None,
+                last_error=last_error,
+            )
+            await session.commit()
 
     def _load_proxies(self) -> list[str]:
         if not settings.use_proxies or not settings.proxy_list_path:
@@ -337,7 +411,26 @@ class LinkedInScraper(BaseScraper):
                     logger.info(f"[LinkedIn] Cached cookies are {age / 3600:.1f}h old â€” re-warming")
                     continue
                 cookie_owner = str(data.get("username") or "").strip().lower()
-                if expected_owner:
+                if source == "legacy":
+                    expected = str(expected_owner or "").strip().lower()
+                    if not expected:
+                        logger.info(
+                            "[LinkedIn] Ignoring legacy cookie file because the active "
+                            "LinkedIn account could not be attributed safely"
+                        )
+                        continue
+                    if not cookie_owner:
+                        logger.info(
+                            "[LinkedIn] Ignoring legacy cookie file without LinkedIn account metadata"
+                        )
+                        continue
+                    if cookie_owner != expected:
+                        logger.info(
+                            "[LinkedIn] Ignoring cached cookies for a different LinkedIn account: "
+                            f"{mask_linkedin_username(cookie_owner)}"
+                        )
+                        continue
+                elif expected_owner:
                     expected = expected_owner.strip().lower()
                     if not cookie_owner:
                         logger.info(
@@ -353,10 +446,16 @@ class LinkedInScraper(BaseScraper):
                 cookies = data.get("cookies", {})
                 if self._has_authenticated_cookie(cookies):
                     if source == "legacy":
-                        logger.warning(
-                            "[LinkedIn] Falling back to legacy LinkedIn cookies for the same account "
-                            "to preserve authenticated scraping"
+                        logger.info(
+                            "[LinkedIn] Importing attributed legacy LinkedIn cookies into scoped state"
                         )
+                        try:
+                            self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
+                            self._cookie_path.write_text(json.dumps(data))
+                        except Exception as exc:
+                            logger.warning(
+                                f"[LinkedIn] Could not import legacy cookies into scoped state: {exc}"
+                            )
                     return cookies
                 if guest_cookies is None:
                     guest_cookies = cookies
@@ -374,7 +473,7 @@ class LinkedInScraper(BaseScraper):
         }
         self._cookie_path.parent.mkdir(parents=True, exist_ok=True)
         self._cookie_path.write_text(json.dumps(payload))
-        if self._has_authenticated_cookie(cookies):
+        if self.runtime_scope == "cli" and self._has_authenticated_cookie(cookies):
             legacy_path = legacy_linkedin_cookie_path()
             legacy_path.parent.mkdir(parents=True, exist_ok=True)
             legacy_path.write_text(json.dumps(payload))
@@ -1038,6 +1137,11 @@ class LinkedInScraper(BaseScraper):
         self._client = self._make_client()
         if self.has_authenticated_session():
             self._detail_api_authwall_backoff_until = 0.0
+            await self._record_session_state(
+                auth_state="authenticated",
+                validated=True,
+                success=True,
+            )
         # Detail browser will be lazily re-created with fresh cookies on next use
 
     # ------------------------------------------------------------------
@@ -1125,16 +1229,31 @@ class LinkedInScraper(BaseScraper):
         if any(signal in html for signal in _CAPTCHA_SIGNALS):
             if not _rewarm_attempted:
                 logger.warning("[LinkedIn] CAPTCHA/auth-wall detected - re-warming session")
+                await self._record_session_state(
+                    auth_state="checkpoint",
+                    challenge_kind="checkpoint_or_captcha",
+                    last_error="LinkedIn returned an auth-wall during detail fetch",
+                )
                 await self._rewarm()
                 return await self._get(url, _rewarm_attempted=True)
             if is_guest_detail_url:
                 self._detail_api_authwall_backoff_until = (
                     time.time() + _DETAIL_API_AUTHWALL_BACKOFF_SECONDS
                 )
+                await self._record_session_state(
+                    auth_state="rate_limited",
+                    challenge_kind="checkpoint_or_captcha",
+                    last_error="LinkedIn guest detail API returned auth-wall after re-warm",
+                )
                 raise RuntimeError(
                     "[LinkedIn] Guest detail API still returned auth-wall after re-warm "
                     f"(authenticated={self.has_authenticated_session()})"
                 )
+            await self._record_session_state(
+                auth_state="checkpoint",
+                challenge_kind="checkpoint_or_captcha",
+                last_error="LinkedIn returned auth-wall after re-warm",
+            )
             raise RuntimeError(
                 "[LinkedIn] Still getting auth-wall after re-warm; authenticated scraping "
                 "cannot continue safely."

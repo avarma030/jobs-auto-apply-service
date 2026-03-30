@@ -63,7 +63,7 @@ def scrape(
         db = Database(settings.database_url)
         await db.init()
         profile = load_profile(settings.user_profile_path)
-        orch = Orchestrator(profile=profile, db=db)
+        orch = Orchestrator(profile=profile, db=db, runtime_scope="cli")
         count = await orch.run_scrape(search_filter)
         console.print(f"[green]Scraped {count} new jobs.[/green]")
         await db.close()
@@ -88,7 +88,7 @@ def apply(dry_run: bool) -> None:
         db = Database(settings.database_url)
         await db.init()
         profile = load_profile(settings.user_profile_path)
-        orch = Orchestrator(profile=profile, db=db)
+        orch = Orchestrator(profile=profile, db=db, runtime_scope="cli")
         counts = await orch.run_apply()
         _print_counts(counts)
         await db.close()
@@ -145,7 +145,7 @@ def run(
         db = Database(settings.database_url)
         await db.init()
         profile = load_profile(settings.user_profile_path)
-        orch = Orchestrator(profile=profile, db=db)
+        orch = Orchestrator(profile=profile, db=db, runtime_scope="cli")
 
         if no_ai or not settings.anthropic_api_key:
             if not no_ai and not settings.anthropic_api_key:

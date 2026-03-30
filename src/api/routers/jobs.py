@@ -346,6 +346,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
     from src.models import ExperienceLevel, JobSearchFilter, JobType, UserProfile
     from src.orchestrator import Orchestrator
     from src.services.profile_sanitizer import build_user_profile
+    from src.services.user_runtime import build_runtime_profile_data
 
     db = Database(settings.database_url)
     await db.init()
@@ -453,16 +454,23 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
                 )
             ).scalar_one_or_none()
         profile_data: dict = _json.loads(row.profile_json) if (row and row.profile_json) else {}
+        async with db.session_factory() as session:
+            runtime_profile_data = await build_runtime_profile_data(
+                session,
+                user_id=user_id,
+                profile_data=profile_data,
+                include_secrets=True,
+            )
         try:
-            profile = build_user_profile(profile_data)
+            profile = build_user_profile(runtime_profile_data)
         except Exception:
             profile = UserProfile.model_construct(
-                first_name=profile_data.get("first_name", "User"),
-                last_name=profile_data.get("last_name", ""),
-                email=profile_data.get("email", ""),
+                first_name=runtime_profile_data.get("first_name", "User"),
+                last_name=runtime_profile_data.get("last_name", ""),
+                email=runtime_profile_data.get("email", ""),
             )
 
-        orch = Orchestrator(profile=profile, db=db)
+        orch = Orchestrator(profile=profile, db=db, runtime_scope="web")
 
         # Always run the full pipeline. The orchestrator degrades gracefully:
         # - no ANTHROPIC_API_KEY → scoring/tailoring skipped, jobs remain pending

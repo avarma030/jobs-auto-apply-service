@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -191,6 +191,58 @@ class SemanticCacheRecord(Base):
     )
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class BoardAccountCredentialRecord(Base):
+    """Encrypted job-board credentials stored outside profile JSON."""
+
+    __tablename__ = "board_account_credentials"
+
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    board: Mapped[str] = mapped_column(String(64), primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    encrypted_secret_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class BoardSessionRecord(Base):
+    """User-scoped board session metadata and auth state."""
+
+    __tablename__ = "board_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "board",
+            "account_key",
+            "session_kind",
+            name="uq_board_session_identity_kind",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    board: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    account_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_username: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    session_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    auth_state: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    challenge_kind: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cookie_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    session_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    last_validated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )

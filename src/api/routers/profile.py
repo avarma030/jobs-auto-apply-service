@@ -10,15 +10,25 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_user, get_session
-from src.api.schemas.profile import ProfileResponse, ProfileUpdate, ResumeUploadResponse
+from src.api.schemas.profile import (
+    BoardAccountStateResponse,
+    ProfileResponse,
+    ProfileUpdate,
+    ResumeUploadResponse,
+)
 from src.config import settings
 from src.database.models import User, UserProfile
 from src.services.profile_sanitizer import merge_profile_data, sanitize_profile_data
+from src.services.runtime_state import ensure_user_upload_dir, user_resume_path
+from src.services.user_runtime import (
+    build_runtime_profile_data,
+    list_board_account_states,
+    migrate_profile_credentials,
+    strip_profile_board_secrets,
+    upsert_board_credentials,
+)
 
 router = APIRouter(prefix="/profile", tags=["profile"])
-
-UPLOAD_DIR = Path("data/uploads")
-
 
 @router.get("", response_model=ProfileResponse)
 async def get_profile(
@@ -26,9 +36,11 @@ async def get_profile(
     current_user: User = Depends(get_current_user),
 ):
     row = await _get_or_create_profile(current_user.id, session)
-    profile_data = json.loads(row.profile_json)
-    await _write_profile_json(profile_data)
-    return ProfileResponse(profile=profile_data)
+    _, migrated = await migrate_profile_credentials(session, current_user.id, row)
+    if migrated:
+        await session.commit()
+        await session.refresh(row)
+    return await _build_profile_response(session, current_user.id, row)
 
 
 @router.put("", response_model=ProfileResponse)
@@ -38,12 +50,30 @@ async def update_profile(
     current_user: User = Depends(get_current_user),
 ):
     row = await _get_or_create_profile(current_user.id, session)
-    sanitized = sanitize_profile_data(body.profile)
+    await migrate_profile_credentials(session, current_user.id, row)
+
+    raw_profile = body.profile if isinstance(body.profile, dict) else {}
+    raw_accounts = raw_profile.get("job_board_accounts") if isinstance(raw_profile.get("job_board_accounts"), dict) else None
+    if raw_accounts is not None:
+        for raw_board, raw_creds in raw_accounts.items():
+            if not isinstance(raw_creds, dict):
+                continue
+            await upsert_board_credentials(
+                session,
+                user_id=current_user.id,
+                board=str(raw_board),
+                username=raw_creds.get("username"),
+                secret_payload={
+                    "password": raw_creds.get("password"),
+                    "access_token": raw_creds.get("access_token"),
+                },
+            )
+
+    sanitized = sanitize_profile_data(strip_profile_board_secrets(raw_profile))
     row.profile_json = json.dumps(sanitized)
     await session.commit()
     await session.refresh(row)
-    await _write_profile_json(sanitized)
-    return ProfileResponse(profile=json.loads(row.profile_json))
+    return await _build_profile_response(session, current_user.id, row)
 
 
 @router.post("/resume", response_model=ResumeUploadResponse)
@@ -54,9 +84,8 @@ async def upload_resume(
 ):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted")
-    user_dir = UPLOAD_DIR / str(current_user.id)
-    user_dir.mkdir(parents=True, exist_ok=True)
-    dest = user_dir / "resume.pdf"
+    user_dir = ensure_user_upload_dir(current_user.id)
+    dest = user_resume_path(current_user.id)
     with dest.open("wb") as f:
         shutil.copyfileobj(file.file, f)
 
@@ -65,17 +94,9 @@ async def upload_resume(
     extraction_error: str | None = None
     ai_enabled = bool(settings.anthropic_api_key)
     row = await _get_or_create_profile(current_user.id, session)
-    existing = json.loads(row.profile_json) if row.profile_json and row.profile_json != "{}" else {}
-
-    # Also copy to the global resume path so the orchestrator can find it.
-    # The orchestrator tries data/uploads/{user_id}/resume.pdf first (per-user),
-    # then falls back to settings.resume_path. Copying here keeps CLI / single-user
-    # mode working without any code changes in the orchestrator.
-    try:
-        settings.resume_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(dest, settings.resume_path)
-    except Exception as exc:
-        logger.warning(f"Could not copy resume to global path: {exc}")
+    existing, migrated = await migrate_profile_credentials(session, current_user.id, row)
+    if migrated:
+        await session.flush()
 
     if ai_enabled:
         try:
@@ -96,7 +117,6 @@ async def upload_resume(
     row.profile_json = json.dumps(sanitized)
     await session.commit()
     profile_updated = True
-    await _write_profile_json(sanitized)
     if extracted:
         extracted = sanitized
 
@@ -122,10 +142,22 @@ async def _get_or_create_profile(user_id: int, session: AsyncSession) -> UserPro
     return row
 
 
-async def _write_profile_json(profile_data: dict) -> None:
-    try:
-        settings.user_profile_path.parent.mkdir(parents=True, exist_ok=True)
-        settings.user_profile_path.write_text(json.dumps(profile_data, indent=2))
-        logger.info(f"Profile saved to {settings.user_profile_path}")
-    except Exception as exc:
-        logger.warning(f"Could not save profile to JSON: {exc}")
+async def _build_profile_response(
+    session: AsyncSession,
+    user_id: int,
+    row: UserProfile,
+) -> ProfileResponse:
+    profile_data = json.loads(row.profile_json or "{}")
+    runtime_profile = await build_runtime_profile_data(
+        session,
+        user_id=user_id,
+        profile_data=profile_data,
+        include_secrets=False,
+    )
+    board_account_states = await list_board_account_states(session, user_id=user_id)
+    return ProfileResponse(
+        profile=runtime_profile,
+        board_account_states=[
+            BoardAccountStateResponse(**state.__dict__) for state in board_account_states
+        ],
+    )

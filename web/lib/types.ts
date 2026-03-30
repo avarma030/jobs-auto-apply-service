@@ -213,6 +213,16 @@ export interface SavedSearchRunSummary {
   error_message?: string | null;
 }
 
+export interface BoardAccountState {
+  board: string;
+  username?: string | null;
+  has_secret: boolean;
+  auth_state: string;
+  challenge_kind?: string | null;
+  last_validated_at?: string | null;
+  last_success_at?: string | null;
+}
+
 export interface Profile {
   first_name?: string;
   last_name?: string;
@@ -254,5 +264,10 @@ export interface Profile {
   };
   custom_answers?: Record<string, string>;
   resume_path?: string;
-  job_board_accounts?: Record<string, { username?: string; password?: string }>;
+  job_board_accounts?: Record<string, { username?: string; password?: string; access_token?: string }>;
+}
+
+export interface ProfileResponse {
+  profile: Profile;
+  board_account_states: BoardAccountState[];
 }

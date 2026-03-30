@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import abc
-from typing import AsyncIterator
+from typing import AsyncIterator, TYPE_CHECKING
 
 from loguru import logger
 
 from src.models import Job, JobSearchFilter
+
+if TYPE_CHECKING:
+    from src.database import Database
 
 
 class BaseScraper(abc.ABC):
@@ -24,8 +27,17 @@ class BaseScraper(abc.ABC):
     #: Whether the board requires a logged-in session to scrape
     requires_auth: bool = False
 
-    def __init__(self, credentials: dict | None = None):
+    def __init__(
+        self,
+        credentials: dict | None = None,
+        db: "Database" | None = None,
+        user_id: int | None = None,
+        runtime_scope: str = "web",
+    ):
         self.credentials = credentials or {}
+        self.db = db
+        self.user_id = user_id
+        self.runtime_scope = runtime_scope
         self._session_active = False
 
     # ------------------------------------------------------------------
