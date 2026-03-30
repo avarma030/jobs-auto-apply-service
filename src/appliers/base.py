@@ -127,8 +127,18 @@ class BaseApplier(abc.ABC):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _ok(self, job: Job, confirmation_id: str | None = None) -> ApplicationResult:
-        return ApplicationResult(job, ApplicationStatus.APPLIED, confirmation_id=confirmation_id)
+    def _ok(
+        self,
+        job: Job,
+        confirmation_id: str | None = None,
+        message: str = "",
+    ) -> ApplicationResult:
+        return ApplicationResult(
+            job,
+            ApplicationStatus.APPLIED,
+            message=message,
+            confirmation_id=confirmation_id,
+        )
 
     def _fail(self, job: Job, reason: str) -> ApplicationResult:
         logger.warning(f"[{self.board_name}] Failed to apply to {job.title} @ {job.company}: {reason}")

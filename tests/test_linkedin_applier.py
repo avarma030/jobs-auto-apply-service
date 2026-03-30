@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -397,6 +398,92 @@ async def test_apply_fails_fast_when_linkedin_auth_is_unavailable():
     assert result.status == ApplicationStatus.FAILED
     assert "LinkedIn authentication unavailable" in result.message
     applier._easy_apply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_logged_in_surfaces_exact_two_factor_reason(monkeypatch):
+    applier = make_applier()
+    applier._ensure_linkedin_state = MagicMock()
+    applier._linkedin_username = "jane@example.com"
+    applier._linkedin_password = "secret"
+    applier._linkedin_credential_source = "profile"
+    applier._inject_scraper_cookies = AsyncMock(return_value=False)
+    applier._is_logged_in = AsyncMock(return_value=False)
+    applier._bm = MagicMock()
+    applier._bm.screenshot = AsyncMock()
+
+    page = MagicMock()
+    page.url = "https://www.linkedin.com/checkpoint/challenge"
+    page.goto = AsyncMock()
+    page.wait_for_selector = AsyncMock(
+        side_effect=linkedin_mod.PWTimeoutError("timeout")
+    )
+    applier._page = page
+    challenge = SimpleNamespace(
+        kind="2fa_required",
+        message=(
+            "LinkedIn requires 2-factor authentication or mobile approval for this account. "
+            "Disable 2-factor authentication for the LinkedIn account used by this automation, then retry."
+        ),
+    )
+    monkeypatch.setattr(
+        linkedin_mod,
+        "detect_linkedin_auth_challenge",
+        AsyncMock(return_value=challenge),
+    )
+
+    await applier._ensure_logged_in()
+
+    assert applier._auth_error is not None
+    assert "2-factor authentication or mobile approval" in applier._auth_error
+    assert "Disable 2-factor authentication" in applier._auth_error
+
+
+@pytest.mark.asyncio
+async def test_easy_apply_marks_already_submitted_job_as_applied():
+    applier = make_applier()
+    applier._bm = MagicMock()
+    applier._bm.screenshot = AsyncMock()
+    applier._job_already_submitted = AsyncMock(return_value=True)
+    applier._dismiss_prompts = AsyncMock()
+    applier._wait_for_apply_controls = AsyncMock()
+
+    page = MagicMock()
+    page.url = "https://www.linkedin.com/jobs/view/1234567890/"
+    page.goto = AsyncMock()
+    applier._page = page
+
+    result = await applier._easy_apply(make_job())
+
+    assert result.status == ApplicationStatus.APPLIED
+    assert result.message == "Application already submitted for this job"
+    applier._wait_for_apply_controls.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_easy_apply_skips_job_search_safety_reminder():
+    applier = make_applier()
+    applier._bm = MagicMock()
+    applier._bm.screenshot = AsyncMock()
+    applier._job_already_submitted = AsyncMock(return_value=False)
+    applier._dismiss_prompts = AsyncMock()
+    applier._job_search_safety_reminder_visible = AsyncMock(return_value=True)
+
+    easy_btn = MagicMock()
+    easy_btn.scroll_into_view_if_needed = AsyncMock()
+    easy_btn.click = AsyncMock()
+    applier._wait_for_apply_controls = AsyncMock(return_value=(easy_btn, None))
+
+    page = MagicMock()
+    page.url = "https://www.linkedin.com/jobs/view/1234567890/"
+    page.goto = AsyncMock()
+    applier._page = page
+
+    result = await applier._easy_apply(make_job())
+
+    assert result.status == ApplicationStatus.SKIPPED
+    assert result.message == "LinkedIn triggered Job Search Safety Reminder for this job. Skipping it."
+    applier._bm.screenshot.assert_awaited()
 
 
 @pytest.mark.asyncio

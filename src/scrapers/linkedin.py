@@ -1,25 +1,25 @@
-"""LinkedIn job scraper.
+﻿"""LinkedIn job scraper.
 
 Scraping strategy
 -----------------
 Hybrid Apify-style approach with Chrome TLS fingerprint impersonation:
 
-1. Session warming — Playwright visits linkedin.com/jobs/search (or logs in if
+1. Session warming â€” Playwright visits linkedin.com/jobs/search (or logs in if
    credentials are configured) using a stealth browser profile stored in
    ``data/.linkedin_scraper_session/``.  Extracts real session cookies.
 
-2. Cookie-authenticated curl-cffi — cookies are injected into a curl-cffi
+2. Cookie-authenticated curl-cffi â€” cookies are injected into a curl-cffi
    AsyncSession configured with ``impersonate="chrome124"``, which reproduces
    Chrome's exact JA3 TLS fingerprint and HTTP/2 SETTINGS frame.  This prevents
    Akamai/PerimeterX from flagging us at the TLS layer.
    API endpoint: GET /jobs-guest/jobs/api/seeMoreJobPostings/search
 
-3. Cookie persistence — saved to ``data/.linkedin_cookies.json``, reused up to
+3. Cookie persistence â€” saved to ``data/.linkedin_cookies.json``, reused up to
    4 hours before re-warming.
 
-4. Re-warm on block — on HTTP 403/999/CAPTCHA the scraper re-warms and retries once.
+4. Re-warm on block â€” on HTTP 403/999/CAPTCHA the scraper re-warms and retries once.
 
-5. Playwright fallback — if the guest API returns empty even after re-warm,
+5. Playwright fallback â€” if the guest API returns empty even after re-warm,
    the first page is scraped directly via Playwright.
 
 Credentials in ``self.credentials`` are used both to log in during warming
@@ -48,23 +48,25 @@ from src.config import settings
 from src.models import ExperienceLevel, Job, JobSearchFilter, JobType, WorkMode
 from src.scrapers.base import BaseScraper
 from src.services.linkedin_state import (
+    detect_linkedin_auth_challenge,
     legacy_linkedin_cookie_path,
     linkedin_cookie_path,
     linkedin_session_dir,
+    linkedin_two_factor_auth_guidance,
     mask_linkedin_username,
 )
 from src.utils.browser import BrowserManager
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _GUEST_SEARCH_URL = (
     "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 )
 _JOB_VIEW_URL = "https://www.linkedin.com/jobs/view/{job_id}/"
-# Guest API for individual job postings — returns a static server-rendered HTML fragment.
+# Guest API for individual job postings â€” returns a static server-rendered HTML fragment.
 # The /jobs/view/{id}/ URL returns a client-side-rendered React SPA shell with no content.
 _JOB_POSTING_API_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
-# LinkedIn's internal Voyager JSON API — returns rich structured data when authenticated.
+# LinkedIn's internal Voyager JSON API â€” returns rich structured data when authenticated.
 # Requires li_at + JSESSIONID cookies; JSESSIONID value used as the csrf-token header.
 # Response is a flat JSON object: {"description": {"text": "..."}, "employmentStatus": "...", ...}
 _VOYAGER_JOB_URL = (
@@ -80,7 +82,7 @@ _DETAIL_API_AUTHWALL_BACKOFF_SECONDS = 5 * 60
 def _clear_session_dir(path: Path) -> None:
     """Delete and recreate a Playwright persistent profile dir to reset browser state.
 
-    Called when the login form is not found — indicates LinkedIn showed a
+    Called when the login form is not found â€” indicates LinkedIn showed a
     security checkpoint due to stale/flagged session state.  A clean dir
     forces LinkedIn to treat the next visit as a brand-new browser.
     """
@@ -93,7 +95,7 @@ def _clear_session_dir(path: Path) -> None:
         logger.warning(f"[LinkedIn] Could not reset browser profile dir {path}: {exc}")
 
 
-# Full browser header suite — mirrors a real Chrome navigation request
+# Full browser header suite â€” mirrors a real Chrome navigation request
 _BROWSER_HEADERS = {
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;"
@@ -169,7 +171,7 @@ class LinkedInScraper(BaseScraper):
         self._detail_api_authwall_backoff_until = 0.0
         self._ensure_linkedin_state()
 
-        # Load cached cookies — warm a fresh session if missing / stale
+        # Load cached cookies â€” warm a fresh session if missing / stale
         cached = self._load_cookies()
         if cached:
             logger.info(
@@ -282,7 +284,7 @@ class LinkedInScraper(BaseScraper):
                 data = json.loads(path.read_text())
                 age = time.time() - data.get("saved_at", 0)
                 if age > _COOKIE_MAX_AGE_SECONDS:
-                    logger.info(f"[LinkedIn] Cached cookies are {age / 3600:.1f}h old — re-warming")
+                    logger.info(f"[LinkedIn] Cached cookies are {age / 3600:.1f}h old â€” re-warming")
                     continue
                 cookie_owner = str(data.get("username") or "").strip().lower()
                 if expected_owner:
@@ -344,15 +346,12 @@ class LinkedInScraper(BaseScraper):
         Launch a stealth Playwright browser against linkedin.com/jobs/search,
         scroll briefly to appear human, and extract all response cookies.
 
-        Uses a *persistent* user-data-dir (``_SESSION_DIR``) so LinkedIn treats
-        this as a returning browser with browsing history — significantly harder
-        to fingerprint than a brand-new ephemeral context.
-
-        If the login form is not found (LinkedIn showing a checkpoint/CAPTCHA),
-        the stale session dir is cleared and one retry is performed with a fresh
-        browser profile.
+        Uses a persistent user-data-dir so LinkedIn treats this as a returning
+        browser. If the login form is not found because LinkedIn showed a
+        checkpoint or stale-profile state, the scraper retries once with a
+        fresh browser profile.
         """
-        logger.info("[LinkedIn] Warming session via Playwright (this takes ~15 s) …")
+        logger.info("[LinkedIn] Warming session via Playwright (this takes ~15 s) ...")
         self._ensure_linkedin_state()
         creds = {
             "username": self._linkedin_username,
@@ -365,22 +364,23 @@ class LinkedInScraper(BaseScraper):
                 f"{mask_linkedin_username(creds['username'])}"
             )
 
+        auth_challenge = None
         cookies: dict = {}
         for attempt in range(2):
             if attempt == 1:
                 logger.warning(
-                    "[LinkedIn] Login form was not visible — clearing stale scraper session "
-                    "dir and retrying with fresh browser profile …"
+                    "[LinkedIn] Login form was not visible - clearing stale scraper session "
+                    "dir and retrying with fresh browser profile ..."
                 )
                 _clear_session_dir(self._session_dir)
 
-            login_form_found = True  # assume present; set False if wait_for_selector fails
+            login_form_found = True
             try:
                 async with BrowserManager(headless=True, user_data_dir=self._session_dir) as bm:
                     page = await bm.new_page()
 
                     if creds.get("username") and creds.get("password"):
-                        logger.info("[LinkedIn] Logging in to get authenticated session cookies …")
+                        logger.info("[LinkedIn] Logging in to get authenticated session cookies ...")
                         await page.goto(
                             "https://www.linkedin.com/login",
                             wait_until="domcontentloaded",
@@ -389,13 +389,16 @@ class LinkedInScraper(BaseScraper):
                         await bm.human_pause(1.5, 2.5)
 
                         current_url = page.url
+                        challenge = await detect_linkedin_auth_challenge(page)
+                        if challenge:
+                            auth_challenge = challenge
+
                         if any(s in current_url for s in ("/feed", "/jobs", "/mynetwork")):
                             existing_raw = await page.context.cookies("https://www.linkedin.com")
                             existing_cookies = {
                                 cookie["name"]: cookie["value"] for cookie in existing_raw
                             }
                             if self._has_authenticated_cookie(existing_cookies):
-                                # Already authenticated via persistent profile
                                 logger.info(f"[LinkedIn] Already authenticated (at {current_url})")
                                 cookies = existing_cookies
                             else:
@@ -405,13 +408,10 @@ class LinkedInScraper(BaseScraper):
                                 )
                                 login_form_found = False
                         else:
-                            # Expect the standard login form — wait with a short timeout so
-                            # we detect checkpoint/CAPTCHA pages quickly instead of hanging
                             try:
                                 await page.wait_for_selector(
                                     "input#username", state="visible", timeout=8_000
                                 )
-                                # Form is present — fill credentials
                                 await page.fill("input#username", creds["username"])
                                 await bm.human_pause(0.3, 0.8)
                                 await page.fill("input#password", creds["password"])
@@ -427,15 +427,24 @@ class LinkedInScraper(BaseScraper):
                                     if self._has_authenticated_cookie(cookies):
                                         break
                                     await bm.human_pause(0.8, 1.4)
-                                logger.info("[LinkedIn] Login submitted — waiting for redirect …")
+                                if not self._has_authenticated_cookie(cookies):
+                                    challenge = await detect_linkedin_auth_challenge(page)
+                                    if challenge:
+                                        auth_challenge = challenge
+                                        logger.warning(f"[LinkedIn] {challenge.message}")
+                                logger.info("[LinkedIn] Login submitted - waiting for redirect ...")
                             except Exception:
-                                logger.warning(
-                                    f"[LinkedIn] Login form not visible at {current_url} "
-                                    f"(attempt {attempt + 1}/2) — checkpoint/CAPTCHA suspected"
-                                )
+                                challenge = await detect_linkedin_auth_challenge(page)
+                                if challenge:
+                                    auth_challenge = challenge
+                                    logger.warning(f"[LinkedIn] {challenge.message}")
+                                else:
+                                    logger.warning(
+                                        f"[LinkedIn] Login form not visible at {current_url} "
+                                        f"(attempt {attempt + 1}/2) - checkpoint/CAPTCHA suspected"
+                                    )
                                 login_form_found = False
 
-                    # Collect session cookies regardless of login outcome
                     await page.goto(
                         "https://www.linkedin.com/jobs/search/?keywords=software+engineer",
                         wait_until="domcontentloaded",
@@ -450,37 +459,32 @@ class LinkedInScraper(BaseScraper):
                     cookies = {c["name"]: c["value"] for c in raw}
                     has_auth = self._has_authenticated_cookie(cookies)
                     logger.info(
-                        f"[LinkedIn] Session warm complete — {len(cookies)} cookies "
+                        f"[LinkedIn] Session warm complete - {len(cookies)} cookies "
                         f"(authenticated={has_auth})"
                     )
 
             except Exception as exc:
                 logger.warning(f"[LinkedIn] Session warming attempt {attempt + 1}/2 failed: {exc}")
-                login_form_found = False  # treat crash as "form not found" to enable retry
+                login_form_found = False
 
             if self._has_authenticated_cookie(cookies):
-                return cookies  # Authenticated — no need to retry
+                return cookies
 
             if login_form_found or attempt == 1:
-                # Either form was found (credentials wrong / checkpoint after submit),
-                # or this was already the retry — don't loop again
                 break
-            # else: form was not found → outer loop will clear dir and retry
 
         if not self._has_authenticated_cookie(cookies):
+            if auth_challenge is not None:
+                raise RuntimeError(
+                    f"LinkedIn authentication unavailable: {auth_challenge.message}"
+                )
             raise RuntimeError(
                 "LinkedIn authentication unavailable: could not obtain an authenticated "
                 f"session after {attempt + 1} attempt(s). Run once with "
                 "HEADLESS_BROWSER=false, complete any LinkedIn security challenge for "
-                "this account, then retry."
+                f"this account, then retry. {linkedin_two_factor_auth_guidance()}"
             )
-        if not self._has_authenticated_cookie(cookies):
-            logger.warning(
-                f"[LinkedIn] Could not obtain an authenticated session after {attempt + 1} attempt(s). "
-                "Proceeding with unauthenticated cookies (scraping may be limited). "
-                "To fix: set HEADLESS_BROWSER=false in .env, run once, and solve any "
-                "LinkedIn security challenge manually — the session will persist."
-            )
+
         return cookies
 
     # ------------------------------------------------------------------
@@ -510,9 +514,9 @@ class LinkedInScraper(BaseScraper):
 
             if not html or html.strip() == "":
                 if page == 0:
-                    # First page empty — try Playwright direct scrape before giving up
+                    # First page empty â€” try Playwright direct scrape before giving up
                     logger.info(
-                        "[LinkedIn] API returned empty on first page — trying Playwright fallback"
+                        "[LinkedIn] API returned empty on first page â€” trying Playwright fallback"
                     )
                     html = await self._search_playwright(params)
                 if not html or html.strip() == "":
@@ -577,15 +581,15 @@ class LinkedInScraper(BaseScraper):
                     continue
                 break
 
-            # Randomized delay — breaks fixed-interval bot detection pattern
+            # Randomized delay â€” breaks fixed-interval bot detection pattern
             await asyncio.sleep(max(1.0, settings.request_delay_seconds + random.uniform(-0.5, 2.0)))
 
     async def get_job_details(self, job: Job) -> Job:
         """Fetch full job details via a 3-tier cascade:
 
-        1. LinkedIn Voyager JSON API  — fastest, requires authenticated li_at cookie.
-        2. Guest posting HTML API     — server-rendered fragment, no JS needed.
-        3. Playwright browser         — full JS rendering, guaranteed to work.
+        1. LinkedIn Voyager JSON API  â€” fastest, requires authenticated li_at cookie.
+        2. Guest posting HTML API     â€” server-rendered fragment, no JS needed.
+        3. Playwright browser         â€” full JS rendering, guaranteed to work.
 
         Each tier falls through to the next if the description comes back empty.
         """
@@ -597,7 +601,7 @@ class LinkedInScraper(BaseScraper):
                 "or verify Easy Apply for this run."
             )
 
-        # ── Tier 1: Voyager API (authenticated JSON) ──────────────────────────
+        # â”€â”€ Tier 1: Voyager API (authenticated JSON) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if self._cookies.get("li_at"):
             try:
                 job = await self._fetch_details_voyager(job)
@@ -607,7 +611,7 @@ class LinkedInScraper(BaseScraper):
             except Exception as exc:
                 logger.debug(f"[LinkedIn] Voyager failed for {job.external_id}: {exc}")
 
-        # ── Tier 2: Guest posting API (server-rendered HTML fragment) ─────────
+        # â”€â”€ Tier 2: Guest posting API (server-rendered HTML fragment) â”€â”€â”€â”€â”€â”€â”€â”€â”€
         try:
             return await self._fetch_details_playwright(job)
         except Exception as exc:
@@ -625,7 +629,7 @@ class LinkedInScraper(BaseScraper):
         except Exception as exc:
             logger.debug(f"[LinkedIn] Guest API failed for {job.external_id}: {exc}")
 
-        # ── Tier 3: Playwright browser (executes JS, uses auth session) ───────
+        # â”€â”€ Tier 3: Playwright browser (executes JS, uses auth session) â”€â”€â”€â”€â”€â”€â”€
         try:
             job = await self._fetch_details_playwright(job)
         except Exception as exc:
@@ -681,7 +685,7 @@ class LinkedInScraper(BaseScraper):
                 job_data.get("employmentStatus", "")
             )
 
-        # Remote/hybrid — prefer workRemoteAllowed bool, fall back to workplaceTypes list
+        # Remote/hybrid â€” prefer workRemoteAllowed bool, fall back to workplaceTypes list
         if not job.work_mode:
             if job_data.get("workRemoteAllowed") is True:
                 job.work_mode = WorkMode.REMOTE
@@ -703,7 +707,7 @@ class LinkedInScraper(BaseScraper):
         if apply_type:
             job.easy_apply = "OnsiteApply" in apply_type
             logger.debug(
-                f"[LinkedIn] Voyager applyMethod={apply_type!r} → easy_apply={job.easy_apply}"
+                f"[LinkedIn] Voyager applyMethod={apply_type!r} â†’ easy_apply={job.easy_apply}"
             )
 
         return job
@@ -712,7 +716,7 @@ class LinkedInScraper(BaseScraper):
         """Navigate to the job page in an authenticated Playwright browser.
 
         Uses a separate persistent session dir (_DETAIL_SESSION_DIR) with the
-        current session cookies injected — avoids conflicting with _SESSION_DIR
+        current session cookies injected â€” avoids conflicting with _SESSION_DIR
         which is used by _warm_session().  The browser stays open across multiple
         calls (lazy-init) to avoid per-job browser startup overhead.
         """
@@ -783,7 +787,7 @@ class LinkedInScraper(BaseScraper):
         """
         soup = BeautifulSoup(html, "lxml")
 
-        # ── JSON-LD structured data (most stable — LinkedIn publishes for SEO) ─
+        # â”€â”€ JSON-LD structured data (most stable â€” LinkedIn publishes for SEO) â”€
         if not job.description:
             for script in soup.find_all("script", type="application/ld+json"):
                 try:
@@ -804,7 +808,7 @@ class LinkedInScraper(BaseScraper):
                 except Exception:
                     pass
 
-        # ── CSS selectors (fragment from guest API has these reliably) ─────────
+        # â”€â”€ CSS selectors (fragment from guest API has these reliably) â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if not job.description:
             for sel in (
                 "div.show-more-less-html__markup",
@@ -826,8 +830,8 @@ class LinkedInScraper(BaseScraper):
             logger.warning(f"[LinkedIn] No description extracted for {job.external_id}")
             logger.debug(f"[LinkedIn] HTML snippet: {html[:600]!r}")
 
-        # ── Easy Apply ─────────────────────────────────────────────────────────
-        # Try multiple selectors — LinkedIn UI varies between desktop/mobile/guest HTML
+        # â”€â”€ Easy Apply â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # Try multiple selectors â€” LinkedIn UI varies between desktop/mobile/guest HTML
         apply_btn = (
             soup.select_one("button.jobs-apply-button[aria-label*='Easy Apply']")
             or soup.select_one("button[aria-label*='Easy Apply']")
@@ -839,7 +843,7 @@ class LinkedInScraper(BaseScraper):
             btn_label = (apply_btn.get("aria-label") or "").lower()
             job.easy_apply = "easy apply" in btn_text or "easy apply" in btn_label
 
-        # ── Salary ─────────────────────────────────────────────────────────────
+        # â”€â”€ Salary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         salary_el = soup.select_one(
             "div.compensation__salary, span.salary.compensation__salary-range"
         )
@@ -848,7 +852,7 @@ class LinkedInScraper(BaseScraper):
                 salary_el.get_text(strip=True)
             )
 
-        # ── Job criteria chips ─────────────────────────────────────────────────
+        # â”€â”€ Job criteria chips â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         for item in soup.select("li.description__job-criteria-item, .job-criteria__item"):
             header_el = item.select_one(
                 "h3.description__job-criteria-subheader, .job-criteria__subheader"
@@ -865,7 +869,7 @@ class LinkedInScraper(BaseScraper):
             elif "seniority level" in header:
                 job.experience_level = self._parse_experience_level(value)
 
-        # ── Skills ─────────────────────────────────────────────────────────────
+        # â”€â”€ Skills â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         skill_els = soup.select(
             "a.job-details-skill-match-status-list__skill, .skill-pill"
         )
@@ -879,13 +883,13 @@ class LinkedInScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def _rewarm(self) -> None:
-        """Close detail browser → warm session (uses _SESSION_DIR) → refresh clients.
+        """Close detail browser â†’ warm session (uses _SESSION_DIR) â†’ refresh clients.
 
         The detail browser and warm-session browser both use Playwright with
         persistent profiles.  Running them simultaneously on the same directory
         causes corruption, so we close the detail browser first.
         """
-        # Close detail browser — it uses _DETAIL_SESSION_DIR, warm session uses _SESSION_DIR.
+        # Close detail browser â€” it uses _DETAIL_SESSION_DIR, warm session uses _SESSION_DIR.
         # They're separate dirs so no conflict, but closing here also refreshes cookies.
         if self._detail_bm:
             try:
@@ -949,14 +953,14 @@ class LinkedInScraper(BaseScraper):
             if "proxy" in err_str or "connect" in err_str:
                 proxy = self._next_proxy()
                 if proxy:
-                    logger.warning("[LinkedIn] Proxy/connection error — rotating to next proxy")
+                    logger.warning("[LinkedIn] Proxy/connection error â€” rotating to next proxy")
                     await self._client.close()
                     self._client = self._make_client(proxy)
                 raise _RateLimitError("Proxy/connection error")
             raise
 
         if resp.status_code == 429:
-            logger.warning("[LinkedIn] Rate limited (429) — will back off and retry")
+            logger.warning("[LinkedIn] Rate limited (429) â€” will back off and retry")
             raise _RateLimitError("429 Too Many Requests")
 
         if resp.status_code in (403, 999):
@@ -1033,7 +1037,7 @@ class LinkedInScraper(BaseScraper):
                 }
             )
         )
-        logger.info(f"[LinkedIn] Playwright fallback — loading: {search_url}")
+        logger.info(f"[LinkedIn] Playwright fallback â€” loading: {search_url}")
         html = ""
         try:
             async with BrowserManager(headless=True, user_data_dir=self._session_dir) as bm:
@@ -1045,7 +1049,7 @@ class LinkedInScraper(BaseScraper):
                     await page.evaluate("window.scrollBy(0, 800)")
                     await bm.human_pause(0.8, 1.5)
                 html = await page.content()
-                logger.info("[LinkedIn] Playwright fallback — page captured")
+                logger.info("[LinkedIn] Playwright fallback â€” page captured")
         except Exception as exc:
             logger.warning(f"[LinkedIn] Playwright fallback failed: {exc}")
         return html
@@ -1098,7 +1102,7 @@ class LinkedInScraper(BaseScraper):
             )
             location = loc_el.get_text(strip=True) if loc_el else None
 
-            # URL — normalize locale subdomains (de.linkedin.com → www.linkedin.com)
+            # URL â€” normalize locale subdomains (de.linkedin.com â†’ www.linkedin.com)
             # to avoid ERR_TOO_MANY_REDIRECTS when Playwright navigates with .com cookies
             link_el = card_el.select_one("a.base-card__full-link")
             if link_el and link_el.get("href"):
@@ -1177,7 +1181,7 @@ class LinkedInScraper(BaseScraper):
         if f.location:
             params["location"] = f.location
 
-        # ── Work mode (f_WT) ──────────────────────────────────────────────────
+        # â”€â”€ Work mode (f_WT) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Prefer the explicit work_modes list; fall back to remote_only flag.
         work_modes: list[str] = list(getattr(f, "work_modes", []))
         if f.remote_only and "remote" not in work_modes:
@@ -1189,13 +1193,13 @@ class LinkedInScraper(BaseScraper):
             if wt_codes:
                 params["f_WT"] = ",".join(dict.fromkeys(wt_codes))  # dedup, preserve order
 
-        # ── Job type (f_JT) ───────────────────────────────────────────────────
+        # â”€â”€ Job type (f_JT) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if f.job_types:
             jt_codes = [_JOB_TYPE_MAP[jt] for jt in f.job_types if jt in _JOB_TYPE_MAP]
             if jt_codes:
                 params["f_JT"] = ",".join(jt_codes)
 
-        # ── Experience level (f_E) ────────────────────────────────────────────
+        # â”€â”€ Experience level (f_E) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if f.experience_levels:
             el_codes = [
                 _EXP_LEVEL_MAP[el] for el in f.experience_levels if el in _EXP_LEVEL_MAP
@@ -1203,12 +1207,12 @@ class LinkedInScraper(BaseScraper):
             if el_codes:
                 params["f_E"] = ",".join(dict.fromkeys(el_codes))
 
-        # ── Date posted (f_TPR) ───────────────────────────────────────────────
+        # â”€â”€ Date posted (f_TPR) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         max_age_seconds = f.effective_max_age_seconds()
         if max_age_seconds:
             params["f_TPR"] = f"r{max_age_seconds}"
 
-        # ── Easy Apply only (f_LF) ────────────────────────────────────────────
+        # â”€â”€ Easy Apply only (f_LF) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if getattr(f, "easy_apply_only", False):
             params["f_LF"] = "f_AL"
 
@@ -1220,16 +1224,16 @@ class LinkedInScraper(BaseScraper):
 
     @staticmethod
     def _parse_salary(text: str) -> tuple[float | None, float | None, str]:
-        """Parse salary range from text like '$120K/yr – $160K/yr'."""
+        """Parse salary range from text like '$120K/yr â€“ $160K/yr'."""
         currency = "USD"
-        if "£" in text:
+        if any(symbol in text for symbol in ("Â£", "£", "Ł")):
             currency = "GBP"
-        elif "€" in text:
+        elif "â‚¬" in text:
             currency = "EUR"
 
         text = text.replace(",", "").upper()
         numbers: list[float] = []
-        for match in re.finditer(r"[\$£€]?\s*(\d+(?:\.\d+)?)\s*([KMk]?)", text):
+        for match in re.finditer(r"[\$Â££Łâ‚¬]?\s*(\d+(?:\.\d+)?)\s*([KMk]?)", text):
             val = float(match.group(1))
             suffix = match.group(2).upper()
             if suffix == "K":

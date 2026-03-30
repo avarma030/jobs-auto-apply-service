@@ -128,6 +128,21 @@ class StubApplier:
         return ApplicationResult(job, ApplicationStatus.APPLIED, message="submitted")
 
 
+class AlreadySubmittedApplier:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    async def apply(self, job, tailored_resume_path=None, cover_letter=None):
+        return ApplicationResult(
+            job,
+            ApplicationStatus.APPLIED,
+            message="Application already submitted for this job",
+        )
+
+
 @pytest.mark.asyncio
 async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disabled(monkeypatch):
     record = make_job_record()
@@ -226,6 +241,25 @@ async def test_run_apply_persists_learned_answers_from_applier(monkeypatch):
     assert orch.profile.custom_answers["Are you open to relocation?"] == "Yes"
     assert any("[Profile][Saved]" in message for message in progress_messages)
     save_profile_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_apply_emits_applied_message_for_already_submitted_job(monkeypatch):
+    record = make_job_record()
+    db = FakeDb([record])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    progress_messages: list[str] = []
+
+    monkeypatch.setattr(orch, "_pick_applier", lambda job: AlreadySubmittedApplier())
+    monkeypatch.setattr(settings, "dry_run", False)
+
+    counts = await orch.run_apply(user_id=42, progress_callback=progress_messages.append)
+
+    assert counts["applied"] == 1
+    assert any(
+        "applied — Application already submitted for this job" in message
+        for message in progress_messages
+    )
 
 
 @pytest.mark.asyncio

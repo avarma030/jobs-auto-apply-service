@@ -197,7 +197,12 @@ class Orchestrator:
             status_key = status.value if isinstance(status, ApplicationStatus) else str(status)
             counts[status_key] = counts.get(status_key, 0) + 1
             if status == ApplicationStatus.APPLIED:
-                _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
+                if result.message:
+                    _emit(
+                        f"  🎉 Application result for '{job.title}': applied — {result.message}"
+                    )
+                else:
+                    _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
             else:
                 _emit(f"  ⚠️  Application result for '{job.title}': {status_key} — {result.message or ''}")
             await self.db.update_job_status(
@@ -482,7 +487,12 @@ class Orchestrator:
             status_key = status.value if isinstance(status, ApplicationStatus) else str(status)
             counts[status_key] = counts.get(status_key, 0) + 1
             if status == ApplicationStatus.APPLIED:
-                _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
+                if result.message:
+                    _emit(
+                        f"  🎉 Application result for '{job.title}': applied — {result.message}"
+                    )
+                else:
+                    _emit(f"  🎉 Applied successfully to '{job.title}' @ {job.company}!")
             else:
                 _emit(f"  ⚠️  Application result for '{job.title}': {status_key} — {result.message or ''}")
             await self.db.update_job_status(

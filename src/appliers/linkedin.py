@@ -1,27 +1,27 @@
-"""LinkedIn applier — Easy Apply automation via Playwright.
+﻿"""LinkedIn applier â€” Easy Apply automation via Playwright.
 
 Flow
 ----
-1. ``setup()``  — launch Playwright browser; inject warm scraper cookies; verify
+1. ``setup()``  â€” launch Playwright browser; inject warm scraper cookies; verify
                   session or perform fresh login.
-2. ``apply()``  — navigate to the job page, click "Easy Apply", step through
+2. ``apply()``  â€” navigate to the job page, click "Easy Apply", step through
                   the modal, and submit.
 
-Login strategy (most → least expensive)
+Login strategy (most â†’ least expensive)
 ----------------------------------------
 1. Load ``data/.linkedin_cookies.json`` (written by the scraper after warming) and
-   inject directly into the browser context — cheapest, no form interaction.
+   inject directly into the browser context â€” cheapest, no form interaction.
 2. Navigate to /feed; if session is live, done.
 3. If not logged in, perform a full form-based login with human-like delays.
 4. Save fresh cookies back to disk so the next run skips login again.
 
 Easy Apply modal steps (order may vary per job):
-  • Contact info  — phone, email (usually pre-filled from account)
-  • Resume        — select "Use a resume" or upload file
-  • Screening Q's — text, number, dropdown, yes/no radio, checkbox
-  • Cover letter  — optional textarea
-  • Review        — summary page
-  • Submit        — final button
+  â€¢ Contact info  â€” phone, email (usually pre-filled from account)
+  â€¢ Resume        â€” select "Use a resume" or upload file
+  â€¢ Screening Q's â€” text, number, dropdown, yes/no radio, checkbox
+  â€¢ Cover letter  â€” optional textarea
+  â€¢ Review        â€” summary page
+  â€¢ Submit        â€” final button
 
 External-apply jobs are detected and skipped (returns SKIPPED result);
 callers should route them to the appropriate ATS applier.
@@ -53,6 +53,7 @@ from src.services.application_questions import (
     semantic_yes_no,
 )
 from src.services.linkedin_state import (
+    detect_linkedin_auth_challenge,
     legacy_linkedin_cookie_path,
     linkedin_cookie_path,
     linkedin_session_dir,
@@ -60,16 +61,16 @@ from src.services.linkedin_state import (
 )
 from src.utils.browser import BrowserManager, BrowserManager as _BM
 
-# ── Cookie / session paths ─────────────────────────────────────────────────────
+# â”€â”€ Cookie / session paths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _COOKIE_MAX_AGE = 4 * 3600          # reuse cookies up to 4 hours old
 
-# ── URLs ───────────────────────────────────────────────────────────────────────
+# â”€â”€ URLs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _LOGIN_URL = "https://www.linkedin.com/login"
 _FEED_URL  = "https://www.linkedin.com/feed/"
 
-# ── Login selectors ────────────────────────────────────────────────────────────
+# â”€â”€ Login selectors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Verified against LinkedIn login page source.
 # name= attributes are tied to the form POST and are the most stable.
 # id= values are a reliable secondary fallback.
@@ -85,7 +86,7 @@ _LOGGED_IN_SELECTORS = [
     "div[data-control-name='identity_welcome_message']",
 ]
 
-# ── Job page selectors ─────────────────────────────────────────────────────────
+# â”€â”€ Job page selectors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # "Follow" prompt that sometimes blocks the Easy Apply button
 _FOLLOW_PROMPT_DISMISS = (
@@ -98,7 +99,7 @@ _AUTOCOMPLETE_RESULTS = (
     ".search-typeahead-v2__hit--autocomplete"
 )
 
-# Job page — aria-label based selectors survive LinkedIn UI/class renames
+# Job page â€” aria-label based selectors survive LinkedIn UI/class renames
 # Broad selector fallback for legacy DOMs. Primary detection uses role/name.
 _EASY_APPLY_BTN = (
     "button[aria-label*='Easy Apply'], "
@@ -117,8 +118,10 @@ _ALREADY_APPLIED = (
     "div.post-apply-timeline__entity, "
     "button[aria-label*='Applied']"
 )
+_ALREADY_APPLIED_TEXT = re.compile(r"application submitted|already applied|applied on", re.I)
+_JOB_SEARCH_SAFETY_REMINDER_TEXT = re.compile(r"job search safety reminder", re.I)
 
-# ── Modal selectors ────────────────────────────────────────────────────────────
+# â”€â”€ Modal selectors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _MODAL = "div.jobs-easy-apply-modal, div.jobs-apply-modal, div[role='dialog']"
 
@@ -225,10 +228,10 @@ class LinkedInApplier(BaseApplier):
         await super().setup()
         self._ensure_linkedin_state()
         self._auth_error = None
-        # 60 s timeout — LinkedIn pages can be slow; 30 s caused spurious failures.
+        # 60 s timeout â€” LinkedIn pages can be slow; 30 s caused spurious failures.
         self._bm = BrowserManager(
             user_data_dir=self._session_dir,
-            timeout_ms=60,          # passed to BrowserManager as seconds → *1000 inside
+            timeout_ms=60,          # passed to BrowserManager as seconds â†’ *1000 inside
         )
         await self._bm.start()
         self._page = await self._bm.new_page()
@@ -256,10 +259,10 @@ class LinkedInApplier(BaseApplier):
         if self._auth_error:
             return self._fail(job, self._auth_error)
 
-        # Re-verify session before each application — handles long pipelines
+        # Re-verify session before each application â€” handles long pipelines
         # where cookies expire mid-run.
         if not self._logged_in or not await self._is_logged_in(self._page):
-            logger.info("[LinkedIn] Session appears stale — re-authenticating …")
+            logger.info("[LinkedIn] Session appears stale â€” re-authenticating â€¦")
             self._logged_in = False
             await self._ensure_logged_in()
             if not self._logged_in:
@@ -275,7 +278,7 @@ class LinkedInApplier(BaseApplier):
         try:
             # Note: we do NOT gate on job.easy_apply here because the DB flag is often
             # wrong (Voyager API scrape sets description but not easy_apply).
-            # _easy_apply() navigates to the actual page and checks for the button live —
+            # _easy_apply() navigates to the actual page and checks for the button live â€”
             # that is the authoritative check. If there's no Easy Apply button, it skips.
             result = await self._easy_apply(
                 job,
@@ -527,7 +530,7 @@ class LinkedInApplier(BaseApplier):
                         )
                         continue
                 if not cookies.get("li_at"):
-                    logger.debug("[LinkedIn] Scraper cookies present but no li_at — skipping injection")
+                    logger.debug("[LinkedIn] Scraper cookies present but no li_at â€” skipping injection")
                     continue
                 if age > _COOKIE_MAX_AGE:
                     self._report_progress(
@@ -537,7 +540,7 @@ class LinkedInApplier(BaseApplier):
                     self._report_progress(
                         "[LinkedIn][Auth] Falling back to legacy LinkedIn cookies for the same account"
                     )
-                # Convert flat dict → Playwright cookie objects
+                # Convert flat dict â†’ Playwright cookie objects
                 pw_cookies = [
                     {
                         "name": k,
@@ -560,7 +563,7 @@ class LinkedInApplier(BaseApplier):
                 return True
             except Exception as exc:
                 logger.warning(f"[LinkedIn] Cookie injection failed from {path}: {exc}")
-        logger.debug("[LinkedIn] No authenticated scraper cookie file found — will log in fresh")
+        logger.debug("[LinkedIn] No authenticated scraper cookie file found â€” will log in fresh")
         return False
 
     async def _is_logged_in(self, page: Page) -> bool:
@@ -592,7 +595,7 @@ class LinkedInApplier(BaseApplier):
     async def _ensure_logged_in(self) -> bool:
         """
         Establish an authenticated LinkedIn session via the most efficient path:
-        1. Inject warm scraper cookies → navigate to feed → done if session is live.
+        1. Inject warm scraper cookies â†’ navigate to feed â†’ done if session is live.
         2. Perform a fresh form-based login with human-like delays.
         3. Save fresh cookies back to disk for the next run.
         """
@@ -609,10 +612,10 @@ class LinkedInApplier(BaseApplier):
                 f"[LinkedIn][Auth] Using {credential_source} credentials for {masked_username}"
             )
 
-        # ── 2. Inject warm scraper cookies ──────────────────────────────────
+        # â”€â”€ 2. Inject warm scraper cookies â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         await self._inject_scraper_cookies()
 
-        # ── 3. Check if already logged in ───────────────────────────────────
+        # â”€â”€ 3. Check if already logged in â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         try:
             await page.goto(_FEED_URL, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(1.5)
@@ -621,24 +624,24 @@ class LinkedInApplier(BaseApplier):
 
         if await self._is_logged_in(page):
             self._report_progress("[LinkedIn][Auth] Session active")
-            logger.info("[LinkedIn] Session active — already logged in ✓")
+            logger.info("[LinkedIn] Session active â€” already logged in âœ“")
             self._logged_in = True
             return True
             return
 
-        # ── 4. Fresh login ───────────────────────────────────────────────────
+        # â”€â”€ 4. Fresh login â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if not username or not password:
             logger.warning(
                 "[LinkedIn] No credentials available. "
                 "Set LINKEDIN_EMAIL + LINKEDIN_PASSWORD env vars, "
-                "or enter them in the Profile → Job Board Credentials section."
+                "or enter them in the Profile â†’ Job Board Credentials section."
             )
             return self._set_auth_error(
                 "No LinkedIn credentials are configured for the active profile."
             )
             return
 
-        logger.info(f"[LinkedIn] Logging in as {username} …")
+        logger.info(f"[LinkedIn] Logging in as {username} â€¦")
         self._report_progress(
             f"[LinkedIn][Auth] Logging in as {mask_linkedin_username(username)}"
         )
@@ -654,7 +657,7 @@ class LinkedInApplier(BaseApplier):
         if "/login" not in page.url and "/checkpoint" not in page.url:
             if await self._is_logged_in(page):
                 self._report_progress("[LinkedIn][Auth] Persistent profile session detected")
-                logger.info("[LinkedIn] Persistent profile session detected — already logged in ✓")
+                logger.info("[LinkedIn] Persistent profile session detected â€” already logged in âœ“")
                 self._logged_in = True
                 return
 
@@ -665,34 +668,35 @@ class LinkedInApplier(BaseApplier):
             await page.wait_for_selector("input#username", state="visible", timeout=8_000)
             form_visible = True
         except PWTimeoutError:
-            # Login form not visible — three possible cases:
-            # 1. Persistent profile cookie already authenticated → redirected to /feed (success!)
-            # 2. LinkedIn showing checkpoint/CAPTCHA → cannot proceed automatically
+            # Login form not visible â€” three possible cases:
+            # 1. Persistent profile cookie already authenticated â†’ redirected to /feed (success!)
+            # 2. LinkedIn showing checkpoint/CAPTCHA â†’ cannot proceed automatically
             # 3. Network issue or unexpected page state
-            # IMPORTANT: never clear_cookies() here — that destroys the valid li_at token
+            # IMPORTANT: never clear_cookies() here â€” that destroys the valid li_at token
             # that was just injected from the scraper warm cookies.
             if await self._is_logged_in(page):
-                logger.info("[LinkedIn] Already logged in (persistent profile active) ✓")
+                logger.info("[LinkedIn] Already logged in (persistent profile active) âœ“")
                 self._logged_in = True
                 return
-            if any(s in page.url for s in ("checkpoint", "challenge", "captcha")):
-                await self._bm.screenshot(page, "linkedin_login_checkpoint")
-                self._set_auth_error(
-                    "LinkedIn presented a security checkpoint or CAPTCHA for this account."
+            challenge = await detect_linkedin_auth_challenge(page)
+            if challenge:
+                screenshot_name = (
+                    "linkedin_login_2fa_required"
+                    if challenge.kind == "2fa_required"
+                    else "linkedin_login_checkpoint"
                 )
+                await self._bm.screenshot(page, screenshot_name)
+                self._set_auth_error(challenge.message)
+                self._report_progress(f"[LinkedIn][Auth] {challenge.message}", level="warning")
                 logger.error(
-                    "[LinkedIn] LinkedIn is showing a security checkpoint at "
-                    f"{page.url}. "
-                    "Fix: set HEADLESS_BROWSER=false in your .env, run the pipeline once, "
-                    "solve the challenge manually — the session cookie persists for future runs."
+                    f"[LinkedIn] {challenge.message} Current URL: {page.url}. "
+                    "Automation cannot continue until LinkedIn login succeeds."
                 )
                 return
             await self._bm.screenshot(page, "linkedin_login_no_form")
-            self._set_auth_error(
-                f"LinkedIn login form was not visible at {page.url}."
-            )
+            self._set_auth_error(f"LinkedIn login form was not visible at {page.url}.")
             logger.error(
-                f"[LinkedIn] Login form not visible at {page.url} — cannot authenticate. "
+                f"[LinkedIn] Login form not visible at {page.url} â€” cannot authenticate. "
                 "Try running with HEADLESS_BROWSER=false to diagnose."
             )
             return
@@ -726,21 +730,25 @@ class LinkedInApplier(BaseApplier):
         await asyncio.sleep(2.5)
 
         current_url = page.url
-        if "checkpoint" in current_url or "challenge" in current_url:
-            await self._bm.screenshot(page, "linkedin_login_checkpoint")
-            self._set_auth_error(
-                "LinkedIn login requires manual verification for this account."
+        challenge = await detect_linkedin_auth_challenge(page)
+        if challenge:
+            screenshot_name = (
+                "linkedin_login_2fa_required"
+                if challenge.kind == "2fa_required"
+                else "linkedin_login_checkpoint"
             )
+            await self._bm.screenshot(page, screenshot_name)
+            self._set_auth_error(challenge.message)
+            self._report_progress(f"[LinkedIn][Auth] {challenge.message}", level="warning")
             logger.warning(
-                "[LinkedIn] Login requires manual verification (CAPTCHA / 2-FA). "
-                "Set HEADLESS_BROWSER=false in your .env, solve the checkpoint once, "
-                "then restart — the session cookie will persist across runs."
+                f"[LinkedIn] {challenge.message} Current URL: {current_url}. "
+                "Set HEADLESS_BROWSER=false only if you need to diagnose the exact challenge page."
             )
             return
 
         if await self._is_logged_in(page):
             self._logged_in = True
-            logger.info("[LinkedIn] Login successful ✓")
+            logger.info("[LinkedIn] Login successful âœ“")
             # Save fresh cookies so the next run can inject and skip the form.
             try:
                 raw = await page.context.cookies("https://www.linkedin.com")
@@ -761,6 +769,12 @@ class LinkedInApplier(BaseApplier):
                 logger.warning(f"[LinkedIn] Could not save cookies: {exc}")
         else:
             await self._bm.screenshot(page, "linkedin_login_failed")
+            challenge = await detect_linkedin_auth_challenge(page)
+            if challenge:
+                self._set_auth_error(challenge.message)
+                self._report_progress(f"[LinkedIn][Auth] {challenge.message}", level="warning")
+                logger.warning(f"[LinkedIn] Login failed due to auth challenge: {challenge.message}")
+                return
             self._set_auth_error(
                 f"LinkedIn login did not complete successfully (current URL: {current_url})."
             )
@@ -783,10 +797,10 @@ class LinkedInApplier(BaseApplier):
         self._tailored_resume_path = tailored_resume_path
         self._cover_letter_text = cover_letter
         self._report_progress(f"[LinkedIn][Apply] Starting Easy Apply for {job.title} @ {job.company}")
-        logger.info(f"[LinkedIn] Easy Apply → {job.title} @ {job.company}")
+        logger.info(f"[LinkedIn] Easy Apply â†’ {job.title} @ {job.company}")
 
-        # Navigate to job page — normalize locale subdomains first (safety net for
-        # URLs stored in DB before the scraper fix, e.g. de.linkedin.com → www.linkedin.com)
+        # Navigate to job page â€” normalize locale subdomains first (safety net for
+        # URLs stored in DB before the scraper fix, e.g. de.linkedin.com â†’ www.linkedin.com)
         job_url = re.sub(r"https://[a-z]{2}\.linkedin\.com/", "https://www.linkedin.com/", job.url)
         self._report_progress(f"[LinkedIn][Apply] Opening job page: {job_url}")
         try:
@@ -798,7 +812,7 @@ class LinkedInApplier(BaseApplier):
         # Detect mid-run session expiry
         if "/login" in page.url or "/authwall" in page.url:
             self._report_progress("[LinkedIn][Auth] Redirected to login mid-run")
-            logger.info("[LinkedIn] Redirected to login mid-run — re-authenticating …")
+            logger.info("[LinkedIn] Redirected to login mid-run â€” re-authenticating â€¦")
             await self._ensure_logged_in()
             if not self._logged_in:
                 return self._fail(
@@ -809,8 +823,13 @@ class LinkedInApplier(BaseApplier):
             await asyncio.sleep(2.0)
 
         # Already applied to this job?
-        if await page.locator(_ALREADY_APPLIED).count() > 0:
-            return self._skip(job, "Already applied to this job")
+        if await self._job_already_submitted(page):
+            message = "Application already submitted for this job"
+            self._report_progress(
+                f"[LinkedIn][Apply] Application already submitted for {job.title} @ {job.company}"
+            )
+            logger.info(f"[LinkedIn] Application already submitted: {job.title} @ {job.company}")
+            return self._ok(job, message=message)
 
         # Dismiss overlay prompts before looking for the apply button
         await self._dismiss_prompts(page)
@@ -826,6 +845,13 @@ class LinkedInApplier(BaseApplier):
             easy_btn, generic_btn = await self._wait_for_apply_controls(page, timeout_ms=6_000)
 
         if not easy_btn:
+            if await self._job_already_submitted(page):
+                message = "Application already submitted for this job"
+                self._report_progress(
+                    f"[LinkedIn][Apply] Application already submitted for {job.title} @ {job.company}"
+                )
+                logger.info(f"[LinkedIn] Application already submitted: {job.title} @ {job.company}")
+                return self._ok(job, message=message)
             # Auth check — if session was lost the page redirects to authwall
             if "/authwall" in page.url or "/login" in page.url:
                 return self._fail(
@@ -854,9 +880,30 @@ class LinkedInApplier(BaseApplier):
             pass
         await btn.click()
 
+        if await self._job_search_safety_reminder_visible(page):
+            message = "LinkedIn triggered Job Search Safety Reminder for this job. Skipping it."
+            self._report_progress(
+                f"[LinkedIn][Apply] LinkedIn triggered Job Search Safety Reminder for {job.title} @ {job.company}. Skipping it.",
+                level="warning",
+            )
+            logger.warning(f"[LinkedIn] Job Search Safety Reminder shown for {job.title} @ {job.company}")
+            await self._bm.screenshot(page, f"safety_reminder_{job.external_id}")
+            return self._skip(job, message)
+
         try:
             await page.wait_for_selector(_MODAL, timeout=25_000)
         except PWTimeoutError:
+            if await self._job_search_safety_reminder_visible(page):
+                message = "LinkedIn triggered Job Search Safety Reminder for this job. Skipping it."
+                self._report_progress(
+                    f"[LinkedIn][Apply] LinkedIn triggered Job Search Safety Reminder for {job.title} @ {job.company}. Skipping it.",
+                    level="warning",
+                )
+                logger.warning(
+                    f"[LinkedIn] Job Search Safety Reminder shown for {job.title} @ {job.company}"
+                )
+                await self._bm.screenshot(page, f"safety_reminder_{job.external_id}")
+                return self._skip(job, message)
             try:
                 modal = page.locator(_MODAL).first
                 if await modal.count() == 0 or not await modal.is_visible():
@@ -891,7 +938,7 @@ class LinkedInApplier(BaseApplier):
                 await self._click_modal_button(page, submit, "submit")
                 await asyncio.sleep(2)
                 await self._bm.screenshot(page, f"post_submit_{job.external_id}")
-                logger.info(f"[LinkedIn] ✓ Application submitted: {job.title} @ {job.company}")
+                logger.info(f"[LinkedIn] âœ“ Application submitted: {job.title} @ {job.company}")
                 self._report_progress(
                     f"[LinkedIn][Submit] Application submitted for {job.title} @ {job.company}"
                 )
@@ -912,7 +959,7 @@ class LinkedInApplier(BaseApplier):
                 await self._bm.screenshot(page, f"form_error_{job.external_id}_{step}")
                 return self._fail(job, f"Form validation error: {error_text}")
 
-            # Stuck detection — same step label twice in a row
+            # Stuck detection â€” same step label twice in a row
             if step_label and step_label == prev_step_label:
                 stuck_count += 1
                 if stuck_count >= 2:
@@ -936,7 +983,7 @@ class LinkedInApplier(BaseApplier):
                 )
                 logger.warning(f"[LinkedIn] No Next/Submit button at step {step + 1}")
                 await self._bm.screenshot(page, f"no_next_{job.external_id}_{step}")
-                return self._fail(job, f"Stuck at modal step {step + 1} — no Next button")
+                return self._fail(job, f"Stuck at modal step {step + 1} â€” no Next button")
 
         return self._fail(job, "Exceeded max modal steps without submitting")
 
@@ -977,6 +1024,27 @@ class LinkedInApplier(BaseApplier):
         except Exception:
             pass
         return ""
+
+    async def _job_already_submitted(self, page: Page) -> bool:
+        try:
+            indicator = page.locator(_ALREADY_APPLIED)
+            if await indicator.count() > 0 and await indicator.first.is_visible():
+                return True
+        except Exception:
+            pass
+
+        candidates = [
+            page.get_by_text(_ALREADY_APPLIED_TEXT),
+            page.locator("text=/Application submitted/i"),
+        ]
+        return await self._first_visible(candidates) is not None
+
+    async def _job_search_safety_reminder_visible(self, page: Page) -> bool:
+        candidates = [
+            page.get_by_text(_JOB_SEARCH_SAFETY_REMINDER_TEXT),
+            page.locator("text=/Job search safety reminder/i"),
+        ]
+        return await self._first_visible(candidates) is not None
 
     async def _first_visible(self, candidates: list[Locator]) -> Locator | None:
         for candidate in candidates:
@@ -1698,7 +1766,7 @@ class LinkedInApplier(BaseApplier):
         raise RuntimeError(f"Could not select radio '{target_name}'")
 
     async def _handle_resume_upload(self, page: Page) -> None:
-        """Upload resume — prefer tailored PDF, fall back to profile resume."""
+        """Upload resume â€” prefer tailored PDF, fall back to profile resume."""
         tailored = getattr(self, "_tailored_resume_path", None)
         if tailored and Path(tailored).exists():
             resume_path = Path(tailored)

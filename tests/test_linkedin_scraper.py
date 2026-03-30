@@ -13,6 +13,12 @@ import pytest
 
 from src.models import ExperienceLevel, JobSearchFilter, JobType, WorkMode
 from src.scrapers.linkedin import LinkedInScraper
+from src.services.linkedin_state import (
+    detect_linkedin_auth_challenge,
+    linkedin_checkpoint_auth_message,
+    linkedin_two_factor_auth_guidance,
+    linkedin_two_factor_auth_message,
+)
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -94,6 +100,68 @@ def make_scraper() -> LinkedInScraper:
     scraper._warm_attempted = False
     scraper._detail_api_authwall_backoff_until = 0.0
     return scraper
+
+
+class _FakeChallengeLocator:
+    def __init__(self, *, visible: bool = False, text: str = "", count: int | None = None):
+        self.visible = visible
+        self.text = text
+        self._count = 1 if count is None and (visible or text) else (count or 0)
+        self.first = self
+
+    async def count(self) -> int:
+        return self._count
+
+    async def is_visible(self) -> bool:
+        return self.visible
+
+    async def inner_text(self) -> str:
+        return self.text
+
+
+class _FakeChallengePage:
+    def __init__(self, *, url: str, body_text: str = "", visible_selectors: set[str] | None = None):
+        self.url = url
+        self.body = _FakeChallengeLocator(visible=True, text=body_text, count=1)
+        self.visible_selectors = visible_selectors or set()
+
+    def locator(self, selector: str):
+        if selector == "body":
+            return self.body
+        return _FakeChallengeLocator(visible=selector in self.visible_selectors)
+
+
+def test_linkedin_two_factor_auth_guidance_mentions_disabling_2fa():
+    guidance = linkedin_two_factor_auth_guidance()
+    assert "Disable 2-factor authentication" in guidance
+
+
+@pytest.mark.asyncio
+async def test_detect_linkedin_auth_challenge_identifies_mobile_approval_text():
+    page = _FakeChallengePage(
+        url="https://www.linkedin.com/checkpoint/challenge",
+        body_text="Approve sign in on your mobile device to continue.",
+    )
+
+    challenge = await detect_linkedin_auth_challenge(page)
+
+    assert challenge is not None
+    assert challenge.kind == "2fa_required"
+    assert challenge.message == linkedin_two_factor_auth_message()
+
+
+@pytest.mark.asyncio
+async def test_detect_linkedin_auth_challenge_identifies_generic_checkpoint():
+    page = _FakeChallengePage(
+        url="https://www.linkedin.com/checkpoint/challenge",
+        body_text="Let's do a quick security check before you continue.",
+    )
+
+    challenge = await detect_linkedin_auth_challenge(page)
+
+    assert challenge is not None
+    assert challenge.kind == "checkpoint_or_captcha"
+    assert challenge.message == linkedin_checkpoint_auth_message()
 
 
 def test_ensure_linkedin_state_scopes_paths_to_credentials():
