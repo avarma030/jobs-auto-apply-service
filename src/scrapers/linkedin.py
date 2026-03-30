@@ -153,7 +153,7 @@ class LinkedInScraper(BaseScraper):
 
     board_name = "LinkedIn"
     board_slug = "linkedin"
-    requires_auth = False
+    requires_auth = True
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -172,12 +172,21 @@ class LinkedInScraper(BaseScraper):
         # Load cached cookies — warm a fresh session if missing / stale
         cached = self._load_cookies()
         if cached:
-            logger.info(f"[LinkedIn] Loaded {len(cached)} cached cookies from disk")
+            logger.info(
+                f"[LinkedIn] Loaded {len(cached)} cached cookies from disk "
+                f"(authenticated={self._has_authenticated_cookie(cached)})"
+            )
             self._cookies = cached
         else:
             self._cookies = await self._warm_session()
             if self._cookies:
                 self._save_cookies(self._cookies)
+
+        if not self.has_authenticated_session():
+            raise RuntimeError(
+                "LinkedIn authentication unavailable: an authenticated LinkedIn session "
+                "is required for deterministic scraping and Easy Apply verification."
+            )
 
         self._client = self._make_client()
 
@@ -301,7 +310,7 @@ class LinkedInScraper(BaseScraper):
                     guest_cookies = cookies
             except Exception as exc:
                 logger.warning(f"[LinkedIn] Failed to load cookies from {path}: {exc}")
-        return guest_cookies
+        return None
 
     def _save_cookies(self, cookies: dict) -> None:
         """Persist cookies with a timestamp."""
@@ -459,6 +468,13 @@ class LinkedInScraper(BaseScraper):
             # else: form was not found → outer loop will clear dir and retry
 
         if not self._has_authenticated_cookie(cookies):
+            raise RuntimeError(
+                "LinkedIn authentication unavailable: could not obtain an authenticated "
+                f"session after {attempt + 1} attempt(s). Run once with "
+                "HEADLESS_BROWSER=false, complete any LinkedIn security challenge for "
+                "this account, then retry."
+            )
+        if not self._has_authenticated_cookie(cookies):
             logger.warning(
                 f"[LinkedIn] Could not obtain an authenticated session after {attempt + 1} attempt(s). "
                 "Proceeding with unauthenticated cookies (scraping may be limited). "
@@ -472,6 +488,11 @@ class LinkedInScraper(BaseScraper):
     # ------------------------------------------------------------------
 
     async def search(self, search_filter: JobSearchFilter) -> AsyncIterator[Job]:  # type: ignore[override]
+        if not self.has_authenticated_session():
+            raise RuntimeError(
+                "LinkedIn scraping requires an authenticated session; cannot reliably "
+                "verify Easy Apply jobs or fetch complete job details."
+            )
         params = self._build_search_params(search_filter)
         seen_ids: set[str] = set()
         cutoff = search_filter.age_cutoff_utc()
@@ -530,8 +551,8 @@ class LinkedInScraper(BaseScraper):
                 card_easy_apply = card.get("easy_apply", False)
                 if search_filter.easy_apply_only and not card_easy_apply:
                     logger.debug(
-                        f"[LinkedIn] Search card {job_id} has no Easy Apply badge - "
-                        "verifying via detail fetch before filtering"
+                        f"[LinkedIn] Search card {job_id} is missing an Easy Apply badge - "
+                        "verifying via authenticated detail fetch before filtering"
                     )
 
                 job = self._make_job(
@@ -570,6 +591,11 @@ class LinkedInScraper(BaseScraper):
         """
         if not job.external_id:
             return job
+        if not self.has_authenticated_session():
+            raise RuntimeError(
+                "LinkedIn authentication unavailable: cannot fetch complete job details "
+                "or verify Easy Apply for this run."
+            )
 
         # ── Tier 1: Voyager API (authenticated JSON) ──────────────────────────
         if self._cookies.get("li_at"):
@@ -582,6 +608,12 @@ class LinkedInScraper(BaseScraper):
                 logger.debug(f"[LinkedIn] Voyager failed for {job.external_id}: {exc}")
 
         # ── Tier 2: Guest posting API (server-rendered HTML fragment) ─────────
+        try:
+            return await self._fetch_details_playwright(job)
+        except Exception as exc:
+            logger.warning(f"[LinkedIn] All detail methods failed for {job.external_id}: {exc}")
+            return job
+
         try:
             url = _JOB_POSTING_API_URL.format(job_id=job.external_id)
             html = await self._fetch_page(url)
@@ -905,11 +937,10 @@ class LinkedInScraper(BaseScraper):
             and self._detail_api_authwall_backoff_until > time.time()
         ):
             remaining = int(self._detail_api_authwall_backoff_until - time.time())
-            logger.debug(
-                "[LinkedIn] Guest detail API backoff active "
-                f"({remaining}s remaining) - falling back to browser verification"
+            raise RuntimeError(
+                "[LinkedIn] Guest detail API backoff is active "
+                f"({remaining}s remaining) and authenticated detail verification is required"
             )
-            return ""
 
         try:
             resp = await self._client.get(url)
@@ -940,12 +971,10 @@ class LinkedInScraper(BaseScraper):
                 self._detail_api_authwall_backoff_until = (
                     time.time() + _DETAIL_API_AUTHWALL_BACKOFF_SECONDS
                 )
-                logger.warning(
+                raise RuntimeError(
                     "[LinkedIn] Guest detail API remained blocked after re-warm "
-                    f"({resp.status_code}, authenticated={self.has_authenticated_session()}) - "
-                    "backing off detail API and falling back to browser verification"
+                    f"({resp.status_code}, authenticated={self.has_authenticated_session()})"
                 )
-                return ""
             logger.warning("[LinkedIn] Still blocked after re-warm - rotating proxy/UA")
             proxy = self._next_proxy()
             await self._client.close()
@@ -965,17 +994,14 @@ class LinkedInScraper(BaseScraper):
                 self._detail_api_authwall_backoff_until = (
                     time.time() + _DETAIL_API_AUTHWALL_BACKOFF_SECONDS
                 )
-                logger.warning(
+                raise RuntimeError(
                     "[LinkedIn] Guest detail API still returned auth-wall after re-warm "
-                    f"(authenticated={self.has_authenticated_session()}) - "
-                    "backing off detail API and falling back to browser verification"
+                    f"(authenticated={self.has_authenticated_session()})"
                 )
-                return ""
-            logger.warning(
-                "[LinkedIn] Still getting auth-wall after re-warm. "
-                "Consider adding LinkedIn credentials or proxies (USE_PROXIES=true)."
+            raise RuntimeError(
+                "[LinkedIn] Still getting auth-wall after re-warm; authenticated scraping "
+                "cannot continue safely."
             )
-            return ""
 
         return html
 

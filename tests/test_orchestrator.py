@@ -229,6 +229,44 @@ async def test_run_apply_persists_learned_answers_from_applier(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_apply_halts_remaining_linkedin_jobs_after_auth_failure(monkeypatch):
+    records = [make_job_record(1), make_job_record(2)]
+    db = FakeDb(records)
+    orch = Orchestrator(profile=make_profile(), db=db)
+    progress_messages: list[str] = []
+
+    class FailingApplier:
+        def __init__(self):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            return None
+
+        async def apply(self, job, tailored_resume_path=None, cover_letter=None):
+            self.calls += 1
+            return ApplicationResult(
+                job,
+                ApplicationStatus.FAILED,
+                message="LinkedIn authentication unavailable: manual verification required.",
+            )
+
+    applier = FailingApplier()
+    monkeypatch.setattr(orch, "_pick_applier", lambda job: applier)
+    monkeypatch.setattr(settings, "dry_run", False)
+
+    counts = await orch.run_apply(user_id=42, progress_callback=progress_messages.append)
+
+    assert counts["failed"] == 2
+    assert applier.calls == 1
+    assert any("Halting remaining applications for this board" in message for message in progress_messages)
+    assert db.status_updates[0]["notes"].startswith("LinkedIn authentication unavailable")
+    assert db.status_updates[1]["notes"].startswith("LinkedIn authentication unavailable")
+
+
+@pytest.mark.asyncio
 async def test_handle_new_questions_preserves_prompt_metadata_and_normalizes_keys(monkeypatch):
     db = FakeDb([])
     orch = Orchestrator(profile=make_profile(), db=db)
@@ -355,7 +393,7 @@ class FalseEasyApplyScraper(FakeScraper):
 
 
 @pytest.mark.asyncio
-async def test_scrape_board_easy_apply_only_keeps_candidate_when_linkedin_session_is_degraded(monkeypatch):
+async def test_scrape_board_easy_apply_only_fails_closed_when_linkedin_session_is_degraded(monkeypatch):
     db = FakeDb([])
     orch = Orchestrator(profile=make_profile(), db=db)
     fake_scraper = FalseEasyApplyScraper(authenticated=False)
@@ -367,23 +405,21 @@ async def test_scrape_board_easy_apply_only_keeps_candidate_when_linkedin_sessio
     )
     monkeypatch.setattr(settings, "request_delay_seconds", 0)
 
-    count = await orch._scrape_board(
-        "linkedin",
-        JobSearchFilter(
-            keywords=["platform engineer"],
-            easy_apply_only=True,
-            max_age_days=0,
-            max_jobs=1,
-        ),
-        user_id=9,
-        run_id="run-keep",
-    )
+    with pytest.raises(RuntimeError, match="LinkedIn authentication unavailable"):
+        await orch._scrape_board(
+            "linkedin",
+            JobSearchFilter(
+                keywords=["platform engineer"],
+                easy_apply_only=True,
+                max_age_days=0,
+                max_jobs=1,
+            ),
+            user_id=9,
+            run_id="run-keep",
+        )
 
-    assert count == 1
     assert fake_scraper.detail_calls == ["10"]
-    assert len(db.upserted_jobs) == 1
-    assert db.upserted_jobs[0]["job"].external_id == "10"
-    assert db.upserted_jobs[0]["job"].easy_apply is False
+    assert db.upserted_jobs == []
 
 
 @pytest.mark.asyncio

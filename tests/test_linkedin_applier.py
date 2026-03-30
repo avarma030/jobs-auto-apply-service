@@ -79,6 +79,7 @@ def make_applier(profile: UserProfile | None = None) -> LinkedInApplier:
     applier._answered_questions = []
     applier._learned_answers = {}
     applier._answered_question_index = {}
+    applier._auth_error = None
     return applier
 
 
@@ -382,6 +383,20 @@ async def test_apply_fails_if_browser_not_initialised():
     result = await applier.apply(job)
     assert result.status == ApplicationStatus.FAILED
     assert "Browser not initialised" in result.message
+
+
+@pytest.mark.asyncio
+async def test_apply_fails_fast_when_linkedin_auth_is_unavailable():
+    applier = make_applier()
+    applier._page = MagicMock()
+    applier._auth_error = "LinkedIn authentication unavailable: manual verification required."
+    applier._easy_apply = AsyncMock()
+
+    result = await applier.apply(make_job())
+
+    assert result.status == ApplicationStatus.FAILED
+    assert "LinkedIn authentication unavailable" in result.message
+    applier._easy_apply.assert_not_awaited()
 
 
 @pytest.mark.asyncio

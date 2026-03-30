@@ -214,6 +214,15 @@ def test_load_cookies_refuses_legacy_authenticated_cookie_file_for_other_account
     assert cookies is None
 
 
+@pytest.mark.asyncio
+async def test_search_requires_authenticated_session():
+    scraper = make_scraper()
+    search_iter = scraper.search(JobSearchFilter(keywords=["product manager"]))
+
+    with pytest.raises(RuntimeError, match="LinkedIn scraping requires an authenticated session"):
+        await anext(search_iter)
+
+
 # ── Tests: _parse_job_cards ───────────────────────────────────────────────────
 
 class TestParseJobCards:
@@ -409,6 +418,11 @@ async def test_get_job_details_enriches_job():
     ))
     mock_client.headers = {}
     scraper._client = mock_client
+    scraper._cookies = {"li_at": "auth-cookie"}
+    scraper._fetch_details_voyager = AsyncMock(side_effect=RuntimeError("voyager unavailable"))
+    scraper._fetch_details_playwright = AsyncMock(
+        side_effect=lambda job: scraper._parse_detail_html(SAMPLE_DETAIL_HTML, job)
+    )
 
     job = Job(
         title="Senior Python Engineer",
@@ -432,6 +446,7 @@ async def test_get_job_details_enriches_job():
 @pytest.mark.asyncio
 async def test_search_yields_jobs_and_stops_on_empty():
     scraper = make_scraper()
+    scraper._cookies = {"li_at": "auth-cookie"}
 
     call_count = 0
 
@@ -459,6 +474,7 @@ async def test_search_yields_jobs_and_stops_on_empty():
 @pytest.mark.asyncio
 async def test_search_deduplicates_same_job_id():
     scraper = make_scraper()
+    scraper._cookies = {"li_at": "auth-cookie"}
     call_count = 0
 
     async def fake_fetch(params):
@@ -483,6 +499,7 @@ async def test_search_deduplicates_same_job_id():
 @pytest.mark.asyncio
 async def test_search_easy_apply_only_defers_filter_until_detail_fetch():
     scraper = make_scraper()
+    scraper._cookies = {"li_at": "auth-cookie"}
     call_count = 0
 
     async def fake_fetch(params):
@@ -510,7 +527,7 @@ async def test_search_easy_apply_only_defers_filter_until_detail_fetch():
 
 
 @pytest.mark.asyncio
-async def test_guest_detail_authwall_enters_backoff_and_falls_back_to_browser():
+async def test_guest_detail_authwall_enters_backoff_and_fails_closed():
     scraper = make_scraper()
     scraper._rewarm = AsyncMock()
     scraper._client = MagicMock()
@@ -526,11 +543,11 @@ async def test_guest_detail_authwall_enters_backoff_and_falls_back_to_browser():
         "src.scrapers.linkedin.time.time",
         side_effect=[100.0, 101.0, 102.0, 150.0, 150.0],
     ):
-        html = await scraper._get(url)
-        second_html = await scraper._get(url)
+        with pytest.raises(RuntimeError, match="Guest detail API still returned auth-wall"):
+            await scraper._get(url)
+        with pytest.raises(RuntimeError, match="Guest detail API backoff is active"):
+            await scraper._get(url)
 
-    assert html == ""
-    assert second_html == ""
     assert scraper._rewarm.await_count == 1
     assert scraper._client.get.await_count == 2
     assert scraper._detail_api_authwall_backoff_until == 402.0

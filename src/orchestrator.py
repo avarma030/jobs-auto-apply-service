@@ -98,11 +98,16 @@ class Orchestrator:
             if board in SCRAPER_REGISTRY
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        auth_failure: Exception | None = None
         for r in results:
             if isinstance(r, Exception):
+                if self._is_fatal_linkedin_auth_error(r):
+                    auth_failure = r
                 logger.error(f"Scrape task failed: {r}")
             else:
                 total += r  # type: ignore[operator]
+        if auth_failure is not None:
+            raise auth_failure
         logger.info(f"Scraping complete — {total} new jobs found")
         return total
 
@@ -132,8 +137,27 @@ class Orchestrator:
             "skipped": 0,
             "dry_run": 0,
         }
+        blocked_boards: dict[str, str] = {}
         for record in pending:
             job = self._record_to_job(record)
+            board_block_reason = blocked_boards.get(job.source_board)
+            if board_block_reason:
+                counts["failed"] += 1
+                _emit(
+                    f"  ⚠️  Application result for '{job.title}': failed — {board_block_reason}"
+                )
+                await self.db.update_job_status(
+                    record.id,
+                    ApplicationStatus.FAILED,
+                    notes=board_block_reason,
+                )
+                await self.db.log_application(
+                    record.id,
+                    ApplicationStatus.FAILED,
+                    message=board_block_reason,
+                    user_id=user_id,
+                )
+                continue
             cover_letter_text: str | None = None
             if getattr(record, "cover_letter_path", None):
                 cl_path = Path(record.cover_letter_path)
@@ -162,6 +186,11 @@ class Orchestrator:
                 logger.error(f"Applier error for job {record.id}: {exc}")
                 counts["failed"] += 1
                 await self.db.update_job_status(record.id, ApplicationStatus.FAILED, notes=str(exc))
+                if self._should_halt_board_after_failure(job.source_board, str(exc)):
+                    blocked_boards[job.source_board] = str(exc)
+                    _emit(
+                        f"[{job.source_board}] Halting remaining applications for this board: {exc}"
+                    )
                 continue
 
             status = result.status
@@ -184,6 +213,14 @@ class Orchestrator:
                 message=result.message,
                 user_id=user_id,
             )
+            if status == ApplicationStatus.FAILED and self._should_halt_board_after_failure(
+                job.source_board, result.message
+            ):
+                blocked_boards[job.source_board] = result.message or "Authentication unavailable"
+                _emit(
+                    f"[{job.source_board}] Halting remaining applications for this board: "
+                    f"{blocked_boards[job.source_board]}"
+                )
             if result.learned_answers:
                 saved_count = await self._persist_custom_answers(
                     result.learned_answers,
@@ -654,6 +691,8 @@ class Orchestrator:
                     try:
                         job = await scraper.get_job_details(job)
                     except Exception as exc:
+                        if self._is_fatal_linkedin_auth_error(exc):
+                            raise
                         logger.warning(f"[{board}] Detail fetch failed for {job.title}: {exc}")
                     # After detail fetch the easy_apply flag may have been updated;
                     # drop the job if it doesn't meet the easy-apply-only filter.
@@ -674,8 +713,12 @@ class Orchestrator:
                             continue
                         logger.warning(
                             f"[{board}] Could not strictly verify Easy Apply without an "
-                            f"authenticated LinkedIn session - keeping candidate for live "
-                            f"apply verification: {job.title}"
+                            f"authenticated LinkedIn session - aborting LinkedIn scrape "
+                            f"because Easy Apply cannot be verified accurately: {job.title}"
+                        )
+                        raise RuntimeError(
+                            "LinkedIn authentication unavailable: could not verify Easy Apply "
+                            "accurately for this run."
                         )
                     await self.db.upsert_job(job, user_id=user_id, scrape_run_id=run_id)
                     count += 1
@@ -689,6 +732,8 @@ class Orchestrator:
         except NotImplementedError:
             logger.warning(f"[{board}] Scraper not yet implemented — skipping")
         except Exception as exc:
+            if self._is_fatal_linkedin_auth_error(exc):
+                raise
             logger.error(f"[{board}] Scraper error: {exc}")
         return count
 
@@ -698,6 +743,15 @@ class Orchestrator:
             if instance.can_apply(job):
                 return instance
         return GenericApplier(profile=self.profile)
+
+    @staticmethod
+    def _should_halt_board_after_failure(board: str, message: str | None) -> bool:
+        text = (message or "").lower()
+        return board == "linkedin" and text.startswith("linkedin authentication unavailable")
+
+    @staticmethod
+    def _is_fatal_linkedin_auth_error(exc: Exception) -> bool:
+        return str(exc).lower().startswith("linkedin authentication unavailable")
 
     def _get_creds(self, board: str) -> dict:
         accounts = self.profile.job_board_accounts

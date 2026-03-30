@@ -192,6 +192,7 @@ class LinkedInApplier(BaseApplier):
         self._linkedin_password = ""
         self._linkedin_identity = ""
         self._linkedin_credential_source = "unknown"
+        self._auth_error: str | None = None
 
     def _resolve_linkedin_credentials(self) -> tuple[str, str, str]:
         creds = self.profile.job_board_accounts.linkedin
@@ -223,6 +224,7 @@ class LinkedInApplier(BaseApplier):
     async def setup(self) -> None:
         await super().setup()
         self._ensure_linkedin_state()
+        self._auth_error = None
         # 60 s timeout — LinkedIn pages can be slow; 30 s caused spurious failures.
         self._bm = BrowserManager(
             user_data_dir=self._session_dir,
@@ -251,6 +253,8 @@ class LinkedInApplier(BaseApplier):
             return self._skip(job, "Not a LinkedIn job")
         if not self._page:
             return self._fail(job, "Browser not initialised")
+        if self._auth_error:
+            return self._fail(job, self._auth_error)
 
         # Re-verify session before each application — handles long pipelines
         # where cookies expire mid-run.
@@ -258,6 +262,11 @@ class LinkedInApplier(BaseApplier):
             logger.info("[LinkedIn] Session appears stale — re-authenticating …")
             self._logged_in = False
             await self._ensure_logged_in()
+            if not self._logged_in:
+                return self._fail(
+                    job,
+                    self._auth_error or "LinkedIn authentication unavailable",
+                )
 
         self._unknown_question_prompts = {}
         self._answered_questions = []
@@ -345,7 +354,7 @@ class LinkedInApplier(BaseApplier):
     def _remember_answer(self, question: str, answer: str) -> None:
         normalized_question = normalize_question_text(question)
         if not normalized_question:
-            return
+            return True
         existing = self.profile.custom_answers.get(normalized_question)
         if existing == answer:
             return
@@ -572,7 +581,15 @@ class LinkedInApplier(BaseApplier):
                 pass
         return False
 
-    async def _ensure_logged_in(self) -> None:
+    def _set_auth_error(self, reason: str) -> bool:
+        message = reason.strip()
+        if not message.lower().startswith("linkedin authentication unavailable"):
+            message = f"LinkedIn authentication unavailable: {message}"
+        self._auth_error = message
+        self._logged_in = False
+        return False
+
+    async def _ensure_logged_in(self) -> bool:
         """
         Establish an authenticated LinkedIn session via the most efficient path:
         1. Inject warm scraper cookies → navigate to feed → done if session is live.
@@ -581,6 +598,8 @@ class LinkedInApplier(BaseApplier):
         """
         page = self._page
         self._ensure_linkedin_state()
+        self._auth_error = None
+        self._logged_in = False
         username = self._linkedin_username
         password = self._linkedin_password
         credential_source = self._linkedin_credential_source
@@ -604,6 +623,7 @@ class LinkedInApplier(BaseApplier):
             self._report_progress("[LinkedIn][Auth] Session active")
             logger.info("[LinkedIn] Session active — already logged in ✓")
             self._logged_in = True
+            return True
             return
 
         # ── 4. Fresh login ───────────────────────────────────────────────────
@@ -612,6 +632,9 @@ class LinkedInApplier(BaseApplier):
                 "[LinkedIn] No credentials available. "
                 "Set LINKEDIN_EMAIL + LINKEDIN_PASSWORD env vars, "
                 "or enter them in the Profile → Job Board Credentials section."
+            )
+            return self._set_auth_error(
+                "No LinkedIn credentials are configured for the active profile."
             )
             return
 
@@ -623,6 +646,7 @@ class LinkedInApplier(BaseApplier):
             await page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
         except Exception as exc:
             logger.error(f"[LinkedIn] Could not load login page: {exc}")
+            return self._set_auth_error(f"Could not load the LinkedIn login page: {exc}")
             return
         await asyncio.sleep(random.uniform(1.5, 2.5))
 
@@ -653,6 +677,9 @@ class LinkedInApplier(BaseApplier):
                 return
             if any(s in page.url for s in ("checkpoint", "challenge", "captcha")):
                 await self._bm.screenshot(page, "linkedin_login_checkpoint")
+                self._set_auth_error(
+                    "LinkedIn presented a security checkpoint or CAPTCHA for this account."
+                )
                 logger.error(
                     "[LinkedIn] LinkedIn is showing a security checkpoint at "
                     f"{page.url}. "
@@ -661,6 +688,9 @@ class LinkedInApplier(BaseApplier):
                 )
                 return
             await self._bm.screenshot(page, "linkedin_login_no_form")
+            self._set_auth_error(
+                f"LinkedIn login form was not visible at {page.url}."
+            )
             logger.error(
                 f"[LinkedIn] Login form not visible at {page.url} — cannot authenticate. "
                 "Try running with HEADLESS_BROWSER=false to diagnose."
@@ -668,6 +698,7 @@ class LinkedInApplier(BaseApplier):
             return
 
         if not form_visible:
+            self._set_auth_error("LinkedIn login form was not visible.")
             return
 
         # Fill email
@@ -697,6 +728,9 @@ class LinkedInApplier(BaseApplier):
         current_url = page.url
         if "checkpoint" in current_url or "challenge" in current_url:
             await self._bm.screenshot(page, "linkedin_login_checkpoint")
+            self._set_auth_error(
+                "LinkedIn login requires manual verification for this account."
+            )
             logger.warning(
                 "[LinkedIn] Login requires manual verification (CAPTCHA / 2-FA). "
                 "Set HEADLESS_BROWSER=false in your .env, solve the checkpoint once, "
@@ -727,6 +761,9 @@ class LinkedInApplier(BaseApplier):
                 logger.warning(f"[LinkedIn] Could not save cookies: {exc}")
         else:
             await self._bm.screenshot(page, "linkedin_login_failed")
+            self._set_auth_error(
+                f"LinkedIn login did not complete successfully (current URL: {current_url})."
+            )
             logger.warning(
                 f"[LinkedIn] Login may have failed — currently at: {current_url} "
                 "Check data/screenshots/linkedin_login_failed.png"
@@ -763,6 +800,11 @@ class LinkedInApplier(BaseApplier):
             self._report_progress("[LinkedIn][Auth] Redirected to login mid-run")
             logger.info("[LinkedIn] Redirected to login mid-run — re-authenticating …")
             await self._ensure_logged_in()
+            if not self._logged_in:
+                return self._fail(
+                    job,
+                    self._auth_error or "LinkedIn authentication unavailable",
+                )
             await page.goto(job_url, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(2.0)
 
