@@ -98,6 +98,10 @@ _AUTOCOMPLETE_RESULTS = (
     "div[data-test-single-typeahead-entity-form-search-result='true'], "
     ".search-typeahead-v2__hit--autocomplete"
 )
+_LOCATION_AUTOCOMPLETE_RESULTS = (
+    _AUTOCOMPLETE_RESULTS
+    + ", [role='listbox'] [role='option'], li[role='option'], div[role='option']"
+)
 
 # Job page â€” aria-label based selectors survive LinkedIn UI/class renames
 # Broad selector fallback for legacy DOMs. Primary detection uses role/name.
@@ -407,6 +411,13 @@ class LinkedInApplier(BaseApplier):
         if any(token in normalized_label for token in ("phone", "mobile")):
             return True
         return "city" in normalized_label
+
+    @staticmethod
+    def _is_location_field_label(label: str) -> bool:
+        normalized_label = normalize_question_text(label).lower()
+        if not normalized_label:
+            return False
+        return any(token in normalized_label for token in ("location", "city", "town"))
 
     def _get_profile_contact_answer(
         self,
@@ -1286,30 +1297,188 @@ class LinkedInApplier(BaseApplier):
 
         return None
 
-    async def _finalize_text_input(self, page: Page, inp: Locator) -> None:
+    def _location_value_candidates(self, value: str | None) -> list[str]:
+        cleaned_value = self._clean_answer(value)
+        if cleaned_value is None:
+            return []
+
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def _add(candidate: str | None) -> None:
+            cleaned_candidate = self._clean_answer(candidate)
+            if cleaned_candidate is None:
+                return
+            normalized_candidate = self._normalize_choice(cleaned_candidate)
+            if normalized_candidate in seen:
+                return
+            seen.add(normalized_candidate)
+            candidates.append(cleaned_candidate)
+
+        _add(cleaned_value)
+        primary_segment = cleaned_value.split(",")[0].strip()
+        _add(primary_segment)
+        _add(re.sub(r"\s*\([^)]*\)\s*", " ", primary_segment).strip())
+        _add(re.sub(r"\s+(?:am|an der|in der|im|bei)\s+.+$", "", primary_segment, flags=re.I).strip())
+        return candidates
+
+    async def _wait_for_autocomplete_overlay(
+        self,
+        page: Page,
+        *,
+        selectors: str,
+        timeout_ms: int,
+    ) -> bool:
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        while time.monotonic() < deadline:
+            if await self._autocomplete_overlay_visible(page, selectors=selectors):
+                return True
+            await asyncio.sleep(0.1)
+        return await self._autocomplete_overlay_visible(page, selectors=selectors)
+
+    async def _is_input_invalid(self, inp: Locator) -> bool:
+        aria_invalid = ((await inp.get_attribute("aria-invalid")) or "").strip().lower()
+        if aria_invalid in {"true", "1"}:
+            return True
+        try:
+            invalid = await inp.evaluate(
+                """(el) => {
+                    if (typeof el.matches === 'function' && el.matches(':invalid')) {
+                        return true;
+                    }
+                    return Boolean(
+                        el.closest('.artdeco-text-input--error, .artdeco-text-input--invalid')
+                    );
+                }"""
+            )
+            return bool(invalid)
+        except Exception:
+            return False
+
+    async def _resolve_validation_repair_answer(
+        self,
+        label: str,
+        field_type: str,
+        *,
+        current_val: str,
+        error_text: str,
+        options: list[str] | None = None,
+    ) -> tuple[str | None, str | None]:
+        question = normalize_question_text(label)
+        if not question:
+            return None, None
+
+        choice_options = [
+            cleaned_option
+            for option in (options or [])
+            if (cleaned_option := self._clean_answer(option)) is not None
+        ]
+
+        forced_profile_answer = self._get_profile_contact_answer(question, options=choice_options)
+        if forced_profile_answer is not None:
+            self._remember_answer(question, forced_profile_answer)
+            return forced_profile_answer, "profile"
+
+        inferred_answer = self._clean_answer(self._infer_value_from_label(question))
+        if inferred_answer is not None:
+            matched = self._match_answer_to_options(inferred_answer, choice_options)
+            if not choice_options or matched is not None:
+                answer = matched or inferred_answer
+                self._remember_answer(question, answer)
+                return answer, "inferred"
+
+        resolver = getattr(self, "answer_resolver", None)
+        if resolver is not None:
+            repair_question = question
+            current_clean = self._clean_answer(current_val)
+            if error_text:
+                repair_question += f"\nValidation error: {error_text}"
+            if current_clean:
+                repair_question += f"\nPrevious answer: {current_clean}"
+            suggested_answers = await resolver(
+                [
+                    ApplicationQuestionPrompt(
+                        question=repair_question,
+                        field_type=field_type,
+                        options=choice_options,
+                    )
+                ]
+            )
+            suggested_answer = None
+            if suggested_answers:
+                suggested_answer = next(
+                    (
+                        cleaned_answer
+                        for raw_answer in suggested_answers.values()
+                        if (cleaned_answer := self._clean_answer(raw_answer)) is not None
+                    ),
+                    None,
+                )
+            if suggested_answer is not None:
+                matched = self._match_answer_to_options(suggested_answer, choice_options)
+                if not choice_options or matched is not None:
+                    answer = matched or suggested_answer
+                    self._remember_answer(question, answer)
+                    return answer, "ai"
+
+        saved_answer = self._clean_answer(self._answer_for_label(question))
+        if saved_answer is not None:
+            matched = self._match_answer_to_options(saved_answer, choice_options)
+            if not choice_options or matched is not None:
+                answer = matched or saved_answer
+                self._remember_answer(question, answer)
+                return answer, "saved"
+
+        return None, None
+
+    async def _finalize_text_input(self, page: Page, inp: Locator, label: str = "") -> None:
         try:
             await inp.evaluate(
                 """(el) => {
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
-                    if (typeof el.blur === 'function') {
-                        el.blur();
+                }"""
+            )
+        except Exception:
+            pass
+
+        autocomplete_selectors = (
+            _LOCATION_AUTOCOMPLETE_RESULTS
+            if self._is_location_field_label(label)
+            else _AUTOCOMPLETE_RESULTS
+        )
+        await self._wait_for_autocomplete_overlay(
+            page,
+            selectors=autocomplete_selectors,
+            timeout_ms=1_200 if self._is_location_field_label(label) else 250,
+        )
+
+        if await self._autocomplete_overlay_visible(page, selectors=autocomplete_selectors):
+            try:
+                await self._select_autocomplete_suggestion(page, selectors=autocomplete_selectors)
+            except Exception:
+                pass
+
+        await self._dismiss_autocomplete_overlays(page, selectors=autocomplete_selectors)
+        try:
+            await page.evaluate(
+                """() => {
+                    const active = document.activeElement;
+                    if (active instanceof HTMLElement && typeof active.blur === 'function') {
+                        active.blur();
                     }
                 }"""
             )
         except Exception:
             pass
 
-        if await self._autocomplete_overlay_visible(page):
-            try:
-                await self._select_autocomplete_suggestion(page)
-            except Exception:
-                pass
-
-        await self._dismiss_autocomplete_overlays(page)
-
-    async def _autocomplete_overlay_visible(self, page: Page) -> bool:
-        for selector in _AUTOCOMPLETE_RESULTS.split(", "):
+    async def _autocomplete_overlay_visible(
+        self,
+        page: Page,
+        selectors: str | None = None,
+    ) -> bool:
+        candidate_selectors = selectors or _AUTOCOMPLETE_RESULTS
+        for selector in candidate_selectors.split(", "):
             try:
                 locator = page.locator(selector)
                 if await locator.count() > 0 and await locator.first.is_visible():
@@ -1318,8 +1487,13 @@ class LinkedInApplier(BaseApplier):
                 continue
         return False
 
-    async def _select_autocomplete_suggestion(self, page: Page) -> bool:
-        for selector in _AUTOCOMPLETE_RESULTS.split(", "):
+    async def _select_autocomplete_suggestion(
+        self,
+        page: Page,
+        selectors: str | None = None,
+    ) -> bool:
+        candidate_selectors = selectors or _AUTOCOMPLETE_RESULTS
+        for selector in candidate_selectors.split(", "):
             try:
                 options = page.locator(selector)
                 if await options.count() == 0 or not await options.first.is_visible():
@@ -1331,10 +1505,15 @@ class LinkedInApplier(BaseApplier):
                 continue
         return False
 
-    async def _dismiss_autocomplete_overlays(self, page: Page) -> None:
-        if not await self._autocomplete_overlay_visible(page):
+    async def _dismiss_autocomplete_overlays(
+        self,
+        page: Page,
+        selectors: str | None = None,
+    ) -> None:
+        candidate_selectors = selectors or _AUTOCOMPLETE_RESULTS
+        if not await self._autocomplete_overlay_visible(page, selectors=candidate_selectors):
             return
-        if await self._select_autocomplete_suggestion(page):
+        if await self._select_autocomplete_suggestion(page, selectors=candidate_selectors):
             return
         try:
             await page.evaluate(
@@ -1438,16 +1617,34 @@ class LinkedInApplier(BaseApplier):
         error_text: str,
     ) -> bool:
         repaired_numeric_fields = await self._repair_visible_numeric_inputs(page, job)
+        repaired_location_fields = await self._repair_visible_location_inputs(page, job)
+        repaired_invalid_text_fields = await self._repair_visible_invalid_text_inputs(
+            page,
+            job,
+            error_text,
+        )
+        repaired_total = (
+            repaired_numeric_fields + repaired_location_fields + repaired_invalid_text_fields
+        )
+        if not repaired_total:
+            return False
+
+        repaired_parts: list[str] = []
         if repaired_numeric_fields:
-            self._report_progress(
-                "[LinkedIn][Validation] Corrected numeric field formatting and retrying"
-            )
-            logger.info(
-                f"[LinkedIn] Corrected {repaired_numeric_fields} numeric field(s) after validation error: "
-                f"{error_text}"
-            )
-            return True
-        return False
+            repaired_parts.append(f"{repaired_numeric_fields} numeric")
+        if repaired_location_fields:
+            repaired_parts.append(f"{repaired_location_fields} location")
+        if repaired_invalid_text_fields:
+            repaired_parts.append(f"{repaired_invalid_text_fields} text")
+
+        repaired_summary = ", ".join(repaired_parts)
+        self._report_progress(
+            f"[LinkedIn][Validation] Retried {repaired_summary} field(s) after validation feedback"
+        )
+        logger.info(
+            f"[LinkedIn] Retried {repaired_summary} field(s) after validation error: {error_text}"
+        )
+        return True
 
     async def _repair_visible_numeric_inputs(self, page: Page, job: Job) -> int:
         repaired = 0
@@ -1482,8 +1679,106 @@ class LinkedInApplier(BaseApplier):
 
             await inp.fill("")
             await _BM.human_type(inp, prepared)
-            await self._finalize_text_input(page, inp)
+            await self._finalize_text_input(page, inp, label)
             self._remember_answer(label, prepared)
+            repaired += 1
+
+        return repaired
+
+    async def _repair_visible_location_inputs(self, page: Page, job: Job) -> int:
+        repaired = 0
+        inputs = await page.locator(self._modal_descendants(_TEXT_INPUTS)).all()
+        for inp in inputs:
+            try:
+                if not await inp.is_visible() or not await inp.is_enabled():
+                    continue
+            except Exception:
+                continue
+
+            label = await self._get_field_label(page, inp)
+            if not self._is_location_field_label(label):
+                continue
+
+            input_type = ((await inp.get_attribute("type")) or "text").strip().lower()
+            current_val = await inp.input_value()
+            profile_value = self._get_profile_contact_answer(label)
+            base_value = profile_value or current_val
+            prepared = self._prepare_text_input_value(
+                label,
+                base_value,
+                field_type="text",
+                input_type=input_type,
+                job=job,
+            )
+            candidates = self._location_value_candidates(prepared or current_val)
+            if not candidates:
+                continue
+
+            source = "profile" if profile_value is not None else "inferred"
+            for candidate in candidates:
+                await inp.fill("")
+                await _BM.human_type(inp, candidate)
+                await self._finalize_text_input(page, inp, label)
+                self._remember_answer(label, candidate)
+                repaired += 1
+                if not await self._is_input_invalid(inp):
+                    self._record_answer(label, candidate, source, "text")
+                    break
+            else:
+                self._record_answer(label, candidates[-1], source, "text")
+
+        return repaired
+
+    async def _repair_visible_invalid_text_inputs(
+        self,
+        page: Page,
+        job: Job,
+        error_text: str,
+    ) -> int:
+        repaired = 0
+        inputs = await page.locator(self._modal_descendants(_TEXT_INPUTS)).all()
+        for inp in inputs:
+            try:
+                if not await inp.is_visible() or not await inp.is_enabled():
+                    continue
+            except Exception:
+                continue
+
+            label = await self._get_field_label(page, inp)
+            if not label or self._is_location_field_label(label):
+                continue
+
+            input_type = ((await inp.get_attribute("type")) or "text").strip().lower()
+            if input_type in {"number", "range"} or self._label_expects_numeric_value(label):
+                continue
+            if not await self._is_input_invalid(inp):
+                continue
+
+            current_val = await inp.input_value()
+            value, source = await self._resolve_validation_repair_answer(
+                label,
+                "text",
+                current_val=current_val,
+                error_text=error_text,
+            )
+            if value is None or source is None:
+                continue
+
+            prepared = self._prepare_text_input_value(
+                label,
+                value,
+                field_type="text",
+                input_type=input_type,
+                job=job,
+            )
+            if prepared is None:
+                continue
+
+            await inp.fill("")
+            await _BM.human_type(inp, prepared)
+            await self._finalize_text_input(page, inp, label)
+            self._remember_answer(label, prepared)
+            self._record_answer(label, prepared, source, "text")
             repaired += 1
 
         return repaired
@@ -1527,7 +1822,7 @@ class LinkedInApplier(BaseApplier):
                     ):
                         await inp.fill("")
                         await _BM.human_type(inp, prepared_profile_value)
-                        await self._finalize_text_input(page, inp)
+                        await self._finalize_text_input(page, inp, label)
                     self._remember_answer(label, prepared_profile_value)
                     self._record_answer(label, prepared_profile_value, "profile", field_type)
                     continue
@@ -1548,7 +1843,7 @@ class LinkedInApplier(BaseApplier):
                     if prepared_override is not None:
                         await inp.fill("")
                         await _BM.human_type(inp, prepared_override)
-                        await self._finalize_text_input(page, inp)
+                        await self._finalize_text_input(page, inp, label)
                         self._remember_answer(label, prepared_override)
                         self._record_answer(label, prepared_override, "profile", field_type)
                         continue
@@ -1571,7 +1866,7 @@ class LinkedInApplier(BaseApplier):
                     continue
                 await inp.fill("")
                 await _BM.human_type(inp, prepared_value)
-                await self._finalize_text_input(page, inp)
+                await self._finalize_text_input(page, inp, label)
                 self._record_answer(label, prepared_value, source, field_type)
             elif label:
                 self._mark_unanswered(label, field_type)

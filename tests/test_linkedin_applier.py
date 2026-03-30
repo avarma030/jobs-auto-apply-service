@@ -326,10 +326,12 @@ class _FakeAllLocator:
 
 
 class _FakeTextInputField:
-    def __init__(self, value: str = "", input_type: str = "text"):
+    def __init__(self, value: str = "", input_type: str = "text", aria_invalid: bool = False):
         self.value = value
         self.input_type = input_type
+        self.aria_invalid = aria_invalid
         self.fills: list[str] = []
+        self.evaluations: list[str] = []
 
     async def is_visible(self) -> bool:
         return True
@@ -340,6 +342,8 @@ class _FakeTextInputField:
     async def get_attribute(self, name: str) -> str | None:
         if name == "type":
             return self.input_type
+        if name == "aria-invalid":
+            return "true" if self.aria_invalid else "false"
         return None
 
     async def input_value(self) -> str:
@@ -348,6 +352,10 @@ class _FakeTextInputField:
     async def fill(self, value: str) -> None:
         self.fills.append(value)
         self.value = value
+
+    async def evaluate(self, script: str):
+        self.evaluations.append(script)
+        return self.aria_invalid
 
 
 class _FakeResumePage:
@@ -765,6 +773,18 @@ async def test_dismiss_autocomplete_overlays_clicks_first_suggestion():
 
 
 @pytest.mark.asyncio
+async def test_finalize_text_input_selects_location_suggestion_before_blur():
+    applier = make_applier()
+    inp = _FakeTextInputField(value="Frankfurt am Main")
+    page = _FakePageWithOverlay(visible=True)
+
+    await applier._finalize_text_input(page, inp, "Location (city)")
+
+    assert page.overlay.clicks == [(2_000, True)]
+    assert len(page.evaluations) == 1
+
+
+@pytest.mark.asyncio
 async def test_dismiss_prompts_does_not_click_easy_apply_modal_dismiss_button():
     applier = make_applier()
     page = _FakePromptPage(skip_click=True)
@@ -847,6 +867,15 @@ def test_prepare_text_input_value_uses_profile_city_when_ai_returns_placeholder_
     assert value == "Dublin"
 
 
+def test_location_value_candidates_include_shorter_city_variant():
+    applier = make_applier(make_profile(address=Address(city="Frankfurt am Main", country="Germany")))
+
+    assert applier._location_value_candidates("Frankfurt am Main") == [
+        "Frankfurt am Main",
+        "Frankfurt",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_repair_visible_numeric_inputs_coerces_textual_numeric_answers():
     applier = make_applier()
@@ -867,6 +896,58 @@ async def test_repair_visible_numeric_inputs_coerces_textual_numeric_answers():
     assert repaired == 1
     assert inp.fills == [""]
     assert inp.value == "6"
+
+
+@pytest.mark.asyncio
+async def test_repair_visible_location_inputs_retries_with_simplified_city_variant():
+    profile = make_profile(
+        address=Address(city="Frankfurt am Main", state="Hesse", country="Germany"),
+        phone="+49 17669099987",
+    )
+    applier = make_applier(profile)
+    applier._get_field_label = AsyncMock(return_value="Location (city)")
+    job = make_job()
+    inp = _FakeTextInputField(value="Frankfurt am Main", input_type="text", aria_invalid=True)
+    page = SimpleNamespace(locator=lambda _selector: _FakeAllLocator([inp]))
+
+    async def _fake_human_type(target, value):
+        target.value = value
+
+    async def _fake_finalize(_page, target, _label=""):
+        if target.value == "Frankfurt":
+            target.aria_invalid = False
+
+    applier._finalize_text_input = AsyncMock(side_effect=_fake_finalize)
+
+    with patch.object(linkedin_mod._BM, "human_type", new=AsyncMock(side_effect=_fake_human_type)):
+        repaired = await applier._repair_visible_location_inputs(page, job)
+
+    assert repaired == 2
+    assert inp.value == "Frankfurt"
+
+
+@pytest.mark.asyncio
+async def test_repair_visible_invalid_text_inputs_uses_ai_repair_answer():
+    applier = make_applier()
+    applier._get_field_label = AsyncMock(return_value="Current title")
+    applier.answer_resolver = AsyncMock(return_value={"Current title": "Project Manager"})
+    applier._finalize_text_input = AsyncMock()
+    job = make_job()
+    inp = _FakeTextInputField(value="PM / invalid", input_type="text", aria_invalid=True)
+    page = SimpleNamespace(locator=lambda _selector: _FakeAllLocator([inp]))
+
+    async def _fake_human_type(target, value):
+        target.value = value
+
+    with patch.object(linkedin_mod._BM, "human_type", new=AsyncMock(side_effect=_fake_human_type)):
+        repaired = await applier._repair_visible_invalid_text_inputs(
+            page,
+            job,
+            "Please enter a valid answer",
+        )
+
+    assert repaired == 1
+    assert inp.value == "Project Manager"
 
 
 def test_is_non_resume_upload_field_detects_photo_context():
