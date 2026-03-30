@@ -277,6 +277,8 @@ export function RunProgress({ onComplete }: Props) {
         next_trigger_at: savedSearchEnabled
           ? new Date(Date.now() + savedSearchIntervalHours * 60 * 60 * 1000).toISOString()
           : null,
+        run_count: savedSearchState?.run_count ?? 0,
+        runs: savedSearchState?.runs ?? [],
       });
       setRunId(res.run_id);
     } catch (err: any) {

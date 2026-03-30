@@ -6,18 +6,24 @@ from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_user, get_session
-from src.api.schemas.runs import RunResponse
-from src.database.models import ScrapeRun, User
+from src.api.schemas.runs import (
+    RunDetailResponse,
+    RunJobResponse,
+    RunJobSummaryResponse,
+    RunResponse,
+    RunSearchCriteriaResponse,
+)
+from src.database.models import JobRecord, ScrapeRun, User
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
 # ---------------------------------------------------------------------------
 # In-process progress queue for AI pipeline events
-# Keyed by run_id → list of pending progress message strings.
+# Keyed by run_id -> list of pending progress message strings.
 # jobs.py appends to this; _sse_generator drains it.
 # ---------------------------------------------------------------------------
 _run_progress: dict[str, list[str]] = {}
@@ -43,7 +49,38 @@ async def list_runs(
             )
         ).scalars().all()
     )
-    return [RunResponse.model_validate(r) for r in rows]
+    summaries = await _job_status_counts_for_runs(
+        session,
+        current_user.id,
+        [row.id for row in rows],
+    )
+    return [_to_run_response(row, summaries.get(row.id)) for row in rows]
+
+
+@router.get("/{run_id}", response_model=RunDetailResponse)
+async def get_run(
+    run_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+):
+    row = await _get_run_or_404(run_id, current_user.id, session)
+    jobs = list(
+        (
+            await session.execute(
+                select(JobRecord)
+                .where(
+                    JobRecord.user_id == current_user.id,
+                    JobRecord.scrape_run_id == run_id,
+                )
+                .order_by(JobRecord.scraped_at.desc())
+            )
+        ).scalars().all()
+    )
+    summary = _job_summary_from_records(jobs)
+    return RunDetailResponse(
+        **_to_run_response(row, summary).model_dump(),
+        jobs=[RunJobResponse.model_validate(job) for job in jobs],
+    )
 
 
 @router.get("/{run_id}/stream")
@@ -53,7 +90,7 @@ async def stream_run(
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
-    row = await _get_run_or_404(run_id, current_user.id, session)
+    await _get_run_or_404(run_id, current_user.id, session)
     return StreamingResponse(
         _sse_generator(run_id, current_user.id),
         media_type="text/event-stream",
@@ -75,7 +112,8 @@ async def stop_run(
         row.status = "stopped"
         await session.commit()
         await session.refresh(row)
-    return RunResponse.model_validate(row)
+    summary = (await _job_status_counts_for_runs(session, current_user.id, [row.id])).get(row.id)
+    return _to_run_response(row, summary)
 
 
 async def _get_run_or_404(run_id: str, user_id: int, session: AsyncSession) -> ScrapeRun:
@@ -89,12 +127,125 @@ async def _get_run_or_404(run_id: str, user_id: int, session: AsyncSession) -> S
     return row
 
 
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+def _parse_run_search_criteria(row: ScrapeRun) -> RunSearchCriteriaResponse | None:
+    if row.search_criteria_json:
+        try:
+            payload = json.loads(row.search_criteria_json)
+            return RunSearchCriteriaResponse.model_validate(payload)
+        except Exception:
+            pass
+
+    payload: dict[str, object] = {}
+    keywords = _split_csv(row.keywords)
+    boards = _split_csv(row.boards)
+    if keywords:
+        payload["keywords"] = keywords
+    if boards:
+        payload["boards"] = boards
+    if row.location:
+        payload["location"] = row.location
+    if not payload:
+        return None
+    return RunSearchCriteriaResponse.model_validate(payload)
+
+
+def _empty_summary() -> RunJobSummaryResponse:
+    return RunJobSummaryResponse()
+
+
+def _finalize_summary(summary: RunJobSummaryResponse) -> RunJobSummaryResponse:
+    summary.total = (
+        summary.pending
+        + summary.applied
+        + summary.skipped
+        + summary.failed
+        + summary.interviewed
+        + summary.offered
+        + summary.rejected
+    )
+    return summary
+
+
+def _job_summary_from_records(records: list[JobRecord]) -> RunJobSummaryResponse:
+    summary = _empty_summary()
+    for record in records:
+        status = (record.application_status or "").lower()
+        if hasattr(summary, status):
+            setattr(summary, status, getattr(summary, status) + 1)
+    return _finalize_summary(summary)
+
+
+async def _job_status_counts_for_runs(
+    session: AsyncSession,
+    user_id: int,
+    run_ids: list[str],
+) -> dict[str, RunJobSummaryResponse]:
+    if not run_ids:
+        return {}
+
+    rows = (
+        await session.execute(
+            select(
+                JobRecord.scrape_run_id,
+                JobRecord.application_status,
+                func.count(JobRecord.id),
+            )
+            .where(
+                JobRecord.user_id == user_id,
+                JobRecord.scrape_run_id.in_(run_ids),
+            )
+            .group_by(JobRecord.scrape_run_id, JobRecord.application_status)
+        )
+    ).all()
+
+    summaries = {run_id: _empty_summary() for run_id in run_ids}
+    for run_id, status, count in rows:
+        if run_id is None:
+            continue
+        summary = summaries.setdefault(run_id, _empty_summary())
+        normalized_status = str(status or "").lower()
+        if hasattr(summary, normalized_status):
+            setattr(summary, normalized_status, getattr(summary, normalized_status) + int(count))
+
+    return {
+        run_id: _finalize_summary(summary)
+        for run_id, summary in summaries.items()
+    }
+
+
+def _to_run_response(
+    row: ScrapeRun,
+    summary: RunJobSummaryResponse | None = None,
+) -> RunResponse:
+    return RunResponse(
+        id=row.id,
+        status=row.status,
+        boards=row.boards,
+        keywords=row.keywords,
+        location=row.location,
+        trigger_type=row.trigger_type or "manual",
+        search_criteria=_parse_run_search_criteria(row),
+        started_at=row.started_at,
+        finished_at=row.finished_at,
+        jobs_found=row.jobs_found,
+        jobs_applied=row.jobs_applied,
+        job_summary=summary or _empty_summary(),
+        error_message=row.error_message,
+    )
+
+
 async def _sse_generator(run_id: str, user_id: int) -> AsyncGenerator[str, None]:
     """Poll the DB every 2 seconds and stream SSE events until the run finishes.
 
     Two event channels:
-      • DB poll  — emits jobs_found / jobs_applied counters when they change
-      • Progress queue — emits per-step AI pipeline messages immediately
+      - DB poll  - emits jobs_found / jobs_applied counters when they change
+      - Progress queue - emits per-step AI pipeline messages immediately
     """
     from src.config import settings
     from src.database.db import Database
@@ -106,13 +257,11 @@ async def _sse_generator(run_id: str, user_id: int) -> AsyncGenerator[str, None]
         last_jobs_found = 0
         last_jobs_applied = 0
 
-        for _ in range(600):  # max 20 minutes (600 * 2s) — AI pipeline takes longer
-            # 1. Drain progress queue first (low-latency messages)
+        for _ in range(600):  # max 20 minutes (600 * 2s)
             messages = _run_progress.pop(run_id, [])
             for msg in messages:
                 yield f"data: {json.dumps({'event': 'progress', 'message': msg})}\n\n"
 
-            # 2. Poll DB for counter updates
             async with db.session_factory() as session:
                 row = (
                     await session.execute(
@@ -126,14 +275,25 @@ async def _sse_generator(run_id: str, user_id: int) -> AsyncGenerator[str, None]
             if row.jobs_found != last_jobs_found or row.jobs_applied != last_jobs_applied:
                 last_jobs_found = row.jobs_found
                 last_jobs_applied = row.jobs_applied
-                yield f"data: {json.dumps({'event': 'progress', 'status': row.status, 'jobs_found': row.jobs_found, 'jobs_applied': row.jobs_applied})}\n\n"
+                progress_payload = {
+                    "event": "progress",
+                    "status": row.status,
+                    "jobs_found": row.jobs_found,
+                    "jobs_applied": row.jobs_applied,
+                }
+                yield f"data: {json.dumps(progress_payload)}\n\n"
 
             if row.status in ("done", "failed", "stopped"):
-                # Drain any final messages before closing
                 final_messages = _run_progress.pop(run_id, [])
                 for msg in final_messages:
                     yield f"data: {json.dumps({'event': 'progress', 'message': msg})}\n\n"
-                yield f"data: {json.dumps({'event': row.status, 'jobs_found': row.jobs_found, 'jobs_applied': row.jobs_applied, 'error_message': row.error_message})}\n\n"
+                final_payload = {
+                    "event": row.status,
+                    "jobs_found": row.jobs_found,
+                    "jobs_applied": row.jobs_applied,
+                    "error_message": row.error_message,
+                }
+                yield f"data: {json.dumps(final_payload)}\n\n"
                 break
 
             await asyncio.sleep(2)

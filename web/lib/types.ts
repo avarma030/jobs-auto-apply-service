@@ -78,11 +78,62 @@ export interface Run {
   boards?: string;
   keywords?: string;
   location?: string;
+  trigger_type?: string | null;
+  search_criteria?: RunSearchCriteria | null;
   started_at: string;
   finished_at?: string;
   jobs_found: number;
   jobs_applied: number;
+  job_summary: RunJobSummary;
   error_message?: string;
+}
+
+export interface RunSearchCriteria {
+  keywords: string[];
+  location?: string | null;
+  work_modes: string[];
+  job_types: string[];
+  experience_levels: string[];
+  easy_apply_only?: boolean | null;
+  remote_only?: boolean | null;
+  boards: string[];
+  max_age_days?: number | null;
+  max_age_hours?: number | null;
+  max_jobs?: number | null;
+  tailor_documents?: boolean | null;
+  min_match_score?: number | null;
+}
+
+export interface RunJobSummary {
+  total: number;
+  pending: number;
+  applied: number;
+  skipped: number;
+  failed: number;
+  interviewed: number;
+  offered: number;
+  rejected: number;
+}
+
+export interface RunJob {
+  id: number;
+  title: string;
+  company: string;
+  location?: string | null;
+  source_board: string;
+  url: string;
+  easy_apply: boolean;
+  scraped_at: string;
+  posted_at?: string | null;
+  application_status: string;
+  applied_at?: string | null;
+  match_score?: number | null;
+  ats_score?: number | null;
+  notes?: string | null;
+}
+
+export interface RunDetail extends Run {
+  jobs: RunJob[];
 }
 
 export interface Settings {
@@ -121,6 +172,20 @@ export interface SavedSearchState {
   last_triggered_at?: string | null;
   last_run_id?: string | null;
   next_trigger_at?: string | null;
+  run_count: number;
+  runs: SavedSearchRunSummary[];
+}
+
+export interface SavedSearchRunSummary {
+  id: string;
+  status: string;
+  trigger_type?: string | null;
+  started_at: string;
+  finished_at?: string | null;
+  jobs_found: number;
+  jobs_applied: number;
+  job_summary: Record<string, number>;
+  error_message?: string | null;
 }
 
 export interface Profile {

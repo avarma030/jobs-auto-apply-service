@@ -5,6 +5,7 @@ import type {
   Job,
   JobsPage,
   Profile,
+  RunDetail,
   Run,
   SavedSearchState,
   Settings,
@@ -146,6 +147,7 @@ export const settings = {
 // Runs
 export const runs = {
   list: () => request<Run[]>("/runs"),
+  get: (id: string) => request<RunDetail>(`/runs/${id}`),
   stop: (id: string) => request<Run>(`/runs/${id}/stop`, { method: "POST" }),
 };
 

@@ -78,8 +78,22 @@ class SavedSearchConfig(BaseModel):
     last_run_id: Optional[str] = None
 
 
+class SavedSearchRunSummary(BaseModel):
+    id: str
+    status: str
+    trigger_type: Optional[str] = None
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    jobs_found: int = 0
+    jobs_applied: int = 0
+    job_summary: dict[str, int] = Field(default_factory=dict)
+    error_message: Optional[str] = None
+
+
 class SavedSearchState(SavedSearchConfig):
     next_trigger_at: Optional[datetime] = None
+    run_count: int = 0
+    runs: list[SavedSearchRunSummary] = Field(default_factory=list)
 
 
 class JobStatusUpdate(BaseModel):

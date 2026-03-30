@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.database.models import ApplicationRecord, Base, JobRecord
@@ -32,10 +32,31 @@ class Database:
         """Create all tables if they don't exist."""
         async with self.engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            await self._ensure_scrape_run_columns(conn)
         logger.info("Database initialised")
 
     async def close(self) -> None:
         await self.engine.dispose()
+
+    async def _ensure_scrape_run_columns(self, conn) -> None:
+        def _existing_columns(sync_conn) -> set[str]:
+            inspector = inspect(sync_conn)
+            return {
+                column["name"]
+                for column in inspector.get_columns("scrape_runs")
+            }
+
+        existing_columns = await conn.run_sync(_existing_columns)
+        statements: list[str] = []
+        if "trigger_type" not in existing_columns:
+            statements.append("ALTER TABLE scrape_runs ADD COLUMN trigger_type VARCHAR(32)")
+        if "search_criteria_json" not in existing_columns:
+            statements.append("ALTER TABLE scrape_runs ADD COLUMN search_criteria_json TEXT")
+        if "saved_search_key" not in existing_columns:
+            statements.append("ALTER TABLE scrape_runs ADD COLUMN saved_search_key VARCHAR(64)")
+
+        for statement in statements:
+            await conn.execute(text(statement))
 
     # ------------------------------------------------------------------
     # Jobs

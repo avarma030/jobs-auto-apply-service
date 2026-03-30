@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from src.api.schemas.jobs import SavedSearchConfig, SavedSearchState, ScrapeRequest, SearchCriteria
+from src.api.schemas.jobs import (
+    SavedSearchConfig,
+    SavedSearchRunSummary,
+    SavedSearchState,
+    ScrapeRequest,
+    SearchCriteria,
+)
 
 
 def search_criteria_from_request(req: ScrapeRequest) -> SearchCriteria:
@@ -18,6 +26,26 @@ def search_criteria_from_request(req: ScrapeRequest) -> SearchCriteria:
     return SearchCriteria(**payload)
 
 
+def normalized_search_criteria_payload(criteria: SearchCriteria) -> dict[str, Any]:
+    payload = criteria.model_dump(mode="json", exclude_none=True)
+    if payload.get("max_age_hours") is not None:
+        payload.pop("max_age_days", None)
+    return payload
+
+
+def serialized_search_criteria(criteria: SearchCriteria) -> str:
+    return json.dumps(
+        normalized_search_criteria_payload(criteria),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def saved_search_key(criteria: SearchCriteria) -> str:
+    return hashlib.sha256(serialized_search_criteria(criteria).encode("utf-8")).hexdigest()
+
+
 def load_saved_search_config(raw: Any) -> SavedSearchConfig:
     if not isinstance(raw, dict):
         return SavedSearchConfig()
@@ -27,12 +55,22 @@ def load_saved_search_config(raw: Any) -> SavedSearchConfig:
         return SavedSearchConfig()
 
 
-def saved_search_state(raw: Any) -> SavedSearchState:
+def saved_search_state(
+    raw: Any,
+    *,
+    run_count: int = 0,
+    runs: list[SavedSearchRunSummary] | None = None,
+) -> SavedSearchState:
     config = load_saved_search_config(raw)
     next_trigger_at = None
     if config.enabled and config.criteria and config.last_triggered_at:
         next_trigger_at = config.last_triggered_at + timedelta(hours=config.interval_hours)
-    return SavedSearchState(**config.model_dump(), next_trigger_at=next_trigger_at)
+    return SavedSearchState(
+        **config.model_dump(),
+        next_trigger_at=next_trigger_at,
+        run_count=run_count,
+        runs=runs or [],
+    )
 
 
 def update_saved_search_config(

@@ -14,7 +14,9 @@ from src.database.models import ScrapeRun, UserSettings
 from src.services.saved_searches import (
     load_saved_search_config,
     saved_search_is_due,
+    saved_search_key,
     scrape_request_from_saved_search,
+    serialized_search_criteria,
 )
 
 RunScrapeFunc = Callable[[str, int, object], Awaitable[None]]
@@ -74,6 +76,9 @@ class SavedSearchScheduler:
                     boards=",".join(req.boards),
                     keywords=",".join(req.keywords),
                     location=req.location,
+                    trigger_type="saved_search",
+                    search_criteria_json=serialized_search_criteria(config.criteria),
+                    saved_search_key=saved_search_key(config.criteria),
                     started_at=now.replace(tzinfo=None),
                 )
                 session.add(run)

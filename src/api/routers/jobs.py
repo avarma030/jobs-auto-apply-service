@@ -12,7 +12,7 @@ from typing import Optional
 import openpyxl
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_user, get_session
@@ -20,11 +20,19 @@ from src.api.schemas.jobs import (
     JobResponse,
     JobStatusUpdate,
     JobsPage,
+    SavedSearchRunSummary,
     SavedSearchState,
+    SearchCriteria,
     ScrapeRequest,
 )
 from src.database.models import JobRecord, ScrapeRun, User, UserSettings
-from src.services.saved_searches import saved_search_state, update_saved_search_config
+from src.services.saved_searches import (
+    saved_search_key,
+    saved_search_state,
+    search_criteria_from_request,
+    serialized_search_criteria,
+    update_saved_search_config,
+)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 _ARTIFACT_ROOT = (Path.cwd() / "data" / "uploads").resolve()
@@ -161,7 +169,45 @@ async def get_saved_search(
 ):
     row = await _get_or_create_settings(current_user.id, session)
     settings_data = json.loads(row.settings_json or "{}")
-    return saved_search_state(settings_data.get("saved_search"))
+    raw_saved_search = settings_data.get("saved_search")
+    state = saved_search_state(raw_saved_search)
+    if state.criteria is None:
+        return state
+
+    run_filter = _saved_search_run_filter(current_user.id, state.criteria)
+    run_count = (
+        await session.execute(select(func.count()).select_from(ScrapeRun).where(run_filter))
+    ).scalar_one()
+    run_rows = list(
+        (
+            await session.execute(
+                select(ScrapeRun)
+                .where(run_filter)
+                .order_by(ScrapeRun.started_at.desc())
+                .limit(10)
+            )
+        ).scalars().all()
+    )
+    summary_by_run = await _job_status_counts_for_runs(
+        session,
+        current_user.id,
+        [run.id for run in run_rows],
+    )
+    runs = [
+        SavedSearchRunSummary(
+            id=run.id,
+            status=run.status,
+            trigger_type=run.trigger_type or "manual",
+            started_at=run.started_at,
+            finished_at=run.finished_at,
+            jobs_found=run.jobs_found,
+            jobs_applied=run.jobs_applied,
+            job_summary=summary_by_run.get(run.id, {}),
+            error_message=run.error_message,
+        )
+        for run in run_rows
+    ]
+    return saved_search_state(raw_saved_search, run_count=run_count, runs=runs)
 
 
 @router.get("/{job_id}", response_model=JobResponse)
@@ -220,6 +266,7 @@ async def trigger_scrape(
     current_user: User = Depends(get_current_user),
 ):
     started_at = datetime.utcnow()
+    criteria = search_criteria_from_request(body)
     run = ScrapeRun(
         id=str(uuid.uuid4()),
         user_id=current_user.id,
@@ -227,6 +274,9 @@ async def trigger_scrape(
         boards=",".join(body.boards),
         keywords=",".join(body.keywords),
         location=body.location,
+        trigger_type="manual",
+        search_criteria_json=serialized_search_criteria(criteria),
+        saved_search_key=saved_search_key(criteria) if body.save_search else None,
         started_at=started_at,
     )
     session.add(run)
@@ -462,3 +512,104 @@ def _to_response(r: JobRecord) -> JobResponse:
         tailored_resume_path=getattr(r, "tailored_resume_path", None),
         cover_letter_path=getattr(r, "cover_letter_path", None),
     )
+
+
+def _saved_search_run_filter(user_id: int, criteria: SearchCriteria):
+    keywords_csv = ",".join(criteria.keywords)
+    boards_csv = ",".join(criteria.boards)
+    serialized = serialized_search_criteria(criteria)
+    key = saved_search_key(criteria)
+    location_filter = (
+        or_(ScrapeRun.location.is_(None), ScrapeRun.location == "")
+        if criteria.location is None
+        else ScrapeRun.location == criteria.location
+    )
+    return and_(
+        ScrapeRun.user_id == user_id,
+        or_(
+            ScrapeRun.saved_search_key == key,
+            and_(
+                ScrapeRun.saved_search_key.is_(None),
+                ScrapeRun.search_criteria_json == serialized,
+            ),
+            and_(
+                ScrapeRun.saved_search_key.is_(None),
+                ScrapeRun.search_criteria_json.is_(None),
+                ScrapeRun.keywords == keywords_csv,
+                ScrapeRun.boards == boards_csv,
+                location_filter,
+            ),
+        ),
+    )
+
+
+async def _job_status_counts_for_runs(
+    session: AsyncSession,
+    user_id: int,
+    run_ids: list[str],
+) -> dict[str, dict[str, int]]:
+    if not run_ids:
+        return {}
+
+    rows = (
+        await session.execute(
+            select(
+                JobRecord.scrape_run_id,
+                JobRecord.application_status,
+                func.count(JobRecord.id),
+            )
+            .where(
+                JobRecord.user_id == user_id,
+                JobRecord.scrape_run_id.in_(run_ids),
+            )
+            .group_by(JobRecord.scrape_run_id, JobRecord.application_status)
+        )
+    ).all()
+
+    summaries = {
+        run_id: {
+            "total": 0,
+            "pending": 0,
+            "applied": 0,
+            "skipped": 0,
+            "failed": 0,
+            "interviewed": 0,
+            "offered": 0,
+            "rejected": 0,
+        }
+        for run_id in run_ids
+    }
+    for run_id, status, count in rows:
+        if run_id is None:
+            continue
+        normalized_status = str(status or "").lower()
+        summary = summaries.setdefault(
+            run_id,
+            {
+                "total": 0,
+                "pending": 0,
+                "applied": 0,
+                "skipped": 0,
+                "failed": 0,
+                "interviewed": 0,
+                "offered": 0,
+                "rejected": 0,
+            },
+        )
+        if normalized_status in summary:
+            summary[normalized_status] += int(count)
+
+    for summary in summaries.values():
+        summary["total"] = sum(
+            summary[key]
+            for key in (
+                "pending",
+                "applied",
+                "skipped",
+                "failed",
+                "interviewed",
+                "offered",
+                "rejected",
+            )
+        )
+    return summaries

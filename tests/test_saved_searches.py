@@ -13,7 +13,9 @@ from src.database.models import ScrapeRun, User, UserSettings
 from src.services.saved_search_scheduler import SavedSearchScheduler
 from src.services.saved_searches import (
     saved_search_state,
+    saved_search_key,
     scrape_request_from_saved_search,
+    serialized_search_criteria,
     update_saved_search_config,
 )
 
@@ -54,6 +56,41 @@ def test_saved_search_state_computes_next_trigger():
     state = saved_search_state(raw)
 
     assert state.next_trigger_at == datetime(2026, 3, 30, 11, 0, tzinfo=timezone.utc)
+
+
+def test_saved_search_state_exposes_run_history():
+    raw = SavedSearchConfig(
+        enabled=True,
+        interval_hours=3,
+        criteria=SearchCriteria(keywords=["project manager"], location="Dublin"),
+    ).model_dump(mode="json", exclude_none=True)
+
+    state = saved_search_state(
+        raw,
+        run_count=2,
+        runs=[],
+    )
+
+    assert state.run_count == 2
+    assert state.runs == []
+
+
+def test_saved_search_key_stays_stable_for_equivalent_criteria():
+    criteria = SearchCriteria(
+        keywords=["ai engineer"],
+        location="Frankfurt",
+        boards=["linkedin"],
+        max_age_days=7,
+        max_age_hours=3,
+    )
+
+    payload = json.loads(serialized_search_criteria(criteria))
+
+    assert payload["keywords"] == ["ai engineer"]
+    assert payload["location"] == "Frankfurt"
+    assert payload["max_age_hours"] == 3
+    assert "max_age_days" not in payload
+    assert saved_search_key(criteria) == saved_search_key(criteria.model_copy())
 
 
 def test_scrape_request_from_saved_search_round_trips_criteria():
@@ -130,6 +167,25 @@ async def test_saved_search_scheduler_triggers_due_search(tmp_path):
         runs = list((await session.execute(select(ScrapeRun))).scalars().all())
         assert len(runs) == 1
         assert runs[0].status == "pending"
+        assert runs[0].trigger_type == "saved_search"
+        assert runs[0].search_criteria_json == serialized_search_criteria(
+            SearchCriteria(
+                keywords=["it project manager"],
+                location="Dublin",
+                boards=["linkedin"],
+                easy_apply_only=True,
+                max_age_hours=3,
+            )
+        )
+        assert runs[0].saved_search_key == saved_search_key(
+            SearchCriteria(
+                keywords=["it project manager"],
+                location="Dublin",
+                boards=["linkedin"],
+                easy_apply_only=True,
+                max_age_hours=3,
+            )
+        )
         settings_row = (
             await session.execute(select(UserSettings).where(UserSettings.user_id == launched[0][1]))
         ).scalar_one()
