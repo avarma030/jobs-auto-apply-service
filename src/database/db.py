@@ -8,7 +8,7 @@ from loguru import logger
 from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.database.models import ApplicationRecord, Base, JobRecord
+from src.database.models import ApplicationRecord, Base, JobRecord, RunJobRecord
 from src.models import ApplicationStatus, Job
 
 
@@ -67,8 +67,11 @@ class Database:
     ) -> JobRecord:
         """Insert or update a job record. Returns the persisted record."""
         async with self.session_factory() as session:
-            # Check for existing record by URL
-            result = await session.execute(select(JobRecord).where(JobRecord.url == job.url))
+            # Check for existing record by URL within the current user scope.
+            q = select(JobRecord).where(JobRecord.url == job.url)
+            if user_id is not None:
+                q = q.where(JobRecord.user_id == user_id)
+            result = await session.execute(q)
             record = result.scalar_one_or_none()
 
             is_new = record is None
@@ -104,6 +107,15 @@ class Database:
             if job.notes is not None:
                 record.notes = job.notes
 
+            await session.flush()
+            if scrape_run_id:
+                link = await session.get(
+                    RunJobRecord,
+                    {"run_id": scrape_run_id, "job_id": record.id},
+                )
+                if link is None:
+                    session.add(RunJobRecord(run_id=scrape_run_id, job_id=record.id))
+
             await session.commit()
             return record
 
@@ -114,6 +126,42 @@ class Database:
         scrape_run_id: str | None = None,
     ) -> list[JobRecord]:
         async with self.session_factory() as session:
+            if scrape_run_id is not None:
+                linked_q = (
+                    select(JobRecord)
+                    .join(RunJobRecord, RunJobRecord.job_id == JobRecord.id)
+                    .where(
+                        RunJobRecord.run_id == scrape_run_id,
+                        JobRecord.application_status == ApplicationStatus.PENDING,
+                    )
+                    .order_by(JobRecord.scraped_at.desc())
+                )
+                if user_id is not None:
+                    linked_q = linked_q.where(JobRecord.user_id == user_id)
+                linked_records = list((await session.execute(linked_q)).scalars().all())
+
+                legacy_q = (
+                    select(JobRecord)
+                    .where(
+                        JobRecord.application_status == ApplicationStatus.PENDING,
+                        JobRecord.scrape_run_id == scrape_run_id,
+                    )
+                    .order_by(JobRecord.scraped_at.desc())
+                )
+                if user_id is not None:
+                    legacy_q = legacy_q.where(JobRecord.user_id == user_id)
+                legacy_records = list((await session.execute(legacy_q)).scalars().all())
+
+                merged: dict[int, JobRecord] = {}
+                for record in linked_records + legacy_records:
+                    merged.setdefault(record.id, record)
+                ordered = sorted(
+                    merged.values(),
+                    key=lambda record: record.scraped_at or datetime.min,
+                    reverse=True,
+                )
+                return ordered[:limit]
+
             q = select(JobRecord).where(
                 JobRecord.application_status == ApplicationStatus.PENDING
             )

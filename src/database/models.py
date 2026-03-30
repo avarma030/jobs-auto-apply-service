@@ -80,6 +80,20 @@ class ScrapeRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class RunJobRecord(Base):
+    """Association table recording which jobs were discovered in each run."""
+
+    __tablename__ = "run_jobs"
+
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("scrape_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True
+    )
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class JobRecord(Base):
     """Persisted job listing."""
 

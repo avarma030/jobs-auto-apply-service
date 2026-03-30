@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import AsyncGenerator
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import get_current_user, get_session
@@ -17,7 +18,7 @@ from src.api.schemas.runs import (
     RunResponse,
     RunSearchCriteriaResponse,
 )
-from src.database.models import JobRecord, ScrapeRun, User
+from src.database.models import JobRecord, RunJobRecord, ScrapeRun, User
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -64,18 +65,7 @@ async def get_run(
     current_user: User = Depends(get_current_user),
 ):
     row = await _get_run_or_404(run_id, current_user.id, session)
-    jobs = list(
-        (
-            await session.execute(
-                select(JobRecord)
-                .where(
-                    JobRecord.user_id == current_user.id,
-                    JobRecord.scrape_run_id == run_id,
-                )
-                .order_by(JobRecord.scraped_at.desc())
-            )
-        ).scalars().all()
-    )
+    jobs = (await _jobs_for_runs(session, current_user.id, [run_id])).get(run_id, [])
     summary = _job_summary_from_records(jobs)
     return RunDetailResponse(
         **_to_run_response(row, summary).model_dump(),
@@ -188,34 +178,58 @@ async def _job_status_counts_for_runs(
 ) -> dict[str, RunJobSummaryResponse]:
     if not run_ids:
         return {}
+    jobs_by_run = await _jobs_for_runs(session, user_id, run_ids)
+    return {
+        run_id: _job_summary_from_records(jobs_by_run.get(run_id, []))
+        for run_id in run_ids
+    }
 
-    rows = (
+
+async def _jobs_for_runs(
+    session: AsyncSession,
+    user_id: int,
+    run_ids: list[str],
+) -> dict[str, list[JobRecord]]:
+    if not run_ids:
+        return {}
+
+    grouped: dict[str, dict[int, JobRecord]] = {run_id: {} for run_id in run_ids}
+
+    linked_rows = (
         await session.execute(
-            select(
-                JobRecord.scrape_run_id,
-                JobRecord.application_status,
-                func.count(JobRecord.id),
-            )
+            select(RunJobRecord.run_id, JobRecord)
+            .join(JobRecord, JobRecord.id == RunJobRecord.job_id)
             .where(
+                RunJobRecord.run_id.in_(run_ids),
                 JobRecord.user_id == user_id,
-                JobRecord.scrape_run_id.in_(run_ids),
             )
-            .group_by(JobRecord.scrape_run_id, JobRecord.application_status)
         )
     ).all()
+    for run_id, record in linked_rows:
+        grouped.setdefault(run_id, {})[record.id] = record
 
-    summaries = {run_id: _empty_summary() for run_id in run_ids}
-    for run_id, status, count in rows:
-        if run_id is None:
+    legacy_rows = list(
+        (
+            await session.execute(
+                select(JobRecord).where(
+                    JobRecord.user_id == user_id,
+                    JobRecord.scrape_run_id.in_(run_ids),
+                )
+            )
+        ).scalars().all()
+    )
+    for record in legacy_rows:
+        if record.scrape_run_id is None:
             continue
-        summary = summaries.setdefault(run_id, _empty_summary())
-        normalized_status = str(status or "").lower()
-        if hasattr(summary, normalized_status):
-            setattr(summary, normalized_status, getattr(summary, normalized_status) + int(count))
+        grouped.setdefault(record.scrape_run_id, {}).setdefault(record.id, record)
 
     return {
-        run_id: _finalize_summary(summary)
-        for run_id, summary in summaries.items()
+        run_id: sorted(
+            records.values(),
+            key=lambda record: record.scraped_at or record.posted_at or datetime.min,
+            reverse=True,
+        )
+        for run_id, records in grouped.items()
     }
 
 

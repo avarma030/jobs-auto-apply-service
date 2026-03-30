@@ -325,6 +325,31 @@ class _FakeAllLocator:
         return self.items
 
 
+class _FakeTextInputField:
+    def __init__(self, value: str = "", input_type: str = "text"):
+        self.value = value
+        self.input_type = input_type
+        self.fills: list[str] = []
+
+    async def is_visible(self) -> bool:
+        return True
+
+    async def is_enabled(self) -> bool:
+        return True
+
+    async def get_attribute(self, name: str) -> str | None:
+        if name == "type":
+            return self.input_type
+        return None
+
+    async def input_value(self) -> str:
+        return self.value
+
+    async def fill(self, value: str) -> None:
+        self.fills.append(value)
+        self.value = value
+
+
 class _FakeResumePage:
     def __init__(self, inputs):
         self.inputs = inputs
@@ -776,6 +801,21 @@ def test_prepare_text_input_value_coerces_ai_text_for_numeric_experience_questio
     assert value == "6"
 
 
+def test_prepare_text_input_value_coerces_numeric_label_even_for_text_inputs():
+    applier = make_applier()
+    job = make_job()
+
+    value = applier._prepare_text_input_value(
+        "How many years of professional experience do you have as a Data Scientist in a production environment?",
+        "6 years",
+        field_type="text",
+        input_type="text",
+        job=job,
+    )
+
+    assert value == "6"
+
+
 def test_prepare_text_input_value_uses_job_salary_for_numeric_salary_question():
     applier = make_applier()
     job = make_job(salary_min=80000, salary_max=100000)
@@ -805,6 +845,28 @@ def test_prepare_text_input_value_uses_profile_city_when_ai_returns_placeholder_
     )
 
     assert value == "Dublin"
+
+
+@pytest.mark.asyncio
+async def test_repair_visible_numeric_inputs_coerces_textual_numeric_answers():
+    applier = make_applier()
+    applier._get_field_label = AsyncMock(
+        return_value="How many years experience do you have as a Data Scientist?"
+    )
+    applier._finalize_text_input = AsyncMock()
+    job = make_job()
+    inp = _FakeTextInputField(value="6 years", input_type="text")
+    page = SimpleNamespace(locator=lambda _selector: _FakeAllLocator([inp]))
+
+    async def _fake_human_type(target, value):
+        target.value = value
+
+    with patch.object(linkedin_mod._BM, "human_type", new=AsyncMock(side_effect=_fake_human_type)):
+        repaired = await applier._repair_visible_numeric_inputs(page, job)
+
+    assert repaired == 1
+    assert inp.fills == [""]
+    assert inp.value == "6"
 
 
 def test_is_non_resume_upload_field_detects_photo_context():
@@ -1043,6 +1105,21 @@ def test_get_prefill_override_value_maps_phone_country_code_select_to_profile_co
     assert override == "Germany (+49)"
 
 
+def test_get_profile_contact_answer_prefers_phone_dial_code_for_country_code_options():
+    profile = make_profile(
+        phone="+91 7773996608",
+        address=Address(city="Pune", country="British Indian Ocean Territory"),
+    )
+    applier = make_applier(profile)
+
+    answer = applier._get_profile_contact_answer(
+        "Phone country code",
+        options=["India (+91)", "British Indian Ocean Territory (+246)"],
+    )
+
+    assert answer == "India (+91)"
+
+
 def test_get_prefill_override_value_replaces_stale_contact_fields_from_profile():
     profile = make_profile(
         phone="+353 834151360",
@@ -1135,9 +1212,12 @@ class TestInferValueFromLabel:
         assert applier._infer_value_from_label("Phone number") == "+1-555-123-4567"
 
     def test_phone_country_code(self):
-        profile = make_profile(address=Address(city="Frankfurt am Main", country="Germany"))
+        profile = make_profile(
+            phone="+49 17669099987",
+            address=Address(city="Frankfurt am Main", country="Germany"),
+        )
         applier = make_applier(profile)
-        assert applier._infer_value_from_label("Phone country code") == "Germany"
+        assert applier._infer_value_from_label("Phone country code") == "+49"
 
     def test_linkedin_url(self):
         applier = make_applier()

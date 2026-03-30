@@ -355,6 +355,49 @@ class LinkedInApplier(BaseApplier):
         return None
 
     @staticmethod
+    def _label_expects_numeric_value(label: str) -> bool:
+        normalized_label = normalize_question_text(label).lower()
+        return any(
+            phrase in normalized_label
+            for phrase in (
+                "how many years",
+                "years of experience",
+                "years experience",
+                "salary expectation",
+                "salary expected",
+                "expected salary",
+                "salary requirement",
+                "compensation expectation",
+                "desired compensation",
+                "desired salary",
+                "annual pay",
+                "expected pay",
+            )
+        )
+
+    @staticmethod
+    def _extract_phone_digits(value: str | None) -> str:
+        if value is None:
+            return ""
+        return re.sub(r"\D+", "", value)
+
+    @staticmethod
+    def _extract_explicit_dial_code(value: str | None) -> str | None:
+        if value is None:
+            return None
+        match = re.match(r"^\s*(?:\+|00)(\d{1,4})(?:\D|$)", value.strip())
+        if not match:
+            return None
+        return match.group(1)
+
+    @staticmethod
+    def _extract_option_dial_code(option: str) -> str | None:
+        match = re.search(r"\+(\d{1,4})", option)
+        if not match:
+            return None
+        return match.group(1)
+
+    @staticmethod
     def _is_profile_contact_field(label: str) -> bool:
         normalized_label = normalize_question_text(label).lower()
         if not normalized_label:
@@ -373,6 +416,26 @@ class LinkedInApplier(BaseApplier):
     ) -> str | None:
         if not self._is_profile_contact_field(label):
             return None
+        normalized_label = normalize_question_text(label).lower()
+        if "country code" in normalized_label:
+            if options:
+                phone_digits = self._extract_phone_digits(self.profile.phone)
+                if phone_digits:
+                    best_option: str | None = None
+                    best_length = -1
+                    for option in options:
+                        dial_code = self._extract_option_dial_code(option)
+                        if dial_code and phone_digits.startswith(dial_code) and len(dial_code) > best_length:
+                            best_option = option
+                            best_length = len(dial_code)
+                    if best_option is not None:
+                        return best_option
+            explicit_dial_code = self._extract_explicit_dial_code(self.profile.phone)
+            if explicit_dial_code is not None:
+                expected = f"+{explicit_dial_code}"
+                if options is not None:
+                    return self._match_answer_to_options(expected, options)
+                return expected
         expected = self._clean_answer(self._infer_value_from_label(label))
         if expected is None:
             return None
@@ -995,16 +1058,20 @@ class LinkedInApplier(BaseApplier):
             await self._fill_modal_page(page, job)
 
             # Check for validation errors before advancing
-            error_el = page.locator(_ERROR_MSG).first
-            if await error_el.count() > 0:
-                error_text = await error_el.inner_text()
-                self._report_progress(
-                    f"[LinkedIn][Validation] Step {step + 1} error: {error_text}",
-                    level="warning",
-                )
-                logger.warning(f"[LinkedIn] Validation error at step {step + 1}: {error_text}")
-                await self._bm.screenshot(page, f"form_error_{job.external_id}_{step}")
-                return self._fail(job, f"Form validation error: {error_text}")
+            error_text = await self._get_validation_error_text(page)
+            if error_text:
+                recovered = await self._attempt_validation_recovery(page, job, error_text)
+                if recovered:
+                    await asyncio.sleep(0.4)
+                    error_text = await self._get_validation_error_text(page)
+                if error_text:
+                    self._report_progress(
+                        f"[LinkedIn][Validation] Step {step + 1} error: {error_text}",
+                        level="warning",
+                    )
+                    logger.warning(f"[LinkedIn] Validation error at step {step + 1}: {error_text}")
+                    await self._bm.screenshot(page, f"form_error_{job.external_id}_{step}")
+                    return self._fail(job, f"Form validation error: {error_text}")
 
             # Stuck detection â€” same step label twice in a row
             if step_label and step_label == prev_step_label:
@@ -1163,7 +1230,11 @@ class LinkedInApplier(BaseApplier):
         if any(token in normalized_label for token in ("location", "city", "town")):
             if cleaned_value.strip().lower() in {"not specified", "unknown", "none", "null"}:
                 return self._clean_answer(self._infer_value_from_label(label))
-        if field_type != "number" and input_type not in {"number", "range"}:
+        if (
+            field_type != "number"
+            and input_type not in {"number", "range"}
+            and not self._label_expects_numeric_value(label)
+        ):
             return cleaned_value
 
         numeric_value = self._extract_numeric_text(cleaned_value)
@@ -1184,11 +1255,7 @@ class LinkedInApplier(BaseApplier):
 
         if any(
             phrase in normalized_label
-            for phrase in (
-                "years of experience",
-                "years experience",
-                "how many years",
-            )
+            for phrase in ("years of experience", "years experience", "how many years")
         ):
             if self.profile.years_of_experience is not None:
                 return str(self.profile.years_of_experience)
@@ -1350,6 +1417,76 @@ class LinkedInApplier(BaseApplier):
     def _modal_descendants(selector: str) -> str:
         modal_roots = [part.strip() for part in _MODAL.split(",")]
         return ", ".join(f"{root} {selector}" for root in modal_roots)
+
+    async def _get_validation_error_text(self, page: Page) -> str | None:
+        errors = await page.locator(_ERROR_MSG).all()
+        for error in errors:
+            try:
+                if not await error.is_visible():
+                    continue
+                text = self._clean_answer(await error.inner_text())
+                if text:
+                    return text
+            except Exception:
+                continue
+        return None
+
+    async def _attempt_validation_recovery(
+        self,
+        page: Page,
+        job: Job,
+        error_text: str,
+    ) -> bool:
+        repaired_numeric_fields = await self._repair_visible_numeric_inputs(page, job)
+        if repaired_numeric_fields:
+            self._report_progress(
+                "[LinkedIn][Validation] Corrected numeric field formatting and retrying"
+            )
+            logger.info(
+                f"[LinkedIn] Corrected {repaired_numeric_fields} numeric field(s) after validation error: "
+                f"{error_text}"
+            )
+            return True
+        return False
+
+    async def _repair_visible_numeric_inputs(self, page: Page, job: Job) -> int:
+        repaired = 0
+        inputs = await page.locator(self._modal_descendants(_TEXT_INPUTS)).all()
+        for inp in inputs:
+            try:
+                if not await inp.is_visible() or not await inp.is_enabled():
+                    continue
+            except Exception:
+                continue
+
+            label = await self._get_field_label(page, inp)
+            input_type = ((await inp.get_attribute("type")) or "text").strip().lower()
+            if input_type not in {"number", "range"} and not self._label_expects_numeric_value(label):
+                continue
+
+            current_val = await inp.input_value()
+            prepared = self._prepare_text_input_value(
+                label,
+                current_val,
+                field_type="number",
+                input_type=input_type,
+                job=job,
+            )
+            if prepared is None:
+                continue
+            current_clean = self._clean_answer(current_val)
+            if current_clean is not None and self._normalize_choice(current_clean) == self._normalize_choice(
+                prepared
+            ):
+                continue
+
+            await inp.fill("")
+            await _BM.human_type(inp, prepared)
+            await self._finalize_text_input(page, inp)
+            self._remember_answer(label, prepared)
+            repaired += 1
+
+        return repaired
 
     # ------------------------------------------------------------------
     # Form filling
@@ -2078,6 +2215,9 @@ class LinkedInApplier(BaseApplier):
         if "email" in label_lower:
             return p.email
         if "country code" in label_lower and "phone" in label_lower:
+            explicit_dial_code = self._extract_explicit_dial_code(p.phone)
+            if explicit_dial_code is not None:
+                return f"+{explicit_dial_code}"
             return p.address.country if p.address else ""
         if "phone" in label_lower or "mobile" in label_lower:
             return p.phone or ""
