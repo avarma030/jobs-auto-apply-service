@@ -137,6 +137,56 @@ _EXP_LEVEL_MAP = {
 _PAGE_SIZE = 25
 _MAX_PAGES = 40  # 1 000 jobs per search
 
+_RELEVANCE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "with",
+}
+
+_KEYWORD_PHRASE_ALIASES: dict[str, tuple[str, ...]] = {
+    "project manager": (
+        "program manager",
+        "delivery manager",
+        "project management",
+        "pmo",
+    ),
+    "product manager": (
+        "product owner",
+    ),
+    "ai engineer": (
+        "machine learning engineer",
+        "ml engineer",
+        "artificial intelligence engineer",
+    ),
+    "machine learning engineer": (
+        "ai engineer",
+        "ml engineer",
+        "artificial intelligence engineer",
+    ),
+    "ml engineer": (
+        "ai engineer",
+        "machine learning engineer",
+        "artificial intelligence engineer",
+    ),
+}
+
+_KEYWORD_TOKEN_ALIASES: dict[str, tuple[str, ...]] = {
+    "ai": ("ai", "artificial intelligence", "ml", "machine learning"),
+    "machine": ("machine learning", "ml", "ai", "artificial intelligence"),
+    "learning": ("machine learning", "ml", "ai", "artificial intelligence"),
+    "project": ("project", "program", "delivery", "pmo"),
+    "engineer": ("engineer", "engineering", "developer"),
+    "developer": ("developer", "engineer", "engineering"),
+}
+
 # Signals LinkedIn returned a login/CAPTCHA wall instead of job cards
 _CAPTCHA_SIGNALS = (
     "authwall",
@@ -556,6 +606,12 @@ class LinkedInScraper(BaseScraper):
                 title = card.get("title", "")
                 if any(kw.lower() in title.lower() for kw in search_filter.exclude_keywords):
                     continue
+                if not self._is_card_relevant(search_filter, card):
+                    logger.debug(
+                        f"[LinkedIn] Search card {job_id} filtered as low relevance for "
+                        f"keywords={search_filter.keywords}: {title}"
+                    )
+                    continue
 
                 card_easy_apply = card.get("easy_apply", False)
                 if search_filter.easy_apply_only and not card_easy_apply:
@@ -593,6 +649,73 @@ class LinkedInScraper(BaseScraper):
 
             # Randomized delay â€” breaks fixed-interval bot detection pattern
             await asyncio.sleep(max(1.0, settings.request_delay_seconds + random.uniform(-0.5, 2.0)))
+
+    @staticmethod
+    def _normalize_relevance_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+    @classmethod
+    def _phrase_in_text(cls, text: str, phrase: str) -> bool:
+        normalized_text = cls._normalize_relevance_text(text)
+        normalized_phrase = cls._normalize_relevance_text(phrase)
+        if not normalized_text or not normalized_phrase:
+            return False
+        return f" {normalized_phrase} " in f" {normalized_text} "
+
+    @classmethod
+    def _keyword_alias_phrases(cls, keyword: str) -> list[str]:
+        normalized_keyword = cls._normalize_relevance_text(keyword)
+        if not normalized_keyword:
+            return []
+        aliases = {normalized_keyword}
+        for phrase, phrase_aliases in _KEYWORD_PHRASE_ALIASES.items():
+            if phrase in normalized_keyword:
+                aliases.update(phrase_aliases)
+        return list(aliases)
+
+    @classmethod
+    def _keyword_tokens(cls, keyword: str) -> list[str]:
+        normalized_keyword = cls._normalize_relevance_text(keyword)
+        return [
+            token
+            for token in normalized_keyword.split()
+            if token and token not in _RELEVANCE_STOPWORDS
+        ]
+
+    @classmethod
+    def _keyword_matches_title(cls, keyword: str, title: str) -> bool:
+        normalized_title = cls._normalize_relevance_text(title)
+        if not normalized_title:
+            return False
+
+        for alias in cls._keyword_alias_phrases(keyword):
+            if cls._phrase_in_text(normalized_title, alias):
+                return True
+
+        tokens = cls._keyword_tokens(keyword)
+        if not tokens:
+            return True
+
+        matched_tokens = 0
+        for token in tokens:
+            candidate_phrases = _KEYWORD_TOKEN_ALIASES.get(token, (token,))
+            if any(cls._phrase_in_text(normalized_title, phrase) for phrase in candidate_phrases):
+                matched_tokens += 1
+
+        if len(tokens) == 1:
+            return matched_tokens == 1
+        if len(tokens) == 2:
+            return matched_tokens == 2
+        return matched_tokens >= max(2, (len(tokens) + 1) // 2)
+
+    @classmethod
+    def _is_card_relevant(cls, search_filter: JobSearchFilter, card: dict) -> bool:
+        if not search_filter.keywords:
+            return True
+        title = str(card.get("title") or "")
+        if not title.strip():
+            return False
+        return any(cls._keyword_matches_title(keyword, title) for keyword in search_filter.keywords)
 
     async def get_job_details(self, job: Job) -> Job:
         """Fetch full job details via a 3-tier cascade:

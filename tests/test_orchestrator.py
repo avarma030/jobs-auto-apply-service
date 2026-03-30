@@ -600,3 +600,34 @@ async def test_scrape_board_easy_apply_only_still_skips_non_easy_apply_when_auth
     assert count == 0
     assert fake_scraper.detail_calls == ["10"]
     assert db.upserted_jobs == []
+
+
+@pytest.mark.asyncio
+async def test_scrape_board_skips_redundant_inter_job_delay_for_linkedin(monkeypatch):
+    db = FakeDb([])
+    orch = Orchestrator(profile=make_profile(), db=db)
+    fake_scraper = FakeScraper(authenticated=True)
+    sleep_mock = AsyncMock()
+
+    monkeypatch.setitem(
+        orchestrator_module.SCRAPER_REGISTRY,
+        "linkedin",
+        lambda credentials=None: fake_scraper,
+    )
+    monkeypatch.setattr(settings, "request_delay_seconds", 20)
+    monkeypatch.setattr(orchestrator_module.asyncio, "sleep", sleep_mock)
+
+    count = await orch._scrape_board(
+        "linkedin",
+        JobSearchFilter(
+            keywords=["project manager"],
+            easy_apply_only=False,
+            max_age_days=0,
+            max_jobs=2,
+        ),
+        user_id=9,
+        run_id="run-fast",
+    )
+
+    assert count == 2
+    sleep_mock.assert_not_awaited()

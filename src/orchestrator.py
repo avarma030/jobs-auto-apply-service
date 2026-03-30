@@ -757,7 +757,9 @@ class Orchestrator:
                             "after detail verification"
                         )
                         break
-                    await asyncio.sleep(settings.request_delay_seconds)
+                    delay_seconds = 0.0 if board == "linkedin" else settings.request_delay_seconds
+                    if delay_seconds > 0:
+                        await asyncio.sleep(delay_seconds)
         except NotImplementedError:
             logger.warning(f"[{board}] Scraper not yet implemented — skipping")
         except Exception as exc:

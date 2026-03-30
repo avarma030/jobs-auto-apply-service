@@ -209,6 +209,20 @@ def test_load_cookies_ignores_different_account_owner(tmp_path):
         assert scraper._load_cookies() is None
 
 
+def test_keyword_matches_title_rejects_loose_manager_match():
+    assert LinkedInScraper._keyword_matches_title(
+        "project manager",
+        "Senior Account Manager, Workplace Technology",
+    ) is False
+
+
+def test_keyword_matches_title_accepts_program_manager_alias():
+    assert LinkedInScraper._keyword_matches_title(
+        "project manager",
+        "Technical Program Manager",
+    ) is True
+
+
 def test_load_cookies_falls_back_to_legacy_authenticated_cookie_file(tmp_path):
     scraper = make_scraper()
     scraper.credentials = {
@@ -398,6 +412,14 @@ class TestBuildSearchParams:
         f = JobSearchFilter(keywords=["engineer"], max_age_days=7, max_age_hours=3)
         params = scraper._build_search_params(f)
         assert params["f_TPR"] == "r10800"
+
+    def test_parse_relative_posted_at_supports_hours_ago(self):
+        scraper = make_scraper()
+        now = datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc)
+
+        posted_at = scraper._parse_relative_posted_at("3 hours ago", now=now)
+
+        assert posted_at == datetime(2026, 3, 30, 15, 0, tzinfo=timezone.utc)
 
     def test_parse_relative_posted_at_supports_days_ago(self):
         scraper = make_scraper()
@@ -604,6 +626,60 @@ async def test_search_easy_apply_only_defers_filter_until_detail_fetch():
 
 
 @pytest.mark.asyncio
+async def test_search_filters_irrelevant_titles_before_easy_apply_verification():
+    scraper = make_scraper()
+    scraper._cookies = {"li_at": "auth-cookie"}
+    html = """
+<ul>
+  <li>
+    <div class="base-card" data-entity-urn="urn:li:jobPosting:4390000001">
+      <a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/4390000001/"></a>
+      <div class="base-search-card__info">
+        <h3 class="base-search-card__title">Psychologists</h3>
+        <h4 class="base-search-card__subtitle"><a class="hidden-nested-link">Acme</a></h4>
+        <div class="base-search-card__metadata">
+          <span class="job-search-card__location">Dublin, Ireland</span>
+          <time datetime="2026-03-30T12:00:00.000Z">2 hours ago</time>
+        </div>
+      </div>
+    </div>
+  </li>
+  <li>
+    <div class="base-card" data-entity-urn="urn:li:jobPosting:4390000002">
+      <a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/4390000002/"></a>
+      <div class="base-search-card__info">
+        <h3 class="base-search-card__title">Senior Project Manager</h3>
+        <h4 class="base-search-card__subtitle"><a class="hidden-nested-link">Acme</a></h4>
+        <div class="base-search-card__metadata">
+          <span class="job-search-card__location">Dublin, Ireland</span>
+          <time datetime="2026-03-30T12:00:00.000Z">2 hours ago</time>
+        </div>
+      </div>
+    </div>
+  </li>
+</ul>
+"""
+    call_count = 0
+
+    async def fake_fetch(params):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return html
+        return ""
+
+    scraper._fetch_search_page = fake_fetch
+
+    jobs = []
+    async for job in scraper.search(
+        JobSearchFilter(keywords=["project manager"], location="ireland", max_age_days=0, easy_apply_only=True)
+    ):
+        jobs.append(job)
+
+    assert [job.external_id for job in jobs] == ["4390000002"]
+
+
+@pytest.mark.asyncio
 async def test_search_does_not_stop_on_first_old_card_when_later_card_is_within_cutoff():
     scraper = make_scraper()
     scraper._cookies = {"li_at": "auth-cookie"}
@@ -660,6 +736,67 @@ async def test_search_does_not_stop_on_first_old_card_when_later_card_is_within_
             jobs.append(job)
 
     assert [job.external_id for job in jobs] == ["4389451650"]
+    assert call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_search_respects_three_hour_window_exactly():
+    scraper = make_scraper()
+    scraper._cookies = {"li_at": "auth-cookie"}
+    three_hour_window_html = """
+<ul>
+  <li>
+    <div class="base-card" data-entity-urn="urn:li:jobPosting:4392913756">
+      <a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/4392913756/"></a>
+      <div class="base-search-card__info">
+        <h3 class="base-search-card__title">Fresh AI Engineer</h3>
+        <h4 class="base-search-card__subtitle"><a class="hidden-nested-link">Acme</a></h4>
+        <div class="base-search-card__metadata">
+          <span class="job-search-card__location">Frankfurt, Germany</span>
+          <time datetime="2026-03-30T16:00:00.000Z">2 hours ago</time>
+        </div>
+      </div>
+    </div>
+  </li>
+  <li>
+    <div class="base-card" data-entity-urn="urn:li:jobPosting:4392913999">
+      <a class="base-card__full-link" href="https://www.linkedin.com/jobs/view/4392913999/"></a>
+      <div class="base-search-card__info">
+        <h3 class="base-search-card__title">Stale AI Engineer</h3>
+        <h4 class="base-search-card__subtitle"><a class="hidden-nested-link">Acme</a></h4>
+        <div class="base-search-card__metadata">
+          <span class="job-search-card__location">Frankfurt, Germany</span>
+          <time datetime="2026-03-30T14:00:00.000Z">4 hours ago</time>
+        </div>
+      </div>
+    </div>
+  </li>
+</ul>
+"""
+
+    call_count = 0
+
+    async def fake_fetch(params):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return three_hour_window_html
+        return ""
+
+    scraper._fetch_search_page = fake_fetch
+
+    with patch("src.scrapers.linkedin.datetime") as dt_mock, patch("src.models.job.datetime") as job_dt_mock:
+        dt_mock.now.return_value = datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc)
+        dt_mock.fromisoformat.side_effect = datetime.fromisoformat
+        dt_mock.utcnow.side_effect = datetime.utcnow
+        job_dt_mock.now.return_value = datetime(2026, 3, 30, 18, 0, tzinfo=timezone.utc)
+        jobs = []
+        async for job in scraper.search(
+            JobSearchFilter(keywords=["ai engineer"], location="frankfurt", max_age_hours=3)
+        ):
+            jobs.append(job)
+
+    assert [job.external_id for job in jobs] == ["4392913756"]
     assert call_count == 2
 
 
