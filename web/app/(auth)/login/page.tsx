@@ -24,7 +24,8 @@ export default function LoginPage() {
     try {
       const res = await auth.login(email, password);
       setToken(res.access_token);
-      router.push("/");
+      router.replace("/");
+      router.refresh();
     } catch (err: any) {
       setError(err.message ?? "Login failed");
     } finally {

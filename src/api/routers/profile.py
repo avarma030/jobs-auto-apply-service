@@ -26,7 +26,9 @@ async def get_profile(
     current_user: User = Depends(get_current_user),
 ):
     row = await _get_or_create_profile(current_user.id, session)
-    return ProfileResponse(profile=json.loads(row.profile_json))
+    profile_data = json.loads(row.profile_json)
+    await _write_profile_json(profile_data)
+    return ProfileResponse(profile=profile_data)
 
 
 @router.put("", response_model=ProfileResponse)

@@ -25,7 +25,8 @@ export default function RegisterPage() {
     try {
       const res = await auth.register(email, password);
       setToken(res.access_token);
-      router.push("/");
+      router.replace("/");
+      router.refresh();
     } catch (err: any) {
       setError(err.message ?? "Registration failed");
     } finally {

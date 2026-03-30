@@ -28,7 +28,8 @@ export function Sidebar() {
 
   function logout() {
     clearToken();
-    router.push("/login");
+    router.replace("/login");
+    router.refresh();
   }
 
   return (
