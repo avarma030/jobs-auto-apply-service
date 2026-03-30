@@ -155,3 +155,20 @@ class ApplicationRecord(Base):
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     confirmation_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class SemanticCacheRecord(Base):
+    """Cached semantic extractions and match decisions."""
+
+    __tablename__ = "semantic_cache"
+
+    key: Mapped[str] = mapped_column(String(191), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )

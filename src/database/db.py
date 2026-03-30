@@ -8,7 +8,13 @@ from loguru import logger
 from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.database.models import ApplicationRecord, Base, JobRecord, RunJobRecord
+from src.database.models import (
+    ApplicationRecord,
+    Base,
+    JobRecord,
+    RunJobRecord,
+    SemanticCacheRecord,
+)
 from src.models import ApplicationStatus, Job
 
 
@@ -278,6 +284,68 @@ class Database:
             session.add(record)
             await session.commit()
             return record
+
+    async def get_semantic_cache(
+        self,
+        key: str,
+        source_hash: str | None = None,
+    ) -> dict | None:
+        async with self.session_factory() as session:
+            record = await session.get(SemanticCacheRecord, key)
+            if record is None:
+                return None
+            if source_hash is not None and record.source_hash != source_hash:
+                return None
+            try:
+                return json.loads(record.payload_json)
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid semantic cache payload for key '{key}'")
+                return None
+
+    async def upsert_semantic_cache(
+        self,
+        key: str,
+        *,
+        kind: str,
+        source_hash: str,
+        payload: dict,
+        user_id: int | None = None,
+    ) -> None:
+        async with self.session_factory() as session:
+            record = await session.get(SemanticCacheRecord, key)
+            if record is None:
+                record = SemanticCacheRecord(key=key, kind=kind, source_hash=source_hash)
+                session.add(record)
+            record.kind = kind
+            record.user_id = user_id
+            record.source_hash = source_hash
+            record.payload_json = json.dumps(payload)
+            await session.commit()
+
+    async def get_recent_match_examples(
+        self,
+        user_id: int,
+        *,
+        limit: int = 12,
+        exclude_job_id: int | None = None,
+    ) -> list[JobRecord]:
+        async with self.session_factory() as session:
+            q = select(JobRecord).where(
+                JobRecord.user_id == user_id,
+                JobRecord.description.is_not(None),
+                JobRecord.application_status.in_(
+                    [
+                        ApplicationStatus.APPLIED,
+                        ApplicationStatus.INTERVIEWED,
+                        ApplicationStatus.OFFERED,
+                    ]
+                ),
+            )
+            if exclude_job_id is not None:
+                q = q.where(JobRecord.id != exclude_job_id)
+            q = q.order_by(JobRecord.applied_at.desc(), JobRecord.scraped_at.desc()).limit(limit)
+            result = await session.execute(q)
+            return list(result.scalars().all())
 
     async def update_profile_custom_answers(
         self, user_id: int, custom_answers: dict[str, str]

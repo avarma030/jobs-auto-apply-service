@@ -390,7 +390,16 @@ class Orchestrator:
                 continue
 
             score = await ai_matcher.score_compatibility(
-                resume_text, job.title, job.description or "", ai, settings.anthropic_model
+                resume_text,
+                job.title,
+                job.description or "",
+                ai,
+                settings.anthropic_model,
+                search_keywords=search_filter.keywords,
+                profile=self.profile,
+                cache_backend=self.db,
+                user_id=user_id,
+                job_id=record.id,
             )
             job.match_score = score
 
