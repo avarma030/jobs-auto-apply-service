@@ -673,6 +673,25 @@ async def test_set_checkbox_state_falls_back_to_dom_toggle_when_clicks_are_block
     assert ("evaluate", True) in checkbox.calls
 
 
+def test_checkbox_policy_unchecks_mark_job_as_top_choice():
+    assert (
+        LinkedInApplier._checkbox_policy_answer(
+            "Mark job as a top choice",
+            identifier="jobDetailsEasyApplyTopChoiceCheckbox",
+        )
+        == "No"
+    )
+
+
+def test_checkbox_policy_unchecks_follow_company_checkbox():
+    assert (
+        LinkedInApplier._checkbox_policy_answer(
+            "Follow Acme Corp to stay up to date with their page."
+        )
+        == "No"
+    )
+
+
 @pytest.mark.asyncio
 async def test_set_radio_state_falls_back_to_label_click_when_input_is_blocked():
     applier = make_applier()
@@ -1024,6 +1043,31 @@ def test_get_prefill_override_value_maps_phone_country_code_select_to_profile_co
     assert override == "Germany (+49)"
 
 
+def test_get_prefill_override_value_replaces_stale_contact_fields_from_profile():
+    profile = make_profile(
+        phone="+353 834151360",
+        address=Address(city="Dublin", state="Leinster", zip_code="D02", country="Ireland"),
+    )
+    applier = make_applier(profile)
+
+    assert (
+        applier._get_prefill_override_value(
+            "Mobile phone number",
+            "+246 123456",
+            field_type="text",
+        )
+        == "+353 834151360"
+    )
+    assert (
+        applier._get_prefill_override_value(
+            "Location (city)",
+            "Mumbai",
+            field_type="text",
+        )
+        == "Dublin"
+    )
+
+
 @pytest.mark.asyncio
 async def test_resolve_answer_does_not_emit_duplicate_request_progress_logs():
     applier = make_applier()
@@ -1042,6 +1086,35 @@ async def test_resolve_answer_does_not_emit_duplicate_request_progress_logs():
     assert answer == "No"
     assert source == "ai"
     assert messages == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_answer_prefers_profile_contact_values_over_saved_answers():
+    profile = make_profile(
+        phone="+353 834151360",
+        address=Address(city="Dublin", state="Leinster", zip_code="D02", country="Ireland"),
+        custom_answers={
+            "Mobile phone number": "+246 123456",
+            "Location (city)": "Mumbai",
+            "Phone country code": "British Indian Ocean Territory (+246)",
+        },
+    )
+    applier = make_applier(profile)
+
+    phone_answer, phone_source = await applier._resolve_answer("Mobile phone number", "text")
+    city_answer, city_source = await applier._resolve_answer("Location (city)", "text")
+    code_answer, code_source = await applier._resolve_answer(
+        "Phone country code",
+        "select",
+        options=["Ireland (+353)", "British Indian Ocean Territory (+246)"],
+    )
+
+    assert phone_answer == "+353 834151360"
+    assert phone_source == "inferred"
+    assert city_answer == "Dublin"
+    assert city_source == "inferred"
+    assert code_answer == "Ireland (+353)"
+    assert code_source == "inferred"
 
 
 class TestInferValueFromLabel:

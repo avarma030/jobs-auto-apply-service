@@ -354,6 +354,48 @@ class LinkedInApplier(BaseApplier):
                     return option
         return None
 
+    @staticmethod
+    def _is_profile_contact_field(label: str) -> bool:
+        normalized_label = normalize_question_text(label).lower()
+        if not normalized_label:
+            return False
+        if "country code" in normalized_label:
+            return True
+        if any(token in normalized_label for token in ("phone", "mobile")):
+            return True
+        return "city" in normalized_label
+
+    def _get_profile_contact_answer(
+        self,
+        label: str,
+        *,
+        options: list[str] | None = None,
+    ) -> str | None:
+        if not self._is_profile_contact_field(label):
+            return None
+        expected = self._clean_answer(self._infer_value_from_label(label))
+        if expected is None:
+            return None
+        if options is not None:
+            return self._match_answer_to_options(expected, options)
+        return expected
+
+    @staticmethod
+    def _checkbox_policy_answer(label: str, identifier: str = "") -> str | None:
+        normalized_label = normalize_question_text(label).lower()
+        normalized_identifier = normalize_question_key(identifier)
+        if (
+            "mark job as a top choice" in normalized_label
+            or "topchoice" in normalized_identifier
+        ):
+            return "No"
+        if (
+            normalized_label.startswith("follow ")
+            and "stay up to date with their page" in normalized_label
+        ):
+            return "No"
+        return None
+
     def _remember_answer(self, question: str, answer: str) -> None:
         normalized_question = normalize_question_text(question)
         if not normalized_question:
@@ -413,6 +455,11 @@ class LinkedInApplier(BaseApplier):
         ]
 
         saved_answer = self._clean_answer(self._answer_for_label(question))
+        forced_profile_answer = self._get_profile_contact_answer(question, options=choice_options)
+        if forced_profile_answer is not None:
+            self._remember_answer(question, forced_profile_answer)
+            return forced_profile_answer, "inferred"
+
         if saved_answer is not None:
             matched = self._match_answer_to_options(saved_answer, choice_options)
             if choice_options and matched is None:
@@ -1327,6 +1374,26 @@ class LinkedInApplier(BaseApplier):
             input_type = ((await inp.get_attribute("type")) or "text").strip().lower()
             field_type = "number" if input_type in {"number", "range"} else "text"
             current_val = await inp.input_value()
+            forced_profile_value = self._get_profile_contact_answer(label)
+            if forced_profile_value is not None:
+                prepared_profile_value = self._prepare_text_input_value(
+                    label,
+                    forced_profile_value,
+                    field_type=field_type,
+                    input_type=input_type,
+                    job=job,
+                )
+                if prepared_profile_value is not None:
+                    current_clean = self._clean_answer(current_val)
+                    if self._normalize_choice(current_clean or "") != self._normalize_choice(
+                        prepared_profile_value
+                    ):
+                        await inp.fill("")
+                        await _BM.human_type(inp, prepared_profile_value)
+                        await self._finalize_text_input(page, inp)
+                    self._remember_answer(label, prepared_profile_value)
+                    self._record_answer(label, prepared_profile_value, "profile", field_type)
+                    continue
             if current_val.strip():
                 override_value = self._get_prefill_override_value(
                     label,
@@ -1422,7 +1489,35 @@ class LinkedInApplier(BaseApplier):
                 if candidate and candidate.lower() != "select an option":
                     options.append(candidate)
 
+            forced_profile_value = self._get_profile_contact_answer(label, options=options)
             current_val = await sel.input_value()
+            if forced_profile_value is not None:
+                selected_label = current_val
+                try:
+                    selected_option = sel.locator("option:checked").first
+                    if await selected_option.count() > 0:
+                        candidate = self._clean_answer(await selected_option.inner_text())
+                        if candidate is not None:
+                            selected_label = candidate
+                except Exception:
+                    pass
+                if self._normalize_choice(selected_label or "") != self._normalize_choice(
+                    forced_profile_value
+                ):
+                    try:
+                        await sel.select_option(value=str(forced_profile_value))
+                    except Exception:
+                        try:
+                            await sel.select_option(label=str(forced_profile_value))
+                        except Exception:
+                            logger.debug(
+                                f"[LinkedIn] Could not force '{label}' to '{forced_profile_value}'"
+                            )
+                            self._mark_unanswered(label, "select", options=options)
+                            continue
+                self._remember_answer(label, forced_profile_value)
+                self._record_answer(label, forced_profile_value, "profile", "select")
+                continue
             if current_val and current_val not in ("", "Select an option"):
                 selected_label = current_val
                 try:
@@ -1605,10 +1700,27 @@ class LinkedInApplier(BaseApplier):
             if not await cb.is_visible():
                 continue
             cb_id = await cb.get_attribute("id") or ""
+            cb_name = await cb.get_attribute("name") or ""
             label_el = page.locator(f"label[for='{cb_id}']") if cb_id else None
             label = ""
             if label_el is not None and await label_el.count() > 0:
                 label = (await label_el.inner_text()).strip()
+
+            policy_answer = self._checkbox_policy_answer(label, identifier=cb_name or cb_id)
+            if policy_answer is not None:
+                await self._set_checkbox_state(
+                    cb,
+                    False,
+                    label=label or cb_name or cb_id,
+                    label_el=label_el,
+                )
+                self._record_answer(
+                    label or cb_name or cb_id,
+                    "No",
+                    "policy",
+                    "checkbox",
+                )
+                continue
 
             try:
                 if await cb.is_checked():
