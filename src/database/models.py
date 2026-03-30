@@ -102,6 +102,35 @@ class RunEventRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
+class RunExecutionRecord(Base):
+    """Durable queue/worker execution metadata for a scrape run."""
+
+    __tablename__ = "run_executions"
+
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("scrape_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    request_payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="queued", index=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    dispatch_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    execution_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
 class RunJobRecord(Base):
     """Association table recording which jobs were discovered in each run."""
 

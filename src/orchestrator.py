@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect as pyinspect
 import json
 from collections.abc import Awaitable
 from datetime import datetime
@@ -130,6 +131,7 @@ class Orchestrator:
         scrape_run_id: str | None = None,
         limit: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
+        should_cancel: Callable[[], bool | Awaitable[bool]] | None = None,
     ) -> dict:
         """Apply to pending jobs. Returns status counts."""
         def _emit(msg: str) -> None:
@@ -137,6 +139,14 @@ class Orchestrator:
                 progress_callback(msg)
             else:
                 logger.info(msg)
+
+        async def _cancel_requested() -> bool:
+            if should_cancel is None:
+                return False
+            decision = should_cancel()
+            if pyinspect.isawaitable(decision):
+                return bool(await decision)
+            return bool(decision)
 
         pending_limit = limit if limit is not None else settings.max_applications_per_run
         pending = await self.db.get_pending_jobs(
@@ -152,8 +162,16 @@ class Orchestrator:
             "skipped": 0,
             "dry_run": 0,
         }
+        if await _cancel_requested():
+            _emit("Run cancellation requested — stopping before application phase.")
+            counts["cancelled"] = 1
+            return counts
         blocked_boards: dict[str, str] = {}
         for record in pending:
+            if await _cancel_requested():
+                _emit("Run cancellation requested — stopping application phase.")
+                counts["cancelled"] = 1
+                break
             job = self._record_to_job(record)
             board_block_reason = blocked_boards.get(job.source_board)
             if board_block_reason:
@@ -283,6 +301,7 @@ class Orchestrator:
         run_id: str | None = None,
         progress_callback: Callable[[str], None] | None = None,
         tailor_documents: bool = True,
+        should_cancel: Callable[[], bool | Awaitable[bool]] | None = None,
     ) -> dict:
         """
         End-to-end pipeline:
@@ -303,12 +322,23 @@ class Orchestrator:
             if progress_callback:
                 progress_callback(f"{_ts()} {msg}")
 
+        async def _cancel_requested() -> bool:
+            if should_cancel is None:
+                return False
+            decision = should_cancel()
+            if pyinspect.isawaitable(decision):
+                return bool(await decision)
+            return bool(decision)
+
         criteria_json = json.dumps(
             self._search_criteria_for_log(search_filter),
             ensure_ascii=False,
         )
         _emit(f"[Search][Criteria] {criteria_json}")
         _emit("🚀 Pipeline starting — scraping jobs …")
+        if await _cancel_requested():
+            _emit("Run cancellation requested — stopping before scrape phase.")
+            return {"applied": 0, "failed": 0, "skipped": 0, "dry_run": 0, "scraped": 0, "cancelled": 1}
         jobs_found = await self.run_scrape(search_filter, user_id=user_id, run_id=run_id)
         current_run_limit = self._resolve_current_run_limit(search_filter, jobs_found)
         _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
@@ -328,6 +358,7 @@ class Orchestrator:
                 scrape_run_id=run_id,
                 limit=current_run_limit,
                 progress_callback=_emit,
+                should_cancel=_cancel_requested,
             )
             counts["scraped"] = jobs_found
             return counts
@@ -384,6 +415,16 @@ class Orchestrator:
         skipped_score = 0
 
         for i, record in enumerate(pending, 1):
+            if await _cancel_requested():
+                _emit("Run cancellation requested — stopping during scoring.")
+                return {
+                    "applied": 0,
+                    "failed": 0,
+                    "skipped": skipped_score,
+                    "dry_run": 0,
+                    "scraped": jobs_found,
+                    "cancelled": 1,
+                }
             job = self._record_to_job(record)
             if not resume_text or not ai:
                 # Cannot score — leave as pending for manual review, do not auto-qualify
@@ -440,6 +481,10 @@ class Orchestrator:
         }
 
         for idx, (record, job) in enumerate(qualified, 1):
+            if await _cancel_requested():
+                _emit("Run cancellation requested — stopping before remaining tailoring/apply steps.")
+                counts["cancelled"] = 1
+                break
             uid = user_id or 0
             job_dir = user_tailored_dir(uid, record.id)
 

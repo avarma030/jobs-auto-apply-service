@@ -79,6 +79,11 @@ class RunResponse(BaseModel):
     jobs_applied: int = 0
     job_summary: RunJobSummaryResponse = Field(default_factory=RunJobSummaryResponse)
     error_message: Optional[str] = None
+    execution_state: Optional[str] = None
+    cancel_requested: bool = False
+    worker_id: Optional[str] = None
+    dispatch_attempts: int = 0
+    execution_attempts: int = 0
 
     model_config = {"from_attributes": True}
 

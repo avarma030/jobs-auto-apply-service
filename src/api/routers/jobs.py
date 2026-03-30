@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Optional
 
 import openpyxl
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_user, get_session
+from src.api.deps import get_current_user, get_database, get_session
 from src.api.schemas.jobs import (
     JobResponse,
     JobStatusUpdate,
@@ -26,6 +26,7 @@ from src.api.schemas.jobs import (
     SearchCriteria,
     ScrapeRequest,
 )
+from src.database.db import Database
 from src.database.models import JobRecord, RunEventRecord, RunJobRecord, ScrapeRun, User, UserSettings
 from src.services.board_capabilities import normalize_enabled_boards, unsupported_requested_boards
 from src.services.run_dispatcher import dispatch_scrape_run
@@ -271,6 +272,8 @@ async def update_job_status(
 @router.post("/scrape", status_code=202)
 async def trigger_scrape(
     body: ScrapeRequest,
+    request: Request,
+    db: Database = Depends(get_database),
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
@@ -324,7 +327,13 @@ async def trigger_scrape(
         )
         row.settings_json = json.dumps(settings_data)
     await session.commit()
-    await dispatch_scrape_run(run.id, current_user.id, effective_request)
+    await dispatch_scrape_run(
+        run.id,
+        current_user.id,
+        effective_request,
+        db=db,
+        local_worker=getattr(request.app.state, "local_run_worker", None),
+    )
     return {"run_id": run.id}
 
 
@@ -332,7 +341,13 @@ async def trigger_scrape(
 # Background pipeline task
 # ---------------------------------------------------------------------------
 
-async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
+async def _run_scrape(
+    run_id: str,
+    user_id: int,
+    req: ScrapeRequest,
+    *,
+    db: Database | None = None,
+) -> str:
     """Run the full AI pipeline (scrape → score → tailor → apply) as a background task.
 
     Profile is loaded from the database for the triggering user.
@@ -341,15 +356,16 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
     import json as _json
 
     from src.config import settings
-    from src.database.db import Database
     from src.database.models import UserProfile as UserProfileRecord
     from src.models import ExperienceLevel, JobSearchFilter, JobType, UserProfile
     from src.orchestrator import Orchestrator
     from src.services.profile_sanitizer import build_user_profile
     from src.services.user_runtime import build_runtime_profile_data
 
-    db = Database(settings.database_url)
-    await db.init()
+    owns_db = db is None
+    if db is None:
+        db = Database(settings.database_url)
+        await db.init()
 
     event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
@@ -396,6 +412,23 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
         return "info"
 
     writer_task = asyncio.create_task(_event_writer())
+
+    async def _is_cancel_requested() -> bool:
+        return await db.is_run_cancellation_requested(run_id)
+
+    if await _is_cancel_requested():
+        async with db.session_factory() as session:
+            run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()
+            run.status = "stopped"
+            run.finished_at = datetime.utcnow()
+            await session.commit()
+        _queue_event(event_type="status", status="stopped", message="Run cancelled before execution started")
+        await event_queue.join()
+        event_queue.put_nowait(None)
+        await writer_task
+        if owns_db:
+            await db.close()
+        return "stopped"
 
     async with db.session_factory() as session:
         run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()
@@ -482,6 +515,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             run_id=run_id,
             progress_callback=_progress,
             tailor_documents=req.tailor_documents,
+            should_cancel=_is_cancel_requested,
         )
         total_found = counts.get("scraped", (
             counts.get("applied", 0)
@@ -490,6 +524,24 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             + counts.get("dry_run", 0)
         ))
         total_applied = counts.get("applied", 0)
+
+        if counts.get("cancelled") or await _is_cancel_requested():
+            async with db.session_factory() as session:
+                run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()
+                run.status = "stopped"
+                run.jobs_found = total_found
+                run.jobs_applied = total_applied
+                run.finished_at = datetime.utcnow()
+                await session.commit()
+            _queue_event(
+                event_type="status",
+                level="warning",
+                message="Run cancelled",
+                status="stopped",
+                jobs_found=total_found,
+                jobs_applied=total_applied,
+            )
+            return "stopped"
 
         async with db.session_factory() as session:
             run = (await session.execute(select(ScrapeRun).where(ScrapeRun.id == run_id))).scalar_one()
@@ -506,6 +558,7 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             jobs_found=total_found,
             jobs_applied=total_applied,
         )
+        return "done"
 
     except Exception as exc:
         async with db.session_factory() as session:
@@ -520,11 +573,13 @@ async def _run_scrape(run_id: str, user_id: int, req: ScrapeRequest) -> None:
             message=str(exc),
             status="failed",
         )
+        return "failed"
     finally:
         await event_queue.join()
         event_queue.put_nowait(None)
         await writer_task
-        await db.close()
+        if owns_db:
+            await db.close()
 
 
 # ---------------------------------------------------------------------------

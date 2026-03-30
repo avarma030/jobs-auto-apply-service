@@ -19,19 +19,19 @@ from src.services.saved_searches import (
     serialized_search_criteria,
 )
 
-RunScrapeFunc = Callable[[str, int, object], Awaitable[None]]
+DispatchRunFunc = Callable[[str, int, object], Awaitable[None]]
 
 
 class SavedSearchScheduler:
     def __init__(
         self,
         db: Database,
-        run_scrape: RunScrapeFunc,
+        dispatch_run: DispatchRunFunc,
         *,
         poll_interval_seconds: int = 60,
     ) -> None:
         self._db = db
-        self._run_scrape = run_scrape
+        self._dispatch_run = dispatch_run
         self._poll_interval_seconds = poll_interval_seconds
         self._task: asyncio.Task[None] | None = None
         self._stopped = asyncio.Event()
@@ -108,7 +108,7 @@ class SavedSearchScheduler:
                 f"[SavedSearch] Triggering saved search for user {user_id} "
                 f"({', '.join(req.keywords)} @ {req.location or 'anywhere'})"
             )
-            asyncio.create_task(self._run_scrape(run_id, user_id, req))
+            await self._dispatch_run(run_id, user_id, req)
 
         return len(launches)
 

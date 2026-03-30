@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import inspect, select, text
+from sqlalchemy import func, inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.database.models import (
@@ -13,6 +13,7 @@ from src.database.models import (
     Base,
     JobRecord,
     RunEventRecord,
+    RunExecutionRecord,
     RunJobRecord,
     SemanticCacheRecord,
 )
@@ -338,6 +339,182 @@ class Database:
                 q = q.where(RunEventRecord.user_id == user_id)
             result = await session.execute(q)
             return list(result.scalars().all())
+
+    async def enqueue_run_execution(
+        self,
+        run_id: str,
+        *,
+        user_id: int,
+        request_payload: dict,
+    ) -> bool:
+        async with self.session_factory() as session:
+            existing = await session.get(RunExecutionRecord, run_id)
+            if existing is not None:
+                return False
+
+            session.add(
+                RunExecutionRecord(
+                    run_id=run_id,
+                    user_id=user_id,
+                    request_payload_json=json.dumps(request_payload, sort_keys=True),
+                    state="queued",
+                )
+            )
+            await session.commit()
+            return True
+
+    async def mark_run_dispatched(self, run_id: str) -> bool:
+        async with self.session_factory() as session:
+            record = await session.get(RunExecutionRecord, run_id)
+            if record is None:
+                return False
+            if record.state in {"completed", "failed", "cancelled"}:
+                return False
+            record.state = "dispatched"
+            record.dispatch_attempts += 1
+            record.dispatched_at = datetime.utcnow()
+            await session.commit()
+            return True
+
+    async def claim_run_execution(
+        self,
+        run_id: str,
+        *,
+        worker_id: str,
+    ) -> dict[str, object] | None:
+        async with self.session_factory() as session:
+            record = await session.get(RunExecutionRecord, run_id)
+            if record is None:
+                return None
+
+            if record.cancel_requested_at is not None:
+                if record.state not in {"completed", "failed", "cancelled"}:
+                    record.state = "cancelled"
+                    record.finished_at = datetime.utcnow()
+                    await session.commit()
+                return None
+
+            if record.state not in {"queued", "dispatched", "retrying"}:
+                return None
+
+            now = datetime.utcnow()
+            record.state = "running"
+            record.worker_id = worker_id
+            record.execution_attempts += 1
+            record.claimed_at = now
+            record.heartbeat_at = now
+            if record.started_at is None:
+                record.started_at = now
+            await session.commit()
+
+            try:
+                payload = json.loads(record.request_payload_json)
+            except json.JSONDecodeError:
+                payload = {}
+            return {
+                "run_id": record.run_id,
+                "user_id": record.user_id,
+                "request_payload": payload,
+            }
+
+    async def claim_next_run_execution(
+        self,
+        *,
+        worker_id: str,
+        limit: int = 20,
+    ) -> dict[str, object] | None:
+        async with self.session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(RunExecutionRecord.run_id)
+                        .where(RunExecutionRecord.state.in_(("queued", "dispatched", "retrying")))
+                        .order_by(RunExecutionRecord.created_at.asc())
+                        .limit(limit)
+                    )
+                ).scalars().all()
+            )
+
+        for run_id in rows:
+            claimed = await self.claim_run_execution(run_id, worker_id=worker_id)
+            if claimed is not None:
+                return claimed
+        return None
+
+    async def heartbeat_run_execution(self, run_id: str, *, worker_id: str) -> bool:
+        async with self.session_factory() as session:
+            record = await session.get(RunExecutionRecord, run_id)
+            if record is None or record.worker_id != worker_id or record.state != "running":
+                return False
+            record.heartbeat_at = datetime.utcnow()
+            await session.commit()
+            return True
+
+    async def complete_run_execution(
+        self,
+        run_id: str,
+        *,
+        worker_id: str | None,
+        state: str,
+        last_error: str | None = None,
+    ) -> bool:
+        async with self.session_factory() as session:
+            record = await session.get(RunExecutionRecord, run_id)
+            if record is None:
+                return False
+            if worker_id is not None:
+                record.worker_id = worker_id
+            record.state = state
+            record.last_error = last_error
+            record.heartbeat_at = datetime.utcnow()
+            record.finished_at = datetime.utcnow()
+            await session.commit()
+            return True
+
+    async def request_run_cancellation(self, run_id: str, *, user_id: int | None = None) -> str | None:
+        async with self.session_factory() as session:
+            record = await session.get(RunExecutionRecord, run_id)
+            if record is None:
+                return None
+            if user_id is not None and record.user_id != user_id:
+                return None
+            if record.cancel_requested_at is None:
+                record.cancel_requested_at = datetime.utcnow()
+            if record.state in {"queued", "dispatched", "retrying"}:
+                record.state = "cancelled"
+                record.finished_at = datetime.utcnow()
+            await session.commit()
+            return record.state
+
+    async def is_run_cancellation_requested(self, run_id: str) -> bool:
+        async with self.session_factory() as session:
+            record = await session.get(RunExecutionRecord, run_id)
+            return bool(record and record.cancel_requested_at is not None)
+
+    async def get_run_execution(self, run_id: str) -> RunExecutionRecord | None:
+        async with self.session_factory() as session:
+            return await session.get(RunExecutionRecord, run_id)
+
+    async def get_queue_health(self) -> dict[str, int]:
+        async with self.session_factory() as session:
+            states = ["queued", "dispatched", "running", "retrying", "completed", "failed", "cancelled"]
+            counts: dict[str, int] = {}
+            for state in states:
+                counts[state] = (
+                    await session.execute(
+                        select(func.count())
+                        .select_from(RunExecutionRecord)
+                        .where(RunExecutionRecord.state == state)
+                    )
+                ).scalar_one()
+            counts["cancel_requested"] = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(RunExecutionRecord)
+                    .where(RunExecutionRecord.cancel_requested_at.is_not(None))
+                )
+            ).scalar_one()
+            return counts
 
     async def get_semantic_cache(
         self,

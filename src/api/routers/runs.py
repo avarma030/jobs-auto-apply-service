@@ -20,7 +20,7 @@ from src.api.schemas.runs import (
     RunSearchCriteriaResponse,
 )
 from src.database.db import Database
-from src.database.models import JobRecord, RunEventRecord, RunJobRecord, ScrapeRun, User
+from src.database.models import JobRecord, RunEventRecord, RunExecutionRecord, RunJobRecord, ScrapeRun, User
 
 router = APIRouter(prefix="/runs", tags=["runs"])
 
@@ -45,7 +45,8 @@ async def list_runs(
         current_user.id,
         [row.id for row in rows],
     )
-    return [_to_run_response(row, summaries.get(row.id)) for row in rows]
+    executions = await _execution_for_runs(session, [row.id for row in rows])
+    return [_to_run_response(row, summaries.get(row.id), executions.get(row.id)) for row in rows]
 
 
 @router.get("/{run_id}", response_model=RunDetailResponse)
@@ -58,8 +59,9 @@ async def get_run(
     jobs = (await _jobs_for_runs(session, current_user.id, [run_id])).get(run_id, [])
     summary = _job_summary_from_records(jobs)
     events = await _events_for_run(session, current_user.id, run_id)
+    execution = (await _execution_for_runs(session, [run_id])).get(run_id)
     return RunDetailResponse(
-        **_to_run_response(row, summary).model_dump(),
+        **_to_run_response(row, summary, execution).model_dump(),
         jobs=[RunJobResponse.model_validate(job) for job in jobs],
         events=[RunEventResponse.model_validate(event) for event in events],
     )
@@ -98,16 +100,46 @@ async def stream_run(
 @router.post("/{run_id}/stop", response_model=RunResponse)
 async def stop_run(
     run_id: str,
+    db: Database = Depends(get_database),
     session: AsyncSession = Depends(get_session),
     current_user: User = Depends(get_current_user),
 ):
     row = await _get_run_or_404(run_id, current_user.id, session)
-    if row.status == "running":
+    if row.status in {"done", "failed", "stopped"}:
+        summary = (await _job_status_counts_for_runs(session, current_user.id, [row.id])).get(row.id)
+        execution = (await _execution_for_runs(session, [row.id])).get(row.id)
+        return _to_run_response(row, summary, execution)
+
+    execution_state = await db.request_run_cancellation(run_id, user_id=current_user.id)
+    if execution_state in {"cancelled", None}:
         row.status = "stopped"
+        row.finished_at = row.finished_at or datetime.utcnow()
         await session.commit()
         await session.refresh(row)
+        await db.append_run_event(
+            run_id,
+            user_id=current_user.id,
+            event_type="status",
+            level="warning",
+            message="Run cancelled before execution started",
+            status="stopped",
+            jobs_found=row.jobs_found,
+            jobs_applied=row.jobs_applied,
+        )
+    else:
+        await db.append_run_event(
+            run_id,
+            user_id=current_user.id,
+            event_type="status",
+            level="warning",
+            message="Cancellation requested",
+            status=row.status,
+            jobs_found=row.jobs_found,
+            jobs_applied=row.jobs_applied,
+        )
     summary = (await _job_status_counts_for_runs(session, current_user.id, [row.id])).get(row.id)
-    return _to_run_response(row, summary)
+    execution = (await _execution_for_runs(session, [row.id])).get(row.id)
+    return _to_run_response(row, summary, execution)
 
 
 async def _get_run_or_404(run_id: str, user_id: int, session: AsyncSession) -> ScrapeRun:
@@ -257,9 +289,26 @@ async def _events_for_run(
     return rows
 
 
+async def _execution_for_runs(
+    session: AsyncSession,
+    run_ids: list[str],
+) -> dict[str, RunExecutionRecord]:
+    if not run_ids:
+        return {}
+    rows = list(
+        (
+            await session.execute(
+                select(RunExecutionRecord).where(RunExecutionRecord.run_id.in_(run_ids))
+            )
+        ).scalars().all()
+    )
+    return {row.run_id: row for row in rows}
+
+
 def _to_run_response(
     row: ScrapeRun,
     summary: RunJobSummaryResponse | None = None,
+    execution: RunExecutionRecord | None = None,
 ) -> RunResponse:
     return RunResponse(
         id=row.id,
@@ -275,6 +324,11 @@ def _to_run_response(
         jobs_applied=row.jobs_applied,
         job_summary=summary or _empty_summary(),
         error_message=row.error_message,
+        execution_state=execution.state if execution else None,
+        cancel_requested=bool(execution and execution.cancel_requested_at is not None),
+        worker_id=execution.worker_id if execution else None,
+        dispatch_attempts=execution.dispatch_attempts if execution else 0,
+        execution_attempts=execution.execution_attempts if execution else 0,
     )
 
 
