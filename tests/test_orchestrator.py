@@ -168,7 +168,7 @@ async def test_run_full_pipeline_applies_only_current_run_when_tailoring_disable
     orch.run_scrape.assert_awaited_once()
     assert db.pending_calls == [
         {
-            "limit": settings.max_applications_per_run,
+            "limit": 1,
             "user_id": 7,
             "scrape_run_id": "run-123",
         }
@@ -214,6 +214,35 @@ async def test_run_full_pipeline_uses_requested_max_jobs_for_current_run_apply_l
     assert len(applier.calls) == 4
     assert counts["scraped"] == 4
     assert counts["applied"] == 4
+
+
+@pytest.mark.asyncio
+async def test_run_full_pipeline_scores_all_jobs_found_when_max_jobs_not_specified(monkeypatch):
+    records = [make_job_record(job_id=i) for i in range(1, 25)]
+    db = FakeDb(records)
+    orch = Orchestrator(profile=make_profile(), db=db)
+    progress_messages: list[str] = []
+
+    orch.run_scrape = AsyncMock(return_value=24)
+    monkeypatch.setattr(orch, "_get_ai_client", lambda: None)
+
+    counts = await orch.run_full_pipeline(
+        JobSearchFilter(keywords=["project manager"], min_match_score=75),
+        user_id=11,
+        run_id="run-score-all",
+        progress_callback=progress_messages.append,
+        tailor_documents=True,
+    )
+
+    assert db.pending_calls == [
+        {
+            "limit": 24,
+            "user_id": 11,
+            "scrape_run_id": "run-score-all",
+        }
+    ]
+    assert counts["scraped"] == 24
+    assert any("Scoring 24 jobs" in message for message in progress_messages)
 
 
 @pytest.mark.asyncio

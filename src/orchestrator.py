@@ -78,10 +78,13 @@ class Orchestrator:
         }
 
     @staticmethod
-    def _resolve_current_run_limit(search_filter: JobSearchFilter) -> int:
+    def _resolve_current_run_limit(
+        search_filter: JobSearchFilter,
+        jobs_found: int,
+    ) -> int:
         if search_filter.max_jobs is not None:
             return search_filter.max_jobs
-        return settings.max_applications_per_run
+        return max(jobs_found, 0)
 
     # ------------------------------------------------------------------
     # Public API
@@ -300,10 +303,10 @@ class Orchestrator:
             self._search_criteria_for_log(search_filter),
             ensure_ascii=False,
         )
-        current_run_limit = self._resolve_current_run_limit(search_filter)
         _emit(f"[Search][Criteria] {criteria_json}")
         _emit("🚀 Pipeline starting — scraping jobs …")
         jobs_found = await self.run_scrape(search_filter, user_id=user_id, run_id=run_id)
+        current_run_limit = self._resolve_current_run_limit(search_filter, jobs_found)
         _emit(f"✅ Scrape complete: {jobs_found} new jobs found")
 
         if search_filter.max_jobs is not None and jobs_found < search_filter.max_jobs:
