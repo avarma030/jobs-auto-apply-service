@@ -1,11 +1,28 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import TYPE_CHECKING
 
 import anthropic
 from loguru import logger
+
+from src.services.ai_contracts import ProfileExtractionResult, ScreeningAnswerBatchResult
+from src.services.ai_gateway import call_json_prompt
+from src.services.ai_knowledge import (
+    build_candidate_knowledge_pack,
+    ensure_candidate_knowledge_pack,
+    load_resume_text_from_profile,
+    resolve_answer_memory,
+    select_evidence_snippets,
+    stable_hash,
+    sync_profile_answer_memory,
+)
+from src.services.prompt_registry import (
+    PROFILE_EXTRACTION_PROMPT,
+    SCREENING_ANSWER_PROMPT,
+    render_profile_extraction_prompt,
+    render_screening_answer_prompt,
+)
 
 if TYPE_CHECKING:
     from src.appliers.base import ApplicationQuestionPrompt
@@ -16,89 +33,35 @@ async def extract_profile_from_resume(
     resume_text: str,
     client: anthropic.AsyncAnthropic,
     model: str = "claude-sonnet-4-6",
+    *,
+    cache_backend=None,
+    user_id: int | None = None,
 ) -> dict:
     """
     Ask Claude to extract structured profile data from raw resume text.
     Returns a dict compatible with UserProfile / profile_json blob.
-
-    Fields extracted:
-      first_name, last_name, email, phone, headline, summary,
-      years_of_experience, skills, languages,
-      work_experience, education, social_links
     """
-    prompt = f"""You are an expert resume parser. Extract all structured profile information
-from the resume text below and return it as valid JSON.
-
-<resume>
-{resume_text[:6000]}
-</resume>
-
-Return ONLY valid JSON matching this exact structure (use null for missing fields,
-empty list [] for missing arrays):
-{{
-  "first_name": "<string or null>",
-  "last_name": "<string or null>",
-  "email": "<string or null>",
-  "phone": "<string or null>",
-  "headline": "<one-line professional title, e.g. 'Senior Software Engineer'>",
-  "summary": "<2-4 sentence professional summary>",
-  "years_of_experience": <integer or null>,
-  "skills": ["skill1", "skill2"],
-  "languages": ["English", "Spanish"],
-  "work_experience": [
-    {{
-      "company": "<string>",
-      "title": "<string>",
-      "start_date": "<YYYY-MM or YYYY>",
-      "end_date": "<YYYY-MM or YYYY or null if current>",
-      "description": "<brief bullet-point summary>",
-      "location": "<string or null>"
-    }}
-  ],
-  "education": [
-    {{
-      "institution": "<string>",
-      "degree": "<e.g. Bachelor of Science>",
-      "field_of_study": "<e.g. Computer Science>",
-      "start_date": "<YYYY or null>",
-      "end_date": "<YYYY or null>",
-      "gpa": <float or null>
-    }}
-  ],
-  "social_links": {{
-    "linkedin": "<URL or null>",
-    "github": "<URL or null>",
-    "portfolio": "<URL or null>",
-    "twitter": null
-  }},
-  "address": {{
-    "city": "<string or null>",
-    "state": "<string or null>",
-    "country": "<string or null>",
-    "zip_code": null,
-    "street": null
-  }}
-}}
-
-Rules:
-- Extract only what is actually in the resume — do not fabricate
-- years_of_experience: calculate from earliest work start date to present
-- skills: include both hard skills (Python, React) and domain skills (Machine Learning)
-- For current jobs, set end_date to null
-- Return ONLY the JSON object, no commentary"""
+    if not resume_text.strip():
+        return {}
 
     try:
-        response = await client.messages.create(
+        result = await call_json_prompt(
+            client,
+            spec=PROFILE_EXTRACTION_PROMPT,
+            prompt=render_profile_extraction_prompt(resume_text),
             model=model,
             max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
+            response_model=ProfileExtractionResult,
+            context="profile extraction",
+            cache_backend=cache_backend,
+            source_hash=stable_hash(
+                PROFILE_EXTRACTION_PROMPT.version,
+                resume_text[:6000],
+            ),
+            user_id=user_id,
+            metadata={"resume_excerpt_length": min(len(resume_text), 6000)},
         )
-        raw = response.content[0].text.strip()
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            logger.warning(f"No JSON in profile extraction response: {raw[:300]}")
-            return {}
-        data = json.loads(json_match.group())
+        data = result.model_dump(mode="json")
         logger.info(
             f"Extracted profile: {data.get('first_name')} {data.get('last_name')}, "
             f"{len(data.get('skills', []))} skills, "
@@ -115,96 +78,128 @@ async def suggest_answers(
     profile: "UserProfile",
     client: anthropic.AsyncAnthropic,
     model: str = "claude-sonnet-4-6",
+    *,
+    cache_backend=None,
+    user_id: int | None = None,
+    resume_text: str | None = None,
 ) -> dict[str, str]:
     """
-    Given a list of unanswered job application screening questions, use Claude
-    to generate short, appropriate answers based on the candidate's profile.
-
-    Returns dict[question_text -> answer_string].
-    Answers are intentionally brief (a word, number, or short phrase) to fit
-    form text inputs, radio buttons, and select dropdowns.
+    Resolve screening questions using answer memory first, then one Claude call
+    for any unresolved prompts using shared candidate knowledge and evidence.
     """
     if not questions:
         return {}
 
-    # Build a compact profile context
-    name = f"{profile.first_name or ''} {profile.last_name or ''}".strip()
-    skills_str = ", ".join(profile.skills[:20]) if profile.skills else "not specified"
-    country = ""
-    if profile.address:
-        country = profile.address.country or ""
-    yoe = profile.years_of_experience or "unknown"
-
-    question_entries: list[tuple[str, str, list[str]]] = []
+    question_entries: list[dict[str, object]] = []
     for item in questions:
         if hasattr(item, "question"):
             question_entries.append(
-                (
-                    str(getattr(item, "question", "")).strip(),
-                    str(getattr(item, "field_type", "text")).strip() or "text",
-                    [str(option).strip() for option in getattr(item, "options", []) if str(option).strip()],
-                )
+                {
+                    "question": str(getattr(item, "question", "")).strip(),
+                    "field_type": str(getattr(item, "field_type", "text")).strip() or "text",
+                    "options": [
+                        str(option).strip()
+                        for option in getattr(item, "options", [])
+                        if str(option).strip()
+                    ],
+                }
             )
         else:
-            question_entries.append((str(item).strip(), "text", []))
+            question_entries.append(
+                {
+                    "question": str(item).strip(),
+                    "field_type": "text",
+                    "options": [],
+                }
+            )
 
-    question_entries = [entry for entry in question_entries if entry[0]]
+    question_entries = [entry for entry in question_entries if entry["question"]]
     if not question_entries:
         return {}
 
-    rendered_questions: list[str] = []
-    for i, (question_text, field_type, options) in enumerate(question_entries, 1):
-        option_text = ", ".join(options) if options else "n/a"
-        rendered_questions.append(
-            f"{i}. Question: {question_text}\n"
-            f"   Field type: {field_type}\n"
-            f"   Options: {option_text}"
+    resume_text = resume_text if resume_text is not None else load_resume_text_from_profile(profile)
+
+    if cache_backend is not None and user_id is not None:
+        await sync_profile_answer_memory(cache_backend, user_id=user_id, profile=profile)
+
+    if cache_backend is not None and user_id is not None and resume_text.strip():
+        candidate_pack = await ensure_candidate_knowledge_pack(
+            cache_backend,
+            user_id=user_id,
+            profile=profile,
+            resume_text=resume_text,
         )
-    questions_block = "\n".join(rendered_questions)
+    else:
+        candidate_pack = build_candidate_knowledge_pack(profile, resume_text)
 
-    prompt = f"""You are helping a job applicant fill out screening questions on a job application form.
-Based on the candidate's profile, provide short, honest answers to each question.
+    memory_hits = await resolve_answer_memory(
+        cache_backend,
+        user_id=user_id,
+        prompts=question_entries,
+        candidate_pack=candidate_pack,
+    )
 
-Candidate profile:
-- Name: {name or 'not provided'}
-- Years of experience: {yoe}
-- Skills: {skills_str}
-- Country: {country or 'not specified'}
+    resolved: dict[str, str] = {
+        question_text: hit.answer_text for question_text, hit in memory_hits.items()
+    }
+    unresolved = [
+        entry
+        for entry in question_entries
+        if str(entry["question"]) not in resolved
+    ]
+    if not unresolved:
+        return resolved
 
-Screening questions:
-{questions_block}
+    memory_hint_payload = [
+        {
+            "question": question_text,
+            "answer": hit.answer_text,
+            "source_kind": hit.source_kind,
+            "confidence": round(hit.confidence, 3),
+            "evidence": hit.evidence,
+        }
+        for question_text, hit in memory_hits.items()
+    ]
 
-Rules:
-- Answers must be SHORT — a single word, number, Yes/No, or a brief phrase (≤ 10 words)
-- These answers go directly into form fields or are selected from dropdowns
-- Be honest based on the profile — do not fabricate
-- For yes/no questions use "Yes" or "No" exactly
-- For numeric questions (field type "number") use ONLY digits or digits with a decimal point
-- Never return words, currency symbols, ranges, or explanations for numeric fields
-- For salary expectation in a numeric field, return one plain annual number like 85000
-- If options are provided, choose one of the listed options exactly
-- For authorization/sponsorship questions: if country is US or not specified, answer "Yes" for authorization, "No" for sponsorship needed
-
-Return ONLY valid JSON:
-{{
-  "<question 1 text>": "<answer>",
-  "<question 2 text>": "<answer>"
-}}"""
+    combined_query = " ".join(str(entry["question"]) for entry in unresolved)
+    evidence_snippets = select_evidence_snippets(
+        candidate_pack.evidence_snippets,
+        combined_query,
+        limit=6,
+    )
+    prompt = render_screening_answer_prompt(
+        candidate_snapshot=candidate_pack.snapshot,
+        candidate_skills=candidate_pack.skills,
+        candidate_titles=candidate_pack.titles,
+        evidence_snippets=evidence_snippets,
+        memory_hints=memory_hint_payload,
+        questions=unresolved,
+    )
 
     try:
-        response = await client.messages.create(
+        result = await call_json_prompt(
+            client,
+            spec=SCREENING_ANSWER_PROMPT,
+            prompt=prompt,
             model=model,
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
+            max_tokens=900,
+            response_model=ScreeningAnswerBatchResult,
+            context="screening answer suggestions",
+            cache_backend=cache_backend,
+            source_hash=stable_hash(
+                SCREENING_ANSWER_PROMPT.version,
+                candidate_pack.source_hash,
+                json.dumps(unresolved, ensure_ascii=False, sort_keys=True),
+            ),
+            user_id=user_id,
+            metadata={"question_count": len(unresolved)},
         )
-        raw = response.content[0].text.strip()
-        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not json_match:
-            logger.warning(f"No JSON in suggest_answers response: {raw[:200]}")
-            return {}
-        data = json.loads(json_match.group())
-        # Ensure all values are strings
-        return {str(k): str(v) for k, v in data.items()}
+        for item in result.answers:
+            question_text = str(item.question).strip()
+            answer_text = str(item.answer).strip()
+            if question_text and answer_text:
+                resolved[question_text] = answer_text
+        return resolved
     except Exception as exc:
         logger.error(f"suggest_answers error: {exc}")
-        return {}
+        return resolved

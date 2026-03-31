@@ -31,6 +31,7 @@ from src.scrapers.monster import MonsterScraper
 from src.scrapers.workday import WorkdayScraper
 from src.scrapers.ziprecruiter import ZipRecruiterScraper
 from src.services import ai_matcher, cover_letter as cover_letter_svc, pdf_builder, profile_extractor, resume_parser, resume_tailor
+from src.services import ai_knowledge
 from src.services.application_questions import normalize_question_text
 from src.services.job_classifier import detect_ats
 from src.services.runtime_state import user_resume_path, user_tailored_dir
@@ -70,6 +71,9 @@ class Orchestrator:
         self.db = db
         self.runtime_scope = runtime_scope
         self._ai_client: anthropic.AsyncAnthropic | None = None
+        self._resume_text_cache: str = ""
+        self._candidate_knowledge_pack: dict | None = None
+        self._job_knowledge_pack_cache: dict[int, dict] = {}
 
     @staticmethod
     def _search_criteria_for_log(search_filter: JobSearchFilter) -> dict[str, object]:
@@ -377,11 +381,20 @@ class Orchestrator:
         if resume_path and resume_path.exists():
             try:
                 resume_text = resume_parser.parse_resume(resume_path)
+                self._resume_text_cache = resume_text
                 _emit(f"📄 Resume parsed ({len(resume_text):,} chars)")
             except Exception as exc:
                 logger.error(f"Resume parse error: {exc}")
+                self._resume_text_cache = ""
+        else:
+            self._resume_text_cache = ""
 
         ai = self._get_ai_client()
+        if ai and resume_text and user_id is not None:
+            try:
+                await self._ensure_candidate_knowledge_pack(user_id=user_id, resume_text=resume_text)
+            except Exception as exc:
+                logger.warning(f"Could not build candidate knowledge pack: {exc}")
 
         # Load ONLY jobs from this run — never re-process leftover pending jobs from
         # previous runs, which would give wrong counts and re-score already-seen jobs.
@@ -437,6 +450,14 @@ class Orchestrator:
                     notes="No job description available for AI scoring",
                 )
                 continue
+            try:
+                await self._ensure_job_knowledge_pack(
+                    record_id=record.id,
+                    job=job,
+                    user_id=user_id,
+                )
+            except Exception as exc:
+                logger.warning(f"Could not build job knowledge pack for job {record.id}: {exc}")
 
             score = await ai_matcher.score_compatibility(
                 resume_text,
@@ -500,6 +521,12 @@ class Orchestrator:
                 # Tailor resume
                 _emit(f"✏️  [{idx}/{len(qualified)}] Tailoring resume for '{job.title}' @ {job.company} …")
                 try:
+                    candidate_pack = self._candidate_knowledge_pack
+                    job_pack = await self._ensure_job_knowledge_pack(
+                        record_id=record.id,
+                        job=job,
+                        user_id=user_id,
+                    )
                     tailored_text, ats_score = await resume_tailor.tailor_resume(
                         resume_text,
                         job.title,
@@ -508,6 +535,10 @@ class Orchestrator:
                         settings.anthropic_model,
                         target_ats_score=settings.min_ats_score,
                         max_attempts=settings.max_tailor_attempts,
+                        candidate_pack=candidate_pack,
+                        job_pack=job_pack,
+                        cache_backend=self.db,
+                        user_id=user_id,
                     )
                     _emit(f"     📈 ATS score after tailoring: {ats_score:.0f}%")
 
@@ -520,7 +551,15 @@ class Orchestrator:
                     # Generate cover letter
                     _emit(f"     📝 Generating cover letter …")
                     cl_text = await cover_letter_svc.generate_cover_letter(
-                        self.profile, job, tailored_text, ai, settings.anthropic_model
+                        self.profile,
+                        job,
+                        tailored_text,
+                        ai,
+                        settings.anthropic_model,
+                        candidate_pack=candidate_pack,
+                        job_pack=job_pack,
+                        cache_backend=self.db,
+                        user_id=user_id,
                     )
                     cl_path = job_dir / "cover_letter.md"
                     cl_path.parent.mkdir(parents=True, exist_ok=True)
@@ -636,6 +675,45 @@ class Orchestrator:
             self._ai_client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
         return self._ai_client
 
+    async def _ensure_candidate_knowledge_pack(
+        self,
+        *,
+        user_id: int | None,
+        resume_text: str,
+    ) -> dict | None:
+        if not resume_text.strip() or user_id is None:
+            return self._candidate_knowledge_pack
+        pack = await ai_knowledge.ensure_candidate_knowledge_pack(
+            self.db,
+            user_id=user_id,
+            profile=self.profile,
+            resume_text=resume_text,
+        )
+        self._candidate_knowledge_pack = pack.model_dump(mode="json")
+        return self._candidate_knowledge_pack
+
+    async def _ensure_job_knowledge_pack(
+        self,
+        *,
+        record_id: int,
+        job: Job,
+        user_id: int | None,
+    ) -> dict | None:
+        if not job.description:
+            return None
+        cached = self._job_knowledge_pack_cache.get(record_id)
+        if cached is not None:
+            return cached
+        pack = await ai_knowledge.ensure_job_knowledge_pack(
+            self.db,
+            job_id=record_id,
+            user_id=user_id,
+            job=job,
+        )
+        payload = pack.model_dump(mode="json")
+        self._job_knowledge_pack_cache[record_id] = payload
+        return payload
+
     def _configure_applier(
         self,
         applier: BaseApplier,
@@ -674,8 +752,6 @@ class Orchestrator:
         user_id: int | None = None,
         progress_callback: Callable[[str], None] | None = None,
     ) -> dict[str, str]:
-        del user_id
-
         questions = [prompt.question.strip() for prompt in prompts if prompt.question.strip()]
         if not questions:
             return {}
@@ -696,6 +772,9 @@ class Orchestrator:
                 self.profile,
                 ai,
                 settings.anthropic_model,
+                cache_backend=self.db,
+                user_id=user_id,
+                resume_text=self._resume_text_cache,
             )
         except Exception as exc:
             logger.error(f"suggest_answers error: {exc}")
@@ -737,6 +816,17 @@ class Orchestrator:
         if user_id is not None:
             try:
                 await self.db.update_profile_custom_answers(user_id, changed_answers)
+                for question, answer in changed_answers.items():
+                    await ai_knowledge.store_answer_memory(
+                        self.db,
+                        user_id=user_id,
+                        question_text=question,
+                        answer_text=answer,
+                        source_kind="learned",
+                        confidence=1.0,
+                        approved=True,
+                        evidence={"source": "application"},
+                    )
             except Exception as exc:
                 logger.warning(f"Could not save custom_answers to DB: {exc}")
 

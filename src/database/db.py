@@ -10,7 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.database.models import (
     ApplicationRecord,
+    AnswerMemoryRecord,
+    CandidateKnowledgePackRecord,
     JobRecord,
+    JobKnowledgePackRecord,
     RunEventRecord,
     RunExecutionRecord,
     RunJobRecord,
@@ -616,6 +619,10 @@ class Database:
         source_hash: str,
         payload: dict,
         user_id: int | None = None,
+        prompt_name: str | None = None,
+        prompt_version: str | None = None,
+        model_name: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
         async with self.session_factory() as session:
             record = await session.get(SemanticCacheRecord, key)
@@ -625,7 +632,250 @@ class Database:
             record.kind = kind
             record.user_id = user_id
             record.source_hash = source_hash
+            record.prompt_name = prompt_name
+            record.prompt_version = prompt_version
+            record.model_name = model_name
             record.payload_json = json.dumps(payload)
+            record.metadata_json = json.dumps(metadata) if metadata is not None else None
+            await session.commit()
+
+    async def get_candidate_knowledge_pack(
+        self,
+        user_id: int,
+        *,
+        version: str,
+        source_hash: str,
+    ) -> dict | None:
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(CandidateKnowledgePackRecord).where(
+                        CandidateKnowledgePackRecord.user_id == user_id,
+                        CandidateKnowledgePackRecord.version == version,
+                        CandidateKnowledgePackRecord.source_hash == source_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            try:
+                payload = json.loads(row.payload_json)
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"Invalid candidate knowledge payload for user {user_id} and hash {source_hash}"
+                )
+                return None
+            try:
+                payload["_embedding_json"] = json.loads(row.embedding_json) if row.embedding_json else None
+            except json.JSONDecodeError:
+                payload["_embedding_json"] = None
+            payload["_embedding_model"] = row.embedding_model
+            payload["_source_hash"] = row.source_hash
+            payload["_version"] = row.version
+            return payload
+
+    async def upsert_candidate_knowledge_pack(
+        self,
+        user_id: int,
+        *,
+        version: str,
+        source_hash: str,
+        payload: dict,
+        embedding: list[float] | None = None,
+        embedding_model: str | None = None,
+    ) -> None:
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(CandidateKnowledgePackRecord).where(
+                        CandidateKnowledgePackRecord.user_id == user_id,
+                        CandidateKnowledgePackRecord.version == version,
+                        CandidateKnowledgePackRecord.source_hash == source_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = CandidateKnowledgePackRecord(
+                    user_id=user_id,
+                    version=version,
+                    source_hash=source_hash,
+                )
+                session.add(row)
+            row.payload_json = json.dumps(payload)
+            row.embedding_json = json.dumps(embedding) if embedding is not None else None
+            row.embedding_model = embedding_model
+            await session.commit()
+
+    async def get_job_knowledge_pack(
+        self,
+        job_id: int,
+        *,
+        version: str,
+        source_hash: str,
+    ) -> dict | None:
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(JobKnowledgePackRecord).where(
+                        JobKnowledgePackRecord.job_id == job_id,
+                        JobKnowledgePackRecord.version == version,
+                        JobKnowledgePackRecord.source_hash == source_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            try:
+                payload = json.loads(row.payload_json)
+            except json.JSONDecodeError:
+                logger.warning(
+                    f"Invalid job knowledge payload for job {job_id} and hash {source_hash}"
+                )
+                return None
+            try:
+                payload["_embedding_json"] = json.loads(row.embedding_json) if row.embedding_json else None
+            except json.JSONDecodeError:
+                payload["_embedding_json"] = None
+            payload["_embedding_model"] = row.embedding_model
+            payload["_source_hash"] = row.source_hash
+            payload["_version"] = row.version
+            return payload
+
+    async def upsert_job_knowledge_pack(
+        self,
+        job_id: int,
+        *,
+        user_id: int | None,
+        version: str,
+        source_hash: str,
+        payload: dict,
+        embedding: list[float] | None = None,
+        embedding_model: str | None = None,
+    ) -> None:
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(JobKnowledgePackRecord).where(
+                        JobKnowledgePackRecord.job_id == job_id,
+                        JobKnowledgePackRecord.version == version,
+                        JobKnowledgePackRecord.source_hash == source_hash,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = JobKnowledgePackRecord(
+                    job_id=job_id,
+                    user_id=user_id,
+                    version=version,
+                    source_hash=source_hash,
+                )
+                session.add(row)
+            row.user_id = user_id
+            row.payload_json = json.dumps(payload)
+            row.embedding_json = json.dumps(embedding) if embedding is not None else None
+            row.embedding_model = embedding_model
+            await session.commit()
+
+    async def upsert_answer_memory(
+        self,
+        *,
+        user_id: int,
+        question_key: str,
+        question_text: str,
+        answer_text: str,
+        answer_type: str = "text",
+        source_kind: str = "learned",
+        confidence: float = 1.0,
+        approved: bool = True,
+        evidence: dict | list | None = None,
+        embedding: list[float] | None = None,
+        embedding_model: str | None = None,
+    ) -> None:
+        async with self.session_factory() as session:
+            row = (
+                await session.execute(
+                    select(AnswerMemoryRecord).where(
+                        AnswerMemoryRecord.user_id == user_id,
+                        AnswerMemoryRecord.question_key == question_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = AnswerMemoryRecord(user_id=user_id, question_key=question_key)
+                session.add(row)
+            row.question_text = question_text
+            row.answer_text = answer_text
+            row.answer_type = answer_type
+            row.source_kind = source_kind
+            row.confidence = confidence
+            row.approved = approved
+            row.evidence_json = json.dumps(evidence) if evidence is not None else None
+            row.embedding_json = json.dumps(embedding) if embedding is not None else None
+            row.embedding_model = embedding_model
+            await session.commit()
+
+    async def get_answer_memory_entries(
+        self,
+        *,
+        user_id: int,
+        question_keys: list[str] | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        async with self.session_factory() as session:
+            q = select(AnswerMemoryRecord).where(AnswerMemoryRecord.user_id == user_id)
+            if question_keys:
+                q = q.where(AnswerMemoryRecord.question_key.in_(question_keys))
+            q = q.order_by(
+                AnswerMemoryRecord.updated_at.desc(),
+                AnswerMemoryRecord.id.desc(),
+            ).limit(limit)
+            rows = list((await session.execute(q)).scalars().all())
+
+        results: list[dict] = []
+        for row in rows:
+            try:
+                evidence = json.loads(row.evidence_json) if row.evidence_json else None
+            except json.JSONDecodeError:
+                evidence = None
+            try:
+                embedding = json.loads(row.embedding_json) if row.embedding_json else None
+            except json.JSONDecodeError:
+                embedding = None
+            results.append(
+                {
+                    "id": row.id,
+                    "question_key": row.question_key,
+                    "question_text": row.question_text,
+                    "answer_text": row.answer_text,
+                    "answer_type": row.answer_type,
+                    "source_kind": row.source_kind,
+                    "confidence": row.confidence,
+                    "approved": row.approved,
+                    "evidence": evidence,
+                    "embedding": embedding,
+                    "embedding_model": row.embedding_model,
+                    "usage_count": row.usage_count,
+                    "last_used_at": row.last_used_at,
+                    "updated_at": row.updated_at,
+                }
+            )
+        return results
+
+    async def mark_answer_memory_used(self, memory_ids: list[int]) -> None:
+        if not memory_ids:
+            return
+        async with self.session_factory() as session:
+            rows = list(
+                (
+                    await session.execute(
+                        select(AnswerMemoryRecord).where(AnswerMemoryRecord.id.in_(memory_ids))
+                    )
+                ).scalars().all()
+            )
+            now = datetime.utcnow()
+            for row in rows:
+                row.usage_count += 1
+                row.last_used_at = now
             await session.commit()
 
     async def get_recent_match_examples(

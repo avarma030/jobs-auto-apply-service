@@ -8,6 +8,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 import anthropic
 from loguru import logger
 
+from src.models import Job
+from src.services.ai_contracts import MatchDecisionResult
+from src.services.ai_gateway import call_json_prompt
+from src.services.ai_knowledge import ensure_candidate_knowledge_pack, ensure_job_knowledge_pack
+from src.services.prompt_registry import MATCH_SCORING_PROMPT, render_match_scoring_prompt
+
 if TYPE_CHECKING:
     from src.models import UserProfile
 
@@ -140,6 +146,10 @@ class MatchCacheBackend(Protocol):
         source_hash: str,
         payload: dict,
         user_id: int | None = None,
+        prompt_name: str | None = None,
+        prompt_version: str | None = None,
+        model_name: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
         ...
 
@@ -575,25 +585,6 @@ def _should_locally_reject(evidence: dict[str, Any]) -> bool:
     )
 
 
-async def _call_claude_json(
-    client: anthropic.AsyncAnthropic,
-    *,
-    system: str,
-    prompt: str,
-    model: str,
-    max_tokens: int,
-    context: str,
-) -> dict[str, Any]:
-    response = await client.messages.create(
-        model=model,
-        system=system,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    raw = response.content[0].text.strip()
-    return _safe_json_loads(raw, context=context)
-
-
 async def _adjudicate_with_claude(
     *,
     client: anthropic.AsyncAnthropic,
@@ -607,82 +598,29 @@ async def _adjudicate_with_claude(
     local_evidence: dict[str, Any],
     history_hints: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    system_prompt = """You are an industry-standard ATS reviewer, recruiter, and career consultant with 20+ years of hiring experience.
-
-Judge fit quickly but accurately, like a senior recruiter doing a fast first-pass screen and then sanity-checking against the detailed evidence.
-
-Rules:
-- Be generous for genuinely transferable adjacent fit
-- Do not over-penalize niche industry context unless the JD clearly makes it mandatory
-- Treat the local pre-score as evidence, not ground truth
-- Only list true blockers in missing_required_skills
-- Use the full score range confidently
-- Return ONLY valid JSON"""
-
-    prompt = f"""Evaluate this candidate-job match.
-
-<search_intent>
-{", ".join(search_keywords or []) or "Not provided"}
-</search_intent>
-
-<candidate_profile_snapshot>
-{candidate_fp["snapshot"] or "Not provided"}
-</candidate_profile_snapshot>
-
-<candidate_titles>
-{json.dumps(candidate_fp["titles"], ensure_ascii=False)}
-</candidate_titles>
-
-<candidate_skills>
-{json.dumps(candidate_fp["skills"][:18], ensure_ascii=False)}
-</candidate_skills>
-
-<candidate_domains>
-{json.dumps(candidate_fp["domains"][:10], ensure_ascii=False)}
-</candidate_domains>
-
-<job_title>{job_title}</job_title>
-
-<job_requirements>
-{json.dumps(job_fp, ensure_ascii=False)}
-</job_requirements>
-
-<local_match_evidence>
-{json.dumps(local_evidence, ensure_ascii=False)}
-</local_match_evidence>
-
-<history_hints>
-{json.dumps(history_hints, ensure_ascii=False)}
-</history_hints>
-
-<resume_excerpt>
-{resume_text[:3500]}
-</resume_excerpt>
-
-<job_description_excerpt>
-{job_description[:4200]}
-</job_description_excerpt>
-
-Respond with JSON:
-{{
-  "score": <integer 0-100>,
-  "skills_match": <integer 0-100>,
-  "experience_match": <integer 0-100>,
-  "domain_match": <integer 0-100>,
-  "education_match": <integer 0-100>,
-  "top_matching_skills": ["skill1", "skill2", "skill3"],
-  "missing_required_skills": ["skill1", "skill2"],
-  "missing_nice_to_have": ["skill1"],
-  "summary": "<2-3 sentence honest assessment of fit>"
-}}"""
-    return await _call_claude_json(
+    prompt = render_match_scoring_prompt(
+        search_keywords=search_keywords,
+        candidate_snapshot=candidate_fp["snapshot"],
+        candidate_titles=candidate_fp["titles"],
+        candidate_skills=candidate_fp["skills"],
+        candidate_domains=candidate_fp["domains"],
+        job_title=job_title,
+        job_pack=job_fp,
+        local_evidence=local_evidence,
+        history_hints=history_hints,
+        resume_excerpt=resume_text,
+        job_description_excerpt=job_description,
+    )
+    result = await call_json_prompt(
         client,
-        system=system_prompt,
+        spec=MATCH_SCORING_PROMPT,
         prompt=prompt,
         model=model,
         max_tokens=650,
+        response_model=MatchDecisionResult,
         context=f"match adjudication for {job_title}",
     )
+    return result.model_dump(mode="json")
 
 
 async def score_compatibility(
@@ -710,7 +648,43 @@ async def score_compatibility(
         return 0.0
 
     candidate_fp = _build_candidate_fingerprint(resume_text, profile)
+    if (
+        cache_backend is not None
+        and user_id is not None
+        and profile is not None
+        and hasattr(cache_backend, "get_candidate_knowledge_pack")
+        and hasattr(cache_backend, "upsert_candidate_knowledge_pack")
+    ):
+        candidate_pack = await ensure_candidate_knowledge_pack(
+            cache_backend,
+            user_id=user_id,
+            profile=profile,
+            resume_text=resume_text,
+        )
+        candidate_fp = candidate_pack.model_dump(mode="json")
+
     job_fp = _build_job_fingerprint(job_title, job_description)
+    if (
+        cache_backend is not None
+        and job_id is not None
+        and hasattr(cache_backend, "get_job_knowledge_pack")
+        and hasattr(cache_backend, "upsert_job_knowledge_pack")
+    ):
+        job_pack = await ensure_job_knowledge_pack(
+            cache_backend,
+            job_id=job_id,
+            user_id=user_id,
+            job=Job(
+                title=job_title,
+                company="Unknown",
+                description=job_description,
+                location=None,
+                url=f"https://internal.local/job/{job_id}",
+                source_board="internal",
+            ),
+        )
+        job_fp = job_pack.model_dump(mode="json")
+
     local_evidence = _local_match_evidence(candidate_fp, job_fp, search_keywords)
     history_hints, history_similarity = await _get_history_hints(
         cache_backend=cache_backend,
@@ -721,16 +695,16 @@ async def score_compatibility(
 
     profile_hash = _stable_hash(
         MATCHER_VERSION,
-        candidate_fp["snapshot"],
-        json.dumps(candidate_fp["titles"], ensure_ascii=False),
-        json.dumps(candidate_fp["skills"][:20], ensure_ascii=False),
-        json.dumps(candidate_fp["domains"][:12], ensure_ascii=False),
+        str(candidate_fp.get("source_hash") or candidate_fp.get("snapshot") or ""),
+        json.dumps(candidate_fp.get("titles", []), ensure_ascii=False),
+        json.dumps(candidate_fp.get("skills", [])[:20], ensure_ascii=False),
+        json.dumps(candidate_fp.get("domains", [])[:12], ensure_ascii=False),
     )
     job_hash = _stable_hash(
         MATCHER_VERSION,
-        job_title,
+        str(job_fp.get("source_hash") or job_title),
         job_description,
-        json.dumps(job_fp, ensure_ascii=False),
+        json.dumps(job_fp, ensure_ascii=False, sort_keys=True),
     )
     search_hash = _stable_hash(
         MATCHER_VERSION,
@@ -771,6 +745,10 @@ async def score_compatibility(
                 source_hash=source_hash,
                 payload=payload,
                 user_id=user_id,
+                prompt_name=MATCH_SCORING_PROMPT.name,
+                prompt_version=MATCH_SCORING_PROMPT.version,
+                model_name=model,
+                metadata={"mode": "local_reject"},
             )
         logger.info(
             f"Match score for '{job_title}': {final_score:.0f}% "
@@ -826,6 +804,14 @@ async def score_compatibility(
             source_hash=source_hash,
             payload=payload,
             user_id=user_id,
+            prompt_name=MATCH_SCORING_PROMPT.name,
+            prompt_version=MATCH_SCORING_PROMPT.version,
+            model_name=model,
+            metadata={
+                "mode": "claude_adjudicated",
+                "history_hints": history_hints,
+                "local_pre_score": local_evidence["local_pre_score"],
+            },
         )
 
     missing = payload.get("missing_required_skills") or payload.get("missing_skills") or []

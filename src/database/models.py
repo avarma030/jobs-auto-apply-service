@@ -245,7 +245,7 @@ class ApplicationRecord(Base):
 
 
 class SemanticCacheRecord(Base):
-    """Cached semantic extractions and match decisions."""
+    """Cached AI outputs and semantic extractions."""
 
     __tablename__ = "semantic_cache"
 
@@ -255,7 +255,105 @@ class SemanticCacheRecord(Base):
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    prompt_name: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    prompt_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    model_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    metadata_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class CandidateKnowledgePackRecord(Base):
+    """Canonical candidate knowledge packs keyed by source hash."""
+
+    __tablename__ = "candidate_knowledge_packs"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "version",
+            "source_hash",
+            name="uq_candidate_knowledge_pack_user_version_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class JobKnowledgePackRecord(Base):
+    """Canonical per-job knowledge packs keyed by source hash."""
+
+    __tablename__ = "job_knowledge_packs"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "version",
+            "source_hash",
+            name="uq_job_knowledge_pack_job_version_source",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    version: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class AnswerMemoryRecord(Base):
+    """Persisted question-answer memory for application workflows."""
+
+    __tablename__ = "answer_memory"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "question_key",
+            name="uq_answer_memory_user_question_key",
+        ),
+        Index("ix_answer_memory_user_updated_at", "user_id", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    question_key: Mapped[str] = mapped_column(String(191), nullable=False, index=True)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    answer_text: Mapped[str] = mapped_column(Text, nullable=False)
+    answer_type: Mapped[str] = mapped_column(String(32), nullable=False, default="text")
+    source_kind: Mapped[str] = mapped_column(String(32), nullable=False, default="learned")
+    confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    evidence_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    usage_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )

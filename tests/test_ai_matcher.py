@@ -33,6 +33,10 @@ class FakeMatchCacheBackend:
         source_hash: str,
         payload: dict,
         user_id: int | None = None,
+        prompt_name: str | None = None,
+        prompt_version: str | None = None,
+        model_name: str | None = None,
+        metadata: dict | None = None,
     ) -> None:
         self.cache[key] = (source_hash, dict(payload))
 
