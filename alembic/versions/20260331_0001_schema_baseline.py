@@ -205,7 +205,7 @@ def _create_table_jobs() -> None:
         sa.Column("salary_max", sa.Float(), nullable=True),
         sa.Column("salary_currency", sa.String(length=8), nullable=True),
         sa.Column("skills", sa.Text(), nullable=True),
-        sa.Column("easy_apply", sa.Boolean(), nullable=False, server_default=sa.text("0")),
+        sa.Column("easy_apply", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("posted_at", sa.DateTime(), nullable=True),
         sa.Column("scraped_at", sa.DateTime(), nullable=False),
         sa.Column("match_score", sa.Float(), nullable=True),

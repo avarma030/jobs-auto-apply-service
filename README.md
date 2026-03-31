@@ -103,6 +103,8 @@ Local Docker startup enables automatic DB migrations for the API container. In s
 alembic upgrade head
 ```
 
+The Docker Compose API service runs without `--reload` so local end-to-end startup is deterministic. If you want live-reload development, run the API directly on your machine instead of through the Compose app stack.
+
 ## Configuration
 
 All configuration is via `.env` (see `.env.example` for full reference).

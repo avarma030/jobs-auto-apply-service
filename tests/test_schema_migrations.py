@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, inspect, select
@@ -231,6 +232,26 @@ async def test_database_init_bootstraps_empty_db_to_head(tmp_path):
     assert status["has_legacy_schema"] is False
 
     await db.close()
+
+
+def test_postgres_boolean_defaults_in_migrations_use_true_false_literals():
+    baseline = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260331_0001_schema_baseline.py"
+    ).read_text(encoding="utf-8")
+    ai_layer = (
+        Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "20260331_0002_ai_knowledge_layer.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'server_default=sa.text("0")' not in baseline
+    assert 'server_default=sa.text("1")' not in ai_layer
+    assert 'server_default=sa.text("false")' in baseline
+    assert 'server_default=sa.text("true")' in ai_layer
 
 
 @pytest.mark.asyncio

@@ -82,6 +82,9 @@ class SavedSearchScheduler:
                     started_at=now.replace(tzinfo=None),
                 )
                 session.add(run)
+                # Flush the parent run row first so the follow-on event insert
+                # has a valid foreign-key target on stricter databases.
+                await session.flush()
                 session.add(
                     RunEventRecord(
                         run_id=run.id,

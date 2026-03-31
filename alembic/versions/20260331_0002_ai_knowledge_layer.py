@@ -89,7 +89,7 @@ def _create_answer_memory() -> None:
         sa.Column("answer_type", sa.String(length=32), nullable=False, server_default="text"),
         sa.Column("source_kind", sa.String(length=32), nullable=False, server_default="learned"),
         sa.Column("confidence", sa.Float(), nullable=False, server_default="1"),
-        sa.Column("approved", sa.Boolean(), nullable=False, server_default=sa.text("1")),
+        sa.Column("approved", sa.Boolean(), nullable=False, server_default=sa.text("true")),
         sa.Column("evidence_json", sa.Text(), nullable=True),
         sa.Column("embedding_json", sa.Text(), nullable=True),
         sa.Column("embedding_model", sa.String(length=64), nullable=True),
