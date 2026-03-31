@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     database_url: str = "sqlite+aiosqlite:///./data/jobs.db"
     data_encryption_key: str | None = None
+    auto_migrate_database: bool = False
 
     # ------------------------------------------------------------------
     # User profile

@@ -60,14 +60,19 @@ def _job_record_priority(record: JobRecord) -> tuple[int, datetime, datetime, in
 class Database:
     """Async SQLAlchemy database layer."""
 
-    def __init__(self, database_url: str):
+    def __init__(self, database_url: str, *, auto_migrate: bool = False):
         self.database_url = database_url
+        self.auto_migrate = auto_migrate
         self.engine = create_async_engine(database_url, echo=False)
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def init(self) -> None:
         """Ensure the database is at the expected Alembic revision."""
-        status = await ensure_database_schema(self.engine, self.database_url)
+        status = await ensure_database_schema(
+            self.engine,
+            self.database_url,
+            auto_migrate=self.auto_migrate,
+        )
         logger.info(f"Database initialised (schema={status.current_revision})")
 
     async def close(self) -> None:

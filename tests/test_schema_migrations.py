@@ -245,6 +245,25 @@ async def test_database_init_fails_fast_on_unversioned_legacy_schema(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_database_init_auto_migrates_legacy_schema_when_enabled(tmp_path):
+    db_path = tmp_path / "legacy-auto.db"
+    _build_legacy_schema(db_path)
+
+    db = Database(_legacy_database_url(db_path), auto_migrate=True)
+    await db.init()
+
+    status = await db.schema_status()
+    assert status["at_head"] is True
+    assert status["has_legacy_schema"] is False
+
+    async with db.session_factory() as session:
+        job_count = await session.scalar(select(func.count()).select_from(JobRecord))
+        assert job_count == 1
+
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_database_migrates_forward_and_dedupes_jobs(tmp_path):
     db_path = tmp_path / "legacy-upgrade.db"
     _build_legacy_schema(db_path)

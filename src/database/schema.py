@@ -73,17 +73,27 @@ async def get_schema_status(engine: AsyncEngine, database_url: str) -> SchemaSta
     )
 
 
-async def ensure_database_schema(engine: AsyncEngine, database_url: str) -> SchemaStatus:
+async def ensure_database_schema(
+    engine: AsyncEngine,
+    database_url: str,
+    *,
+    auto_migrate: bool = False,
+) -> SchemaStatus:
     status = await get_schema_status(engine, database_url)
-    if status.is_empty:
+    if status.is_empty or (auto_migrate and not status.at_head):
         await asyncio.to_thread(migrate_database_to_head, database_url)
         status = await get_schema_status(engine, database_url)
 
     if not status.at_head:
+        guidance = (
+            "Automatic migrations are disabled. Run `alembic upgrade head` before starting the API."
+            if not auto_migrate
+            else "Automatic migration was attempted but the database is still not at head."
+        )
         raise SchemaMismatchError(
             "Database schema is not at the expected Alembic revision. "
             f"Current revision: {status.current_revision or 'unversioned legacy schema'}, "
-            f"expected: {status.head_revision}. Run `alembic upgrade head` before starting the API."
+            f"expected: {status.head_revision}. {guidance}"
         )
 
     return status

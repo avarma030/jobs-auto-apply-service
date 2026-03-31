@@ -97,6 +97,12 @@ cp .env.example .env
 docker compose up app
 ```
 
+Local Docker startup enables automatic DB migrations for the API container. In stricter environments, keep `AUTO_MIGRATE_DATABASE=false` and run:
+
+```bash
+alembic upgrade head
+```
+
 ## Configuration
 
 All configuration is via `.env` (see `.env.example` for full reference).

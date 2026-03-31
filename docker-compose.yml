@@ -15,6 +15,7 @@ services:
       LINKEDIN_EMAIL: "${LINKEDIN_EMAIL:-}"
       LINKEDIN_PASSWORD: "${LINKEDIN_PASSWORD:-}"
       SECRET_KEY: "${SECRET_KEY:-changeme-replace-with-a-long-random-secret-in-production}"
+      AUTO_MIGRATE_DATABASE: "true"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

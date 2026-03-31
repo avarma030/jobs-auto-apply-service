@@ -17,7 +17,10 @@ from src.services.saved_search_scheduler import SavedSearchScheduler
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db = Database(app_settings.database_url)
+    db = Database(
+        app_settings.database_url,
+        auto_migrate=app_settings.auto_migrate_database,
+    )
     await db.init()
     app.state.db = db
     api_deps._db = db
