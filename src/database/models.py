@@ -3,7 +3,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -84,6 +95,9 @@ class RunEventRecord(Base):
     """Append-only event log for a scrape/apply run."""
 
     __tablename__ = "run_events"
+    __table_args__ = (
+        Index("ix_run_events_run_id_id", "run_id", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(
@@ -106,6 +120,9 @@ class RunExecutionRecord(Base):
     """Durable queue/worker execution metadata for a scrape run."""
 
     __tablename__ = "run_executions"
+    __table_args__ = (
+        Index("ix_run_executions_state_created_at", "state", "created_at"),
+    )
 
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("scrape_runs.id", ondelete="CASCADE"), primary_key=True
@@ -149,6 +166,19 @@ class JobRecord(Base):
     """Persisted job listing."""
 
     __tablename__ = "jobs"
+    __table_args__ = (
+        Index("ix_jobs_user_status_scraped_at", "user_id", "application_status", "scraped_at"),
+        Index("uq_jobs_user_normalized_url", "user_id", "normalized_url", unique=True),
+        Index(
+            "uq_jobs_user_source_external_id",
+            "user_id",
+            "source_board",
+            "external_id",
+            unique=True,
+            postgresql_where=text("external_id IS NOT NULL"),
+            sqlite_where=text("external_id IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(
@@ -160,6 +190,7 @@ class JobRecord(Base):
     external_id: Mapped[str | None] = mapped_column(String(256), nullable=True, index=True)
     source_board: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     url: Mapped[str] = mapped_column(Text, nullable=False)
+    normalized_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     title: Mapped[str] = mapped_column(String(512), nullable=False)
     company: Mapped[str] = mapped_column(String(256), nullable=False)
@@ -201,7 +232,12 @@ class ApplicationRecord(Base):
     user_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
-    job_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    job_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     attempted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String(64), nullable=False)
     confirmation_id: Mapped[str | None] = mapped_column(String(256), nullable=True)

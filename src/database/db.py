@@ -5,19 +5,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import func, inspect, select, text
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.database.models import (
     ApplicationRecord,
-    Base,
     JobRecord,
     RunEventRecord,
     RunExecutionRecord,
     RunJobRecord,
     SemanticCacheRecord,
 )
+from src.database.schema import ensure_database_schema, get_schema_status
 from src.models import ApplicationStatus, Job
+from src.services.job_identity import normalize_job_url
 
 
 def _strip_tz(dt: datetime | None) -> datetime | None:
@@ -29,42 +30,55 @@ def _strip_tz(dt: datetime | None) -> datetime | None:
     return dt
 
 
+def _job_status_priority(status: str | None) -> int:
+    lowered = (status or "").lower()
+    if lowered in {
+        ApplicationStatus.APPLIED.value,
+        ApplicationStatus.INTERVIEWED.value,
+        ApplicationStatus.OFFERED.value,
+    }:
+        return 3
+    if lowered == ApplicationStatus.PENDING.value:
+        return 2
+    if lowered in {ApplicationStatus.FAILED.value, ApplicationStatus.SKIPPED.value}:
+        return 1
+    return 0
+
+
+def _job_record_priority(record: JobRecord) -> tuple[int, datetime, datetime, int]:
+    return (
+        _job_status_priority(record.application_status),
+        record.applied_at or datetime.min,
+        record.scraped_at or datetime.min,
+        record.id or 0,
+    )
+
+
 class Database:
     """Async SQLAlchemy database layer."""
 
     def __init__(self, database_url: str):
+        self.database_url = database_url
         self.engine = create_async_engine(database_url, echo=False)
         self.session_factory = async_sessionmaker(self.engine, expire_on_commit=False)
 
     async def init(self) -> None:
-        """Create all tables if they don't exist."""
-        async with self.engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await self._ensure_scrape_run_columns(conn)
-        logger.info("Database initialised")
+        """Ensure the database is at the expected Alembic revision."""
+        status = await ensure_database_schema(self.engine, self.database_url)
+        logger.info(f"Database initialised (schema={status.current_revision})")
 
     async def close(self) -> None:
         await self.engine.dispose()
 
-    async def _ensure_scrape_run_columns(self, conn) -> None:
-        def _existing_columns(sync_conn) -> set[str]:
-            inspector = inspect(sync_conn)
-            return {
-                column["name"]
-                for column in inspector.get_columns("scrape_runs")
-            }
-
-        existing_columns = await conn.run_sync(_existing_columns)
-        statements: list[str] = []
-        if "trigger_type" not in existing_columns:
-            statements.append("ALTER TABLE scrape_runs ADD COLUMN trigger_type VARCHAR(32)")
-        if "search_criteria_json" not in existing_columns:
-            statements.append("ALTER TABLE scrape_runs ADD COLUMN search_criteria_json TEXT")
-        if "saved_search_key" not in existing_columns:
-            statements.append("ALTER TABLE scrape_runs ADD COLUMN saved_search_key VARCHAR(64)")
-
-        for statement in statements:
-            await conn.execute(text(statement))
+    async def schema_status(self) -> dict[str, object]:
+        status = await get_schema_status(self.engine, self.database_url)
+        return {
+            "current_revision": status.current_revision,
+            "head_revision": status.head_revision,
+            "at_head": status.at_head,
+            "is_empty": status.is_empty,
+            "has_legacy_schema": status.has_legacy_schema,
+        }
 
     # ------------------------------------------------------------------
     # Jobs
@@ -74,13 +88,30 @@ class Database:
         self, job: Job, user_id: int | None = None, scrape_run_id: str | None = None
     ) -> JobRecord:
         """Insert or update a job record. Returns the persisted record."""
+        normalized_url = normalize_job_url(job.url) or job.url.strip()
         async with self.session_factory() as session:
-            # Check for existing record by URL within the current user scope.
-            q = select(JobRecord).where(JobRecord.url == job.url)
+            match_filters = [JobRecord.normalized_url == normalized_url]
+            if job.external_id:
+                match_filters.append(
+                    and_(
+                        JobRecord.source_board == job.source_board,
+                        JobRecord.external_id == job.external_id,
+                    )
+                )
+
+            q = select(JobRecord).where(or_(*match_filters))
             if user_id is not None:
                 q = q.where(JobRecord.user_id == user_id)
-            result = await session.execute(q)
-            record = result.scalar_one_or_none()
+            else:
+                q = q.where(JobRecord.user_id.is_(None))
+            matches = list((await session.execute(q)).scalars().all())
+            record = None
+            if matches:
+                matches.sort(key=_job_record_priority, reverse=True)
+                record = matches[0]
+                duplicates = matches[1:]
+                if duplicates:
+                    await self._merge_duplicate_jobs(session, record, duplicates)
 
             is_new = record is None
             if is_new:
@@ -98,6 +129,8 @@ class Database:
             record.company = job.company
             record.location = job.location
             record.description = job.description
+            record.url = job.url
+            record.normalized_url = normalized_url
             record.job_type = job.job_type
             record.work_mode = job.work_mode
             record.experience_level = job.experience_level
@@ -137,6 +170,48 @@ class Database:
 
             await session.commit()
             return record
+
+    async def _merge_duplicate_jobs(
+        self,
+        session: AsyncSession,
+        primary: JobRecord,
+        duplicates: list[JobRecord],
+    ) -> None:
+        for duplicate in duplicates:
+            if primary.scrape_run_id is None and duplicate.scrape_run_id is not None:
+                primary.scrape_run_id = duplicate.scrape_run_id
+            if primary.normalized_url is None and duplicate.normalized_url is not None:
+                primary.normalized_url = duplicate.normalized_url
+
+            linked_run_ids = list(
+                (
+                    await session.execute(
+                        select(RunJobRecord.run_id).where(RunJobRecord.job_id == duplicate.id)
+                    )
+                ).scalars().all()
+            )
+            for run_id in linked_run_ids:
+                existing_link = await session.get(
+                    RunJobRecord,
+                    {"run_id": run_id, "job_id": primary.id},
+                )
+                if existing_link is None:
+                    session.add(RunJobRecord(run_id=run_id, job_id=primary.id))
+
+            application_rows = list(
+                (
+                    await session.execute(
+                        select(ApplicationRecord).where(ApplicationRecord.job_id == duplicate.id)
+                    )
+                ).scalars().all()
+            )
+            for application in application_rows:
+                application.job_id = primary.id
+
+            await session.execute(
+                delete(RunJobRecord).where(RunJobRecord.job_id == duplicate.id)
+            )
+            await session.delete(duplicate)
 
     async def get_pending_jobs(
         self,

@@ -82,6 +82,12 @@ async def queue_health():
     }
 
 
+@app.get("/health/schema")
+async def schema_health():
+    db = api_deps.get_database()
+    return await db.schema_status()
+
+
 app.include_router(auth.router)
 app.include_router(jobs.router)
 app.include_router(applications.router)
