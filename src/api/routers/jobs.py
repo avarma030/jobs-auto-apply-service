@@ -302,6 +302,9 @@ async def trigger_scrape(
         started_at=started_at,
     )
     session.add(run)
+    # Flush the parent run row before adding dependent run events or
+    # triggering any later query-driven autoflush.
+    await session.flush()
     session.add(
         RunEventRecord(
             run_id=run.id,
