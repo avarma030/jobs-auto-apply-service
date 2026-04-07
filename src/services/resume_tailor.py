@@ -94,7 +94,7 @@ async def _tailor_once(
             job_pack=job_pack,
         ),
         model=model,
-        max_tokens=2200,
+        max_tokens=2600,
         response_model=TailoredResumeResult,
         context=f"resume tailoring for {job_title}",
         cache_backend=cache_backend,
@@ -106,6 +106,8 @@ async def _tailor_once(
         ),
         user_id=user_id,
         metadata={"job_title": job_title},
+        text_fallback_field="tailored_resume_text",
+        text_fallback_min_length=80,
     )
     return result.tailored_resume_text.strip()
 

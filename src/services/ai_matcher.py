@@ -585,6 +585,58 @@ def _should_locally_reject(evidence: dict[str, Any]) -> bool:
     )
 
 
+def _emit_match_log(
+    job_title: str,
+    *,
+    score: float,
+    mode: str,
+    local_pre_score: float | None = None,
+    history_similarity: float | None = None,
+    ai_score: float | None = None,
+    missing_required_skills: list[str] | None = None,
+) -> None:
+    parts: list[str] = []
+    if ai_score is not None:
+        parts.append(f"ai={ai_score:.0f}%")
+    if local_pre_score is not None:
+        parts.append(f"local={local_pre_score:.0f}%")
+    if history_similarity is not None:
+        parts.append(f"history={history_similarity:.0f}%")
+    parts.append(f"mode={mode}")
+    logger.info(
+        f"Match score for '{job_title}': {score:.0f}% "
+        f"({', '.join(parts)}) | "
+        f"missing: {(missing_required_skills or [])[:3]}"
+    )
+
+
+def _record_decision_trace(
+    decision_trace: dict[str, Any] | None,
+    *,
+    score: float,
+    mode: str,
+    local_pre_score: float | None = None,
+    history_similarity: float | None = None,
+    ai_score: float | None = None,
+    missing_required_skills: list[str] | None = None,
+    summary: str | None = None,
+) -> None:
+    if decision_trace is None:
+        return
+    decision_trace.clear()
+    decision_trace.update(
+        {
+            "score": float(score),
+            "mode": mode,
+            "local_pre_score": float(local_pre_score or 0.0),
+            "history_similarity": float(history_similarity or 0.0),
+            "ai_score": None if ai_score is None else float(ai_score),
+            "missing_required_skills": list(missing_required_skills or []),
+            "summary": summary or "",
+        }
+    )
+
+
 async def _adjudicate_with_claude(
     *,
     client: anthropic.AsyncAnthropic,
@@ -635,6 +687,7 @@ async def score_compatibility(
     cache_backend: MatchCacheBackend | None = None,
     user_id: int | None = None,
     job_id: int | None = None,
+    decision_trace: dict[str, Any] | None = None,
 ) -> float:
     """
     Cost-optimized hybrid matcher:
@@ -719,12 +772,34 @@ async def score_compatibility(
         cached_match = await cache_backend.get_semantic_cache(cache_key, source_hash)
         if cached_match and "score" in cached_match:
             score = float(cached_match["score"])
-            logger.info(
-                f"Match score for '{job_title}': {score:.0f}% "
-                f"(local={cached_match.get('local_pre_score', 0):.0f}%, "
-                f"history={cached_match.get('history_similarity', 0):.0f}%, "
-                f"mode={cached_match.get('mode', 'cache')}) | "
-                f"missing: {cached_match.get('missing_required_skills', [])[:3]}"
+            mode = str(cached_match.get("mode", "cache"))
+            missing = cached_match.get("missing_required_skills") or cached_match.get("missing_skills") or []
+            _record_decision_trace(
+                decision_trace,
+                score=score,
+                mode=mode,
+                local_pre_score=float(cached_match.get("local_pre_score", 0) or 0),
+                history_similarity=float(cached_match.get("history_similarity", 0) or 0),
+                ai_score=(
+                    None
+                    if cached_match.get("ai_score") is None
+                    else float(cached_match.get("ai_score", 0) or 0)
+                ),
+                missing_required_skills=list(missing),
+                summary=str(cached_match.get("summary", "") or ""),
+            )
+            _emit_match_log(
+                job_title,
+                score=score,
+                mode=mode,
+                local_pre_score=float(cached_match.get("local_pre_score", 0) or 0),
+                history_similarity=float(cached_match.get("history_similarity", 0) or 0),
+                ai_score=(
+                    None
+                    if cached_match.get("ai_score") is None
+                    else float(cached_match.get("ai_score", 0) or 0)
+                ),
+                missing_required_skills=list(missing),
             )
             return min(max(score, 0.0), 100.0)
 
@@ -750,12 +825,22 @@ async def score_compatibility(
                 model_name=model,
                 metadata={"mode": "local_reject"},
             )
-        logger.info(
-            f"Match score for '{job_title}': {final_score:.0f}% "
-            f"(local={local_evidence['local_pre_score']:.0f}%, "
-            f"history={history_similarity * 100.0:.0f}%, "
-            f"mode=local_reject) | "
-            f"missing: {payload['missing_required_skills']}"
+        _record_decision_trace(
+            decision_trace,
+            score=final_score,
+            mode="local_reject",
+            local_pre_score=local_evidence["local_pre_score"],
+            history_similarity=history_similarity * 100.0,
+            missing_required_skills=payload["missing_required_skills"],
+            summary=payload["summary"],
+        )
+        _emit_match_log(
+            job_title,
+            score=final_score,
+            mode="local_reject",
+            local_pre_score=local_evidence["local_pre_score"],
+            history_similarity=history_similarity * 100.0,
+            missing_required_skills=payload["missing_required_skills"],
         )
         return final_score
 
@@ -776,11 +861,22 @@ async def score_compatibility(
     except Exception as exc:
         logger.error(f"Error scoring '{job_title}': {exc}")
         final_score = min(local_evidence["local_pre_score"], 69.0)
-        logger.info(
-            f"Match score for '{job_title}': {final_score:.0f}% "
-            f"(local={local_evidence['local_pre_score']:.0f}%, "
-            f"history={history_similarity * 100.0:.0f}%, "
-            f"mode=local_fallback)"
+        _record_decision_trace(
+            decision_trace,
+            score=final_score,
+            mode="local_fallback",
+            local_pre_score=local_evidence["local_pre_score"],
+            history_similarity=history_similarity * 100.0,
+            missing_required_skills=job_fp["required_skills"][:3],
+            summary="AI adjudication failed; used deterministic local fallback.",
+        )
+        _emit_match_log(
+            job_title,
+            score=final_score,
+            mode="local_fallback",
+            local_pre_score=local_evidence["local_pre_score"],
+            history_similarity=history_similarity * 100.0,
+            missing_required_skills=job_fp["required_skills"][:3],
         )
         return final_score
 
@@ -815,12 +911,23 @@ async def score_compatibility(
         )
 
     missing = payload.get("missing_required_skills") or payload.get("missing_skills") or []
-    logger.info(
-        f"Match score for '{job_title}': {final_score:.0f}% "
-        f"(ai={ai_score:.0f}%, "
-        f"local={local_evidence['local_pre_score']:.0f}%, "
-        f"history={history_similarity * 100.0:.0f}%, "
-        f"mode=claude_adjudicated) | "
-        f"missing: {missing[:3]}"
+    _record_decision_trace(
+        decision_trace,
+        score=final_score,
+        mode="claude_adjudicated",
+        local_pre_score=local_evidence["local_pre_score"],
+        history_similarity=history_similarity * 100.0,
+        ai_score=ai_score,
+        missing_required_skills=list(missing),
+        summary=str(payload.get("summary", "") or ""),
+    )
+    _emit_match_log(
+        job_title,
+        score=final_score,
+        mode="claude_adjudicated",
+        ai_score=ai_score,
+        local_pre_score=local_evidence["local_pre_score"],
+        history_similarity=history_similarity * 100.0,
+        missing_required_skills=list(missing),
     )
     return final_score

@@ -229,6 +229,47 @@ async def test_score_compatibility_calls_claude_once_for_plausible_match_and_use
 
 
 @pytest.mark.asyncio
+async def test_score_compatibility_populates_decision_trace_for_consistent_logging():
+    backend = FakeMatchCacheBackend()
+    client = make_client(
+        {
+            "score": 72,
+            "skills_match": 74,
+            "experience_match": 76,
+            "domain_match": 42,
+            "education_match": 60,
+            "top_matching_skills": ["stakeholder management", "project delivery"],
+            "missing_required_skills": ["capital delivery"],
+            "missing_nice_to_have": ["regulated infrastructure"],
+            "summary": "Strong adjacent fit.",
+        }
+    )
+    decision_trace: dict[str, object] = {}
+
+    score = await score_compatibility(
+        resume_text="IT Project Manager with strong agile delivery experience.",
+        job_title="Senior Project Manager",
+        job_description=(
+            "Required: stakeholder management, project delivery, budget ownership. "
+            "Preferred: capital delivery in regulated infrastructure."
+        ),
+        client=client,
+        search_keywords=["project manager"],
+        profile=make_profile(),
+        cache_backend=backend,
+        user_id=1,
+        job_id=101,
+        decision_trace=decision_trace,
+    )
+
+    assert score > 70
+    assert decision_trace["mode"] == "claude_adjudicated"
+    assert decision_trace["score"] == score
+    assert decision_trace["ai_score"] == 72.0
+    assert decision_trace["missing_required_skills"] == ["capital delivery"]
+
+
+@pytest.mark.asyncio
 async def test_score_compatibility_includes_weak_history_signal_as_small_boost():
     backend = FakeMatchCacheBackend()
     backend.examples = [

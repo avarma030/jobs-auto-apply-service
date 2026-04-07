@@ -56,10 +56,12 @@ ATS_SCORE_PROMPT = PromptSpec(
 RESUME_TAILOR_PROMPT = PromptSpec(
     kind="resume_tailor",
     name="resume_tailor",
-    version="v2",
+    version="v3",
     system=(
         "You are an expert resume writer specializing in ATS optimization. "
-        "Rewrite only with factual information and return only valid JSON."
+        "Rewrite only with factual information and return only valid JSON. "
+        "Do not output the resume directly outside the JSON object. "
+        "Escape newlines inside JSON string values."
     ),
 )
 
@@ -304,7 +306,8 @@ Rules:
 - Preserve all factual information
 - Naturally incorporate exact job keywords where truthful
 - Keep formatting clean plain text
-- Return only valid JSON
+- Return only a JSON object with escaped newlines inside string values
+- Do not include markdown fences or explanatory text
 
 <candidate_knowledge>
 {json.dumps(candidate_pack or {}, ensure_ascii=False)}

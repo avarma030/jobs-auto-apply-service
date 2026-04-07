@@ -459,6 +459,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.warning(f"Could not build job knowledge pack for job {record.id}: {exc}")
 
+            score_trace: dict[str, object] = {}
             score = await ai_matcher.score_compatibility(
                 resume_text,
                 job.title,
@@ -470,11 +471,21 @@ class Orchestrator:
                 cache_backend=self.db,
                 user_id=user_id,
                 job_id=record.id,
+                decision_trace=score_trace,
             )
             job.match_score = score
 
             # Persist match score
             await self.db.update_job_ai_fields(record.id, match_score=score)
+            logger.info(
+                f"[AI][Score] job_id={record.id} title='{job.title}' "
+                f"score={score:.0f}% threshold={effective_threshold:.0f}% "
+                f"mode={score_trace.get('mode', 'unknown')} "
+                f"ai={float(score_trace.get('ai_score') or 0):.0f}% "
+                f"local={float(score_trace.get('local_pre_score') or 0):.0f}% "
+                f"history={float(score_trace.get('history_similarity') or 0):.0f}% "
+                f"missing={(score_trace.get('missing_required_skills') or [])[:3]}"
+            )
 
             if score < effective_threshold:
                 skipped_score += 1
